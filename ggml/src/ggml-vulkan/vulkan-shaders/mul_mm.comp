@@ -129,12 +129,13 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 
-#if defined(MUL_MAT_ID) && defined(DATA_A_Q5_K)
+#if defined(MUL_MAT_ID) && (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K))
 // Per-tile-row (d, m) for the current BK chunk. A BK=32 chunk of one row never
-// straddles a q5_K sub-block (8 idx span 14 of a 16-wide half), so the packed
-// 6-bit scale extraction can run once per row per k-iteration instead of once
-// per 4-weight load (8x redundant across the loading lanes).
-#define MMID_Q5K_SCACHE 1
+// straddles a q4_K/q5_K sub-block (8 idx span 14 of a 16-wide half), so the
+// packed 6-bit scale extraction can run once per row per superblock instead of
+// once per 4-weight load (8x redundant across the loading lanes). Both types
+// share the dm + scales[12] block prefix, so one fill serves both.
+#define MMID_QK_SCACHE 1
 // 8 sub-block (d, m) pairs per tile row, refilled once per superblock (every
 // 8th BK=32 iteration) so 7 of 8 iterations pay no fill or extra barrier.
 shared vec2 scache_dm[BM * 8];
@@ -299,7 +300,7 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
-#ifdef MMID_Q5K_SCACHE
+#ifdef MMID_QK_SCACHE
         // refill all 8 sub-block (d, m) pairs per row at each superblock boundary
         if ((block & 255) == 0) {
             for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) {
