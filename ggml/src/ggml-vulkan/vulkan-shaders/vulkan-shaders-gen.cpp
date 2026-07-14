@@ -1033,6 +1033,7 @@ void process_shaders() {
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("count_experts", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
+    string_to_spv("mmid_row_lists", "mmid_row_lists.comp", {});
 
     for (std::string dim_str : {"", "_3d"}) {
         for (bool bda : {false, true}) {
