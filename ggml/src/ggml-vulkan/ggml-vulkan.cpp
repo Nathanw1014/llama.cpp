@@ -1025,6 +1025,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_mmid_row_lists;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1214,6 +1215,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t padded_N;
+    uint32_t use_row_lists;
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -1294,6 +1296,15 @@ struct vk_op_count_experts_push_constants {
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+};
+
+struct vk_op_mmid_row_lists_push_constants {
+    uint32_t nei0;
+    uint32_t nei1;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_as;
 };
 
 struct vk_op_glu_push_constants {
@@ -5536,6 +5547,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
 
+    ggml_vk_create_pipeline(device, device->pipeline_mmid_row_lists, "mmid_row_lists", mmid_row_lists_len, mmid_row_lists_data, "main", 2, sizeof(vk_op_mmid_row_lists_push_constants), {1, 1, 1}, {}, 1, true);
+
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
 
@@ -8627,13 +8640,13 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t padded_n) {
+        uint32_t padded_n, uint32_t use_row_lists) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, padded_n };
+                                              nei0, nei1, nbi1, ne11, padded_n, use_row_lists };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
 }
 
@@ -9947,7 +9960,18 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
+    // Precompute per-expert row lists so each matmul workgroup reads its rows
+    // directly instead of re-scanning the whole ids tensor. Stored in the same
+    // buffer after the counts: [counts n_as][offsets n_as+1][cursors n_as][entries].
+    // The coopmat2 shaders only read the counts and don't use the lists.
+    // GGML_VK_MMID_ROWLISTS=0 disables it (same-binary A/B).
+    static const char * mmid_row_lists_env = getenv("GGML_VK_MMID_ROWLISTS");
+    const bool use_row_lists = !(mmid_row_lists_env && atoi(mmid_row_lists_env) == 0) && !ctx->device->coopmat2;
+
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
+    if (use_row_lists) {
+        expert_count_size = sizeof(uint32_t) * (uint32_t)(3 * n_as + 1 + nei0 * nei1);
+    }
 
     {
         if (
@@ -9980,6 +10004,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        if (use_row_lists) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mmid_row_lists, 1);
+        }
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -10091,6 +10118,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
+    if (use_row_lists) {
+        // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists
+        const std::vector<uint32_t> pc = { (uint32_t)nei0,
+                                           (uint32_t)nei1,
+                                           (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                           (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                           (uint32_t)n_as };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     uint32_t stride_batch_x = ne00*ne01;
     uint32_t stride_b_y = y_decode_vector_staging ? y_staged_row_stride : ne10;
     uint32_t stride_batch_y = y_decode_vector_staging ? y_staged_row_stride * padded_n : ne10*ne11;
@@ -10110,7 +10150,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n,
+        use_row_lists ? 1u : 0u
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
