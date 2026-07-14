@@ -129,6 +129,17 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 
+#if defined(MUL_MAT_ID) && defined(DATA_A_Q5_K)
+// Per-tile-row (d, m) for the current BK chunk. A BK=32 chunk of one row never
+// straddles a q5_K sub-block (8 idx span 14 of a 16-wide half), so the packed
+// 6-bit scale extraction can run once per row per k-iteration instead of once
+// per 4-weight load (8x redundant across the loading lanes).
+#define MMID_Q5K_SCACHE 1
+// 8 sub-block (d, m) pairs per tile row, refilled once per superblock (every
+// 8th BK=32 iteration) so 7 of 8 iterations pay no fill or extra barrier.
+shared vec2 scache_dm[BM * 8];
+#endif
+
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #ifdef COOPMAT
@@ -288,6 +299,33 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
+#ifdef MMID_Q5K_SCACHE
+        // refill all 8 sub-block (d, m) pairs per row at each superblock boundary
+        if ((block & 255) == 0) {
+            for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) {
+                const uint r  = x / 8;
+                const uint is = x % 8;
+                const uint idx = pos_a + r * (p.stride_a / LOAD_VEC_A);
+                const uint ib = idx / 64;
+
+                const vec2 loadd = vec2(data_a[ib].dm);
+                const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
+                                           data_a_packed32[ib].scales[1],
+                                           data_a_packed32[ib].scales[2]);
+                const uint scalesoffs = (is & 3) * 8;
+                const uint scidx0 = (is < 4) ? 0 : 2;
+                const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                const uint mbidx0 = (is < 4) ? 1 : 2;
+                const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+                const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                const uint sc    = ((scales[scidx0] >> scalesoffs) & 0xF) | ((scales[0] >> scidxshift1) & 0x30);
+                const uint mbyte = ((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30);
+
+                scache_dm[x] = vec2(loadd.x * sc, -loadd.y * mbyte);
+            }
+            barrier();
+        }
+#endif
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
