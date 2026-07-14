@@ -56,6 +56,8 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    uint padded_N;
+    uint use_row_lists;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -157,6 +159,9 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
+    if (p.use_row_lists != 0) {
+        load_row_ids_from_lists(expert_idx, ic);
+    } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
     if (bitCount(p.nei0) == 1) {
         load_row_ids(expert_idx, true, ic);
@@ -178,6 +183,7 @@ void main() {
 
     barrier();
 #endif
+    }
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;

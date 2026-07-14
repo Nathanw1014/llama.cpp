@@ -1,0 +1,91 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Builds per-expert row lists for MUL_MAT_ID so the matmul workgroups can read
+// their rows directly instead of each re-scanning the whole ids tensor.
+//
+// Output layout in the expert-counts buffer (all uint32, counts written by the
+// count_experts pass and left untouched so mul_mm_cm2 keeps working):
+//   [0,        n_as)    counts   (input, from count_experts)
+//   [n_as,     2*n_as]  offsets  (exclusive prefix sum of counts; [2*n_as] = total)
+//   (2*n_as,   3*n_as]  cursors  (scratch for the scatter)
+//   (3*n_as, ...]       entries  (packed (ii1 << 16) | ii0, grouped by expert)
+//
+// Runs as a single workgroup: the scatter is only nei0*nei1 elements and this
+// keeps the prefix sum, cursor init and scatter in one dispatch.
+
+layout (push_constant) uniform parameter
+{
+    uint nei0;
+    uint nei1;
+    uint nb00;
+    uint nb01;
+    uint a_offset;
+    uint n_as;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer IDS {int data_ids[];};
+layout (binding = 1) buffer RL {uint data_rl[];};
+
+shared uint sh[BLOCK_SIZE];
+shared uint sh_carry;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint off_base = p.n_as;
+    const uint cur_base = 2 * p.n_as + 1;
+    const uint ent_base = 3 * p.n_as + 1;
+
+    // Exclusive prefix sum of counts -> offsets, cursors start at the offsets
+    if (tid == 0) {
+        sh_carry = 0;
+    }
+    barrier();
+    for (uint base = 0; base < p.n_as; base += BLOCK_SIZE) {
+        const uint i = base + tid;
+        const uint v = (i < p.n_as) ? data_rl[i] : 0;
+        sh[tid] = v;
+        barrier();
+        [[unroll]] for (uint s = 1; s < BLOCK_SIZE; s <<= 1) {
+            const uint t = (tid >= s) ? sh[tid - s] : 0;
+            barrier();
+            sh[tid] += t;
+            barrier();
+        }
+        const uint carry = sh_carry;
+        if (i < p.n_as) {
+            const uint excl = carry + sh[tid] - v;
+            data_rl[off_base + i] = excl;
+            data_rl[cur_base + i] = excl;
+        }
+        barrier();
+        if (tid == BLOCK_SIZE - 1) {
+            sh_carry = carry + sh[tid];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_rl[off_base + p.n_as] = sh_carry;
+    }
+
+    // offsets/cursors must be visible to the atomics below
+    memoryBarrierBuffer();
+    barrier();
+
+    // Scatter each (ii0, ii1) into its expert's segment
+    const uint num_elements = p.nei0 * p.nei1;
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint ii1 = idx / p.nei0;
+        const uint ii0 = idx - ii1 * p.nei0;
+        const int id = data_ids[p.a_offset + ii1 * p.nb01 + ii0 * p.nb00];
+        if (id >= 0 && uint(id) < p.n_as) {
+            const uint slot = atomicAdd(data_rl[cur_base + uint(id)], 1);
+            data_rl[ent_base + slot] = (ii1 << 16) | ii0;
+        }
+    }
+}

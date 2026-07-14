@@ -2,6 +2,25 @@
 shared u16vec2 row_ids[BN];
 uint _ne1;
 
+// Read this workgroup's row ids from the lists built by the mmid_row_lists
+// prepass, stored after the expert counts in the same buffer:
+// [counts n_as][offsets n_as+1][cursors n_as][entries packed (ii1 << 16) | ii0].
+// The dispatch uses one z-slice per expert, so n_as == gl_NumWorkGroups.z.
+void load_row_ids_from_lists(uint expert_idx, uint ic) {
+    const uint n_as = gl_NumWorkGroups.z;
+    _ne1 = uint(data_expert_count[expert_idx]);
+    const uint expert_off = uint(data_expert_count[n_as + expert_idx]);
+    const uint ent_base = 3 * n_as + 1 + expert_off + ic * BN;
+    for (uint i = gl_LocalInvocationIndex; i < BN; i += BLOCK_SIZE) {
+        // fill out-of-range slots with (0, 0): the unaligned load/store loops
+        // bounds-check against _ne1, but the aligned B loads read row_ids
+        // unconditionally for the full tile
+        const uint entry = (ic * BN + i < _ne1) ? uint(data_expert_count[ent_base + i]) : 0;
+        row_ids[i] = u16vec2(entry & 0xFFFF, entry >> 16);
+    }
+    barrier();
+}
+
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
 shared uvec4 ballots_sh[NUM_WARPS];
 
