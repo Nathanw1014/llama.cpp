@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 922 382" width="922" height="382" role="img">
+<title>Quantized-KV flash-attention fixes vs their base on gfx1151</title>
+<desc>Prefill and decode versus KV depth on gfx1151. The RADV fix lifts prefill; the ROCm fix lifts decode; each leaves the other regime unchanged.</desc>
+<rect x="0" y="0" width="922" height="382" fill="#1a1a19"/>
+<text x="62" y="24" font-size="13" font-weight="500" fill="#ffffff">Prefill — pp512 (t/s)   ·   RADV fix's regime</text>
+<line x1="62" y1="306.0" x2="442" y2="306.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="310.0" font-size="11" text-anchor="end" fill="#898781">0</text>
+<line x1="62" y1="254.0" x2="442" y2="254.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="258.0" font-size="11" text-anchor="end" fill="#898781">200</text>
+<line x1="62" y1="202.0" x2="442" y2="202.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="206.0" font-size="11" text-anchor="end" fill="#898781">400</text>
+<line x1="62" y1="150.0" x2="442" y2="150.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="154.0" font-size="11" text-anchor="end" fill="#898781">600</text>
+<line x1="62" y1="98.0" x2="442" y2="98.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="102.0" font-size="11" text-anchor="end" fill="#898781">800</text>
+<line x1="62" y1="46.0" x2="442" y2="46.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="53" y="50.0" font-size="11" text-anchor="end" fill="#898781">1000</text>
+<line x1="62" y1="306" x2="442" y2="306" stroke="#383835" stroke-width="1"/>
+<text x="62.0" y="326" font-size="11" text-anchor="middle" fill="#898781">0</text>
+<text x="138.0" y="326" font-size="11" text-anchor="middle" fill="#898781">4k</text>
+<text x="214.0" y="326" font-size="11" text-anchor="middle" fill="#898781">16k</text>
+<text x="290.0" y="326" font-size="11" text-anchor="middle" fill="#898781">32k</text>
+<text x="366.0" y="326" font-size="11" text-anchor="middle" fill="#898781">64k</text>
+<text x="442.0" y="326" font-size="11" text-anchor="middle" fill="#898781">128k</text>
+<text x="252" y="348" font-size="11" text-anchor="middle" fill="#898781">KV depth</text>
+<text x="16" y="176" font-size="11" text-anchor="middle" fill="#898781" transform="rotate(-90 16 176)">tokens / s</text>
+<path d="M62.0 59.7 L138.0 88.5 L214.0 174.4 L290.0 225.2 L366.0 258.2 L442.0 281.8" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="62.0" cy="59.7" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="138.0" cy="88.5" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="214.0" cy="174.4" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="290.0" cy="225.2" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="366.0" cy="258.2" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="442.0" cy="281.8" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<path d="M62.0 57.5 L138.0 89.3 L214.0 173.7 L290.0 225.2 L366.0 258.2 L442.0 279.2" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="62.0" cy="57.5" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="138.0" cy="89.3" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="214.0" cy="173.7" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="290.0" cy="225.2" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="366.0" cy="258.2" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="442.0" cy="279.2" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<path d="M62.0 56.5 L138.0 137.7 L214.0 219.4 L290.0 253.3 L366.0 276.8 L442.0 291.0" fill="none" stroke="#199e70" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="62.0" cy="56.5" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="138.0" cy="137.7" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="214.0" cy="219.4" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="290.0" cy="253.3" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="366.0" cy="276.8" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="442.0" cy="291.0" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<path d="M62.0 48.8 L138.0 114.7 L214.0 190.8 L290.0 231.8 L366.0 262.2 L442.0 282.7" fill="none" stroke="#199e70" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="62.0" cy="48.8" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="138.0" cy="114.7" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="214.0" cy="190.8" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="290.0" cy="231.8" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="366.0" cy="262.2" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="442.0" cy="282.7" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<text x="449.0" y="286.7" font-size="11" font-weight="500" fill="#ffffff">90</text>
+<text x="516" y="24" font-size="13" font-weight="500" fill="#ffffff">Decode — tg32 (t/s)   ·   ROCm fix's regime</text>
+<line x1="516" y1="306.0" x2="896" y2="306.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="310.0" font-size="11" text-anchor="end" fill="#898781">0</text>
+<line x1="516" y1="254.0" x2="896" y2="254.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="258.0" font-size="11" text-anchor="end" fill="#898781">14</text>
+<line x1="516" y1="202.0" x2="896" y2="202.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="206.0" font-size="11" text-anchor="end" fill="#898781">28</text>
+<line x1="516" y1="150.0" x2="896" y2="150.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="154.0" font-size="11" text-anchor="end" fill="#898781">42</text>
+<line x1="516" y1="98.0" x2="896" y2="98.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="102.0" font-size="11" text-anchor="end" fill="#898781">56</text>
+<line x1="516" y1="46.0" x2="896" y2="46.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="507" y="50.0" font-size="11" text-anchor="end" fill="#898781">70</text>
+<line x1="516" y1="306" x2="896" y2="306" stroke="#383835" stroke-width="1"/>
+<text x="516.0" y="326" font-size="11" text-anchor="middle" fill="#898781">0</text>
+<text x="592.0" y="326" font-size="11" text-anchor="middle" fill="#898781">4k</text>
+<text x="668.0" y="326" font-size="11" text-anchor="middle" fill="#898781">16k</text>
+<text x="744.0" y="326" font-size="11" text-anchor="middle" fill="#898781">32k</text>
+<text x="820.0" y="326" font-size="11" text-anchor="middle" fill="#898781">64k</text>
+<text x="896.0" y="326" font-size="11" text-anchor="middle" fill="#898781">128k</text>
+<text x="706" y="348" font-size="11" text-anchor="middle" fill="#898781">KV depth</text>
+<text x="470" y="176" font-size="11" text-anchor="middle" fill="#898781" transform="rotate(-90 470 176)">tokens / s</text>
+<path d="M516.0 109.6 L592.0 150.4 L668.0 208.1 L744.0 244.5 L820.0 272.8 L896.0 288.6" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="516.0" cy="109.6" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="592.0" cy="150.4" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="668.0" cy="208.1" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="744.0" cy="244.5" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="820.0" cy="272.8" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="896.0" cy="288.6" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<path d="M516.0 106.4 L592.0 115.8 L668.0 141.8 L744.0 165.4 L820.0 196.8 L896.0 231.9" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="516.0" cy="106.4" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="592.0" cy="115.8" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="668.0" cy="141.8" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="744.0" cy="165.4" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="820.0" cy="196.8" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="896.0" cy="231.9" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<text x="903.0" y="235.9" font-size="11" font-weight="500" fill="#ffffff">20</text>
+<path d="M516.0 65.6 L592.0 92.4 L668.0 127.6 L744.0 163.7 L820.0 202.2 L896.0 238.7" fill="none" stroke="#199e70" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="516.0" cy="65.6" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="592.0" cy="92.4" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="668.0" cy="127.6" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="744.0" cy="163.7" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="820.0" cy="202.2" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="896.0" cy="238.7" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<path d="M516.0 60.2 L592.0 91.3 L668.0 128.5 L744.0 162.3 L820.0 202.3 L896.0 239.0" fill="none" stroke="#199e70" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="516.0" cy="60.2" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="592.0" cy="91.3" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="668.0" cy="128.5" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="744.0" cy="162.3" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="820.0" cy="202.3" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="896.0" cy="239.0" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<line x1="62" y1="360" x2="84" y2="360" stroke="#3987e5" stroke-width="2" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="73" cy="360" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<text x="91" y="364" font-size="11" fill="#c3c2b7">ROCm base</text>
+<line x1="171.0" y1="360" x2="193.0" y2="360" stroke="#3987e5" stroke-width="2" stroke-linecap="round"/>
+<circle cx="182.0" cy="360" r="4" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<text x="200.0" y="364" font-size="11" fill="#c3c2b7">ROCm + fix</text>
+<line x1="286.0" y1="360" x2="308.0" y2="360" stroke="#199e70" stroke-width="2" stroke-linecap="round" stroke-dasharray="6,4"/>
+<circle cx="297.0" cy="360" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<text x="315.0" y="364" font-size="11" fill="#c3c2b7">RADV base</text>
+<line x1="395.0" y1="360" x2="417.0" y2="360" stroke="#199e70" stroke-width="2" stroke-linecap="round"/>
+<circle cx="406.0" cy="360" r="4" fill="#199e70" stroke="#1a1a19" stroke-width="2"/>
+<text x="424.0" y="364" font-size="11" fill="#c3c2b7">RADV + fix</text>
+</svg>

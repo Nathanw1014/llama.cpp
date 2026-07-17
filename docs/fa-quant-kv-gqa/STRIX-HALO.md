@@ -20,37 +20,58 @@ correctly but dequantized q8_0 KV in a separate pass, costing prefill. HIP's FA 
 does not batch GQA, so it repeats that work `gqa_ratio` times, costing decode. Both are "dequant once and
 reuse"; neither is a Strix-Halo-specific hack.
 
+## Each fix vs its own base, both regimes
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="fa-fixes-dark.svg">
+  <img alt="Prefill and decode versus KV depth on gfx1151. The RADV fix lifts prefill and leaves decode unchanged; the ROCm fix lifts decode and leaves prefill unchanged." src="fa-fixes-light.svg">
+</picture>
+
+All four builds are the **same commit** (upstream master) — the only difference is the patch. Colour is the
+backend, dashes are the unpatched base. The two flat lines are the point: each fix moves its own regime and
+provably does not touch the other's, so they compose rather than overlap.
+
 ## Measured on gfx1151 (Radeon 8060S / Ryzen AI MAX+ 395, 64 GB UMA)
 
-Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL (48 layers, 32 Q heads / 4 KV heads, head_dim 128), q8_0 KV,
-`llama-bench -fa 1 -b 512 -ub 512 -p 512 -n 32 -d <depth> -r 2`. All arms same box, same session, same
-model file, GPU otherwise idle.
+Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL (48 layers, 32 Q heads / 4 KV heads, head_dim 128), q8_0 KV.
+`llama-bench -fa 1 -b 512 -ub 512 -p 512 -n 32 -d <depth> -r 2` (128k: `-r 1 --no-warmup`), page cache
+warmed, box idle, one dedicated invocation per config. **All four builds are the same commit (upstream
+master); only the patch differs.** A single invocation yields both metrics, so prefill and decode below are
+from the same runs.
 
-Decode (tg32, t/s):
+### Decode — tg32 (t/s) · the ROCm fix's regime
 
-| depth | ROCm stock | ROCm + fix | RADV (vanilla) |
-| ----- | ---------- | ---------- | -------------- |
-| 0     | 53.89      | 55.14      | 65.45          |
-| 4k    | 42.25      | 51.45      | 56.77          |
-| 16k   | 26.67      | **44.59**  | 47.55          |
-| 32k   | 16.74      | **37.97**  | 38.25          |
-| 64k   | 8.95       | **29.69**  | 27.83          |
-| 128k  | 4.68       | **19.77**  | 17.85          |
+| depth | ROCm base | ROCm + fix | Δ | RADV base | RADV + fix | Δ |
+| ----- | --------- | ---------- | - | --------- | ---------- | - |
+| 0    | 52.88 | **53.74** | +1.6% | 64.73 | 66.17 | +2.2% |
+| 4k   | 41.88 | **51.20** | +22.3% | 57.52 | 57.80 | +0.5% |
+| 16k  | 26.37 | **44.20** | +67.6% | 48.04 | 47.78 | -0.5% |
+| 32k  | 16.55 | **37.86** | +128.8% | 38.32 | 38.70 | +1.0% |
+| 64k  | 8.95 | **29.40** | +228.5% | 27.94 | 27.91 | -0.1% |
+| 128k | 4.68 | **19.96** | +326.5% | 18.12 | 18.05 | -0.4% |
 
-The HIP fix is worth **+322% at 128k**, and moves ROCm from 3.1× behind RADV at 64k to ahead of it. The
-crossover is around 32k: **RADV is still the better choice for shallow context** (65.45 vs 55.14 at depth 0).
+### Prefill — pp512 (t/s) · the RADV fix's regime
 
-Prefill on RADV (pp512, t/s) — what the coopmat1 dequant-once commit buys, measured on this branch against
-vanilla Vulkan at the same commit:
+| depth | ROCm base | ROCm + fix | Δ | RADV base | RADV + fix | Δ |
+| ----- | --------- | ---------- | - | --------- | ---------- | - |
+| 0    | 947.4 | 955.6 | +0.9% | 959.8 | **989.2** | +3.1% |
+| 4k   | 836.5 | 833.3 | -0.4% | 647.4 | **735.9** | +13.7% |
+| 16k  | 506.3 | 508.9 | +0.5% | 333.1 | **443.0** | +33.0% |
+| 32k  | 310.8 | 310.9 | +0.1% | 202.8 | **285.4** | +40.7% |
+| 64k  | 183.8 | 183.8 | +0.0% | 112.3 | **168.7** | +50.2% |
+| 128k | 93.21 | 103.0 | +10.5% | 57.59 | **89.79** | +55.9% |
 
-| depth | RADV vanilla | RADV + dequant-once |
-| ----- | ------------ | ------------------- |
-| 16k   | 334.84       | **444.88** (+32.9%) |
-| 32k   | 201.95       | **284.16** (+40.7%) |
+The ROCm prefill row at 128k (+10.5%) is **noise, not a win**: every other depth is flat within ±0.9%, the
+128k arm is a single shot (`-r 1`), and that arm was separately measured to swing ~±9% run to run. The ROCm
+change cannot move prefill at head_dim 128 — prefill takes the `mma` path, which the patch does not touch.
+Treat it as flat.
 
-So the two commits are complementary rather than overlapping: the Vulkan one buys prefill on RADV, the HIP
-one buys decode on ROCm. Together they remove the quantized-KV penalty from both halves of a long-context
-session on this hardware.
+Read the Δ columns together: the ROCm fix moves decode and leaves prefill flat; the RADV fix moves prefill
+and leaves decode flat. Neither is a tuning knob traded against the other — they compose.
+
+Two things the decode table says that the headline number does not. RADV still wins shallow context, and
+the crossover where ROCm overtakes it is around 32k. And the ROCm fix's value grows with depth, because the
+redundant dequant it removes scales with the KV cache.
 
 ## What to run on this hardware
 
