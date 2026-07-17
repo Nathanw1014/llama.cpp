@@ -535,6 +535,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
+            // PROTOTYPE (env-gated via GGML_CUDA_TILE_KVQ): the vec kernel fuses dequant into the KQ dot
+            // product, so a dequantized KV value is never materialized and cannot be reused across the
+            // gqa_ratio Q heads that share a KV head -- each re-dequantizes it in its own block. The tile
+            // kernel batches ncols2 heads per block and stages KV in SRAM, so with dequant-on-load it
+            // dequantizes once. Mirror the f16 branch above: prefer tile when the GQA opt applies.
+            // The vec kernel fuses dequantization into the KQ dot product, so it cannot reuse a
+            // dequantized KV value across the gqa_ratio Q heads that share a KV head -- each
+            // re-dequantizes it in its own block. The tile kernel batches ncols2 heads per block and
+            // dequantizes on load into SRAM, so it does that work once. Mirror the f16 branch above and
+            // prefer tile whenever the GQA optimization applies.
+            const bool tile_has_kv_type = K->type == V->type &&
+                (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+                (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256) && V->ne[0] == K->ne[0];
+            if (gqa_opt_applies && tile_has_kv_type) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
