@@ -111,6 +111,21 @@ Two things the decode table says that the headline number does not. RADV still w
 the crossover where ROCm overtakes it is around 32k. And the ROCm fix's value grows with depth, because the
 redundant dequant it removes scales with the KV cache.
 
+### The 64k crossover, worked
+
+At 64k the fixes flip which backend you'd serve. Base (unpatched) versus this branch, q8_0 KV:
+
+| 64k · q8_0 KV | prefill (pp512) | decode (tg32) |
+| ------------- | --------------- | ------------- |
+| ROCm base     | 183.8 | 8.95 |
+| RADV base     | 112.3 | **27.9** |
+| **ROCm + fix** | **183.9** | **29.4** |
+| RADV + fix    | 168.7 | 27.9 |
+
+Unpatched, 64k was split and RADV was the pick at depth: ROCm won prefill, but RADV won **decode by 3.1×**
+(27.9 vs 8.95). The ROCm decode fix (8.95 → 29.4) flips that — on this branch ROCm wins **both** prefill
+(+9%) and decode (+5%), so it becomes the better all-round backend at 64k. Below ~32k, RADV still leads.
+
 ## What to run on this hardware
 
 - **Long-context decode (agentic, deep KV): ROCm + `-ctk q8_0 -ctv q8_0`** — wins past ~32k with this branch.
