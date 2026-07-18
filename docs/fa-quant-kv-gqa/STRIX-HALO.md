@@ -14,7 +14,8 @@ grow with depth because the redundant work each removes scales with the KV cache
 | **Prefill** — RADV fix | +33% | +41% | +50% | **+56%** |
 
 (Token-gen figures are the ROCm backend vs its own unpatched default; prefill figures are the RADV backend
-vs its own. Full per-depth tables, including the flat off-regime halves, are below.)
+vs its own. Full per-depth tables, including the flat off-regime halves, are below. Every number traces to
+the raw `llama-bench` output — error bars included — in [BENCHMARK-DATA.md](BENCHMARK-DATA.md).)
 
 | Backend | Commit | What it fixes | Regime |
 | ------- | ------ | ------------- | ------ |
@@ -74,7 +75,7 @@ Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL (48 layers, 32 Q heads / 4 KV heads, hea
 `llama-bench -fa 1 -b 512 -ub 512 -p 512 -n 32 -d <depth> -r 2` (128k: `-r 1 --no-warmup`), page cache
 warmed, box idle, one dedicated invocation per config. **All four builds are the same commit (upstream
 master); only the patch differs.** A single invocation yields both metrics, so prefill and decode below are
-from the same runs.
+from the same runs. Raw output with per-arm error bars: [BENCHMARK-DATA.md](BENCHMARK-DATA.md).
 
 ### Decode — tg32 (t/s) · the ROCm fix's regime
 
