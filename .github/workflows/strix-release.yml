@@ -65,8 +65,9 @@ jobs:
       - name: Install Vulkan SDK (LunarG) + build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build wget ca-certificates
-          # Distro glslc/SPIRV-Headers are often too old for current shaders; use the LunarG SDK.
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          # The LunarG SDK supplies SPIRV-Headers (find_package) + a glslc new enough for the shaders;
+          # verified locally that the noble SDK builds this tree end-to-end.
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
             | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
