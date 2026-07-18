@@ -144,6 +144,12 @@ Unpatched, 64k was split and RADV was the pick at depth: ROCm won prefill, but R
 
 ## Caveats
 
+- **Magnitude is model-dependent — the headline is a head_dim-128 figure.** The +327% is Qwen3-Coder-30B
+  (head_dim 128), where stock q8 decode is ~half of f16. On Qwen3.6-35B-A3B Q5 (head_dim 256) the same fix
+  measured **+12% decode / +19% prompt processing at 32k** — milder, because the redundancy is a smaller
+  share of the token budget there. It still brings q8_0 KV to f16 speed. Raw numbers in
+  [BENCHMARK-DATA.md](BENCHMARK-DATA.md). The gain scales with gqa_ratio × how FA-dominated the workload is,
+  not with head size.
 - All numbers are gfx1151. NVIDIA is unmeasured for the HIP change; the redundancy is architecture-
   independent but its cost is not.
 - The HIP dispatch prefers `tile` for symmetric q4_0/q8_0 whenever the GQA optimization applies. That

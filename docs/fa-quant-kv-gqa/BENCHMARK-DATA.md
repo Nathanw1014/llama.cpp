@@ -93,3 +93,23 @@ Every percentage in [STRIX-HALO.md](STRIX-HALO.md) traces to the raw `llama-benc
 | 128k  | +10.5% | -0.4% |
 
 The ROCm prefill column and the RADV decode column are the off-regime halves: near-zero at every depth (the ROCm pp512 +10.5% at 128k is single-shot `-r 1` noise — see STRIX-HALO.md). Each fix moves only its own regime.
+
+## Second model — Qwen3.6-35B-A3B Q5 (head_dim 256), the model-dependence check
+
+A milder case than the Qwen3-Coder-30B above (head_dim 128). Here stock q8 decode sits only a few percent
+below f16, so the fix delta is modest — but it still brings q8_0 KV up to f16 speed. Config differs from the
+tables above: `Qwen3.6-35B-A3B-UD-Q5_K_XL`, **`-b 2048 -ub 512`, pp measured as pp2048**, 32k, FA on, r=2.
+Same-session, GTT verified <1 GB before each arm, end-canary confirmed the window held (pp within 0.4%).
+
+| arm | pp2048 (t/s) | tg32 (t/s) |
+| --- | ------------ | ---------- |
+| ROCm base, f16 KV  | 538.68 ± 2.21 | 38.52 ± 1.65 |
+| ROCm base, q8_0 KV | 552.73 ± 1.08 | 36.77 ± 0.80 |
+| ROCm **fix**, q8_0 KV | 540.94 ± 2.54 | **41.10 ± 0.54** |
+| RADV base, f16 KV  | 576.79 ± 3.45 | 45.75 ± 0.65 |
+| RADV base, q8_0 KV | 479.90 ± 2.53 | 48.13 ± 0.03 |
+| RADV **fix**, q8_0 KV | **572.60 ± 0.39** | 47.56 ± 0.50 |
+
+Fix deltas on this model at 32k: **ROCm decode +11.8%** (36.77 → 41.10, landing at f16), **RADV prompt
+processing +19.3%** (479.90 → 572.60, recovering to f16 576.79). Both bring q8_0 KV to f16 speed; neither is
+the dramatic hd128 figure, which is the point — magnitude scales with gqa_ratio × FA-dominance, not head size.
