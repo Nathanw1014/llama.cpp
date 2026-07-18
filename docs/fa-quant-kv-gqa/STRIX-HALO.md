@@ -3,6 +3,19 @@
 This branch carries two independent fixes that happen to be the same idea on two backends:
 **dequantize quantized KV once, then reuse it**, instead of re-dequantizing it per consumer.
 
+## Gain over the unpatched default
+
+gfx1151 · Qwen3-Coder-30B-A3B · q8_0 KV. Each fix owns one half of a long-context session, and both gains
+grow with depth because the redundant work each removes scales with the KV cache:
+
+| vs default | 16k | 32k | 64k | 128k |
+| ---------- | --- | --- | --- | ---- |
+| **Token generation** (decode) — ROCm fix | +68% | +129% | +229% | **+327%** |
+| **Prefill** — RADV fix | +33% | +41% | +50% | **+56%** |
+
+(Token-gen figures are the ROCm backend vs its own unpatched default; prefill figures are the RADV backend
+vs its own. Full per-depth tables, including the flat off-regime halves, are below.)
+
 | Backend | Commit | What it fixes | Regime |
 | ------- | ------ | ------------- | ------ |
 | **Vulkan / RADV** | `vulkan : dequant q8_0 KV once in coopmat1` | the coopmat1 FA path dequantized q8_0 KV as a separate pass | prefill |
@@ -13,12 +26,36 @@ This branch carries two independent fixes that happen to be the same idea on two
 Upstream status: the Vulkan commits are llama.cpp PR #25494 (in review). The HIP commits are not yet
 submitted — see `README.md` in this directory for the diagnosis, controls and open questions.
 
-## Why one branch
+## The shared cause — and why it was there
 
-On this hardware the two backends were failing the *same* way in different places. Vulkan's FA batches GQA
-correctly but dequantized q8_0 KV in a separate pass, costing prefill. HIP's FA dequantizes in-kernel but
-does not batch GQA, so it repeats that work `gqa_ratio` times, costing decode. Both are "dequant once and
-reuse"; neither is a Strix-Halo-specific hack.
+Both backends were doing the same wasteful thing: **the same quantized KV, dequantized redundantly by many
+parallel units.** The fix in each case is *dequantize once, then share*.
+
+- **RADV (prefill):** the coopmat1 FA shader re-read and re-dequantized the **whole KV cache inside every
+  Q-workgroup**. The fix dequantizes + transposes it **once** into an f16 scratch that all workgroups share —
+  and the transpose makes the read **coalesced**, the piece whose payoff is largest on Strix's
+  stride-sensitive memory (~6.9× de-coalesced read gap on the 8060S).
+- **ROCm (decode):** the `vec` FA kernel processes **one Q head per block** and fuses dequant into the dot
+  product, so at gqa_ratio = 8 each KV head is dequantized **8×** — once per Q head that shares it. The fix
+  routes decode to the `tile` kernel, which batches the 8 heads and dequantizes into **SRAM once**.
+
+They differ only in *which* unit was duplicating the work — Q-workgroups on RADV, Q-heads-in-a-GQA-group on
+ROCm — so the two flat halves of the chart above are the proof they compose rather than overlap.
+
+### Why the duplication was there to begin with
+
+These were **sensible defaults, not bugs.** Fusing dequant into the compute — dequant-as-you-load — is the
+simplest correct design, and it is *optimal whenever there is no reuse to capture*: f16 KV (nothing to
+dequant), shallow KV (cheap to re-read), or gqa_ratio = 1 (each KV head used by a single Q head).
+Materializing the dequantized KV once costs extra memory — an f16 scratch on RADV, SRAM pressure on ROCm —
+that you do not want to spend in the common case.
+
+The redundancy only dominates when three conditions coincide: **quantized KV + heavy GQA + deep context** —
+i.e. large MoE models at long context, a recent workload. And on ROCm there was a hard constraint on top:
+the only FA kernels that batch GQA (`tile` / `mma`) accept **f16 K/V only**, so quantized decode had nowhere
+to go but `vec`. The fix — teaching `tile` to dequantize on load — is what removed that constraint. The
+ROCm redundancy is plain CUDA code and architecture-independent; only its *cost*, and the RADV coalescing
+benefit, are Strix-dominant.
 
 ## Each fix vs its own base, both regimes
 
