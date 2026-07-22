@@ -8140,6 +8140,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // TurboQuant KV write path (SET_ROWS -> copy_to_quant block encode). Not in
+    // all_types, since these are KV-cache-only types. QK_TQ = 64, so a head_dim row
+    // is ceil(hs/64) blocks: cover a one-block row (64) and the two-block row (128)
+    // that Qwen3/GLM-class models actually use, plus 256 (four blocks). The FA tests
+    // quantize K/V on the CPU, so without these the GPU encoder is never checked.
+    for (ggml_type tq_type : {GGML_TYPE_TQ3_0, GGML_TYPE_TQ4_0}) {
+        for (int64_t ne0 : {64, 128, 256}) {
+            for (ggml_type idx_type : {GGML_TYPE_I64, GGML_TYPE_I32}) {
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, tq_type, idx_type, { ne0, 5,  1, 3 }, { 1, 1, }, 1, false));
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, tq_type, idx_type, { ne0, 11, 1, 1 }, { 2, 3, }, 7, false));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
@@ -9550,8 +9564,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // dequant indexes blocks and rows separately.
     for (ggml_type type_KV : {GGML_TYPE_TQ3_0, GGML_TYPE_TQ4_0}) {
         for (int64_t hs : {64, 128}) {
-            for (int64_t nb : {1, 2, 8}) {
-                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 128, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            // Both accumulator precisions: PREC_DEFAULT accumulates in f16, which is
+            // what real inference often selects, and is a different numerical path
+            // from PREC_F32. Testing only f32 acc leaves that path unchecked.
+            for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
+                for (int64_t nb : {1, 2, 8}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 128, nb, true, false, 0, 0, prec, type_KV, type_KV));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {8, 1}, 512, 8, true, false, 0, 0, prec, type_KV, type_KV));
             }
             // GQA, and KV sizes that are not a multiple of the KV block (bounds-check path),
             // including a KV shorter than a single block -- the short-prompt prefill shape
