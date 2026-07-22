@@ -1337,3 +1337,41 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// TurboQuant KV-cache: CPU from_float wrappers + asymmetric vec_dot.  The query
+// stays full precision (vec_dot_type = F32); the vec_dot dequantizes each K block
+// into original space and dots against the f32 query, i.e. s = <query, dequant(K)>.
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq3_0_ref(x, (block_tq3_0 *) y, k);
+}
+void quantize_row_tq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq4_0_ref(x, (block_tq4_0 *) y, k);
+}
+void ggml_vec_dot_tq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                            size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    const block_tq3_0 * GGML_RESTRICT kx = (const block_tq3_0 *) vx;
+    const float       * GGML_RESTRICT q  = (const float *) vy;
+    const int nb = n / QK_TQ;
+    float tmp[QK_TQ];
+    double acc = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        dequantize_row_tq3_0(&kx[b], tmp, QK_TQ);
+        for (int i = 0; i < QK_TQ; ++i) acc += (double) q[(size_t) b * QK_TQ + i] * (double) tmp[i];
+    }
+    *s = (float) acc;
+}
+void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                            size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    const block_tq4_0 * GGML_RESTRICT kx = (const block_tq4_0 *) vx;
+    const float       * GGML_RESTRICT q  = (const float *) vy;
+    const int nb = n / QK_TQ;
+    float tmp[QK_TQ];
+    double acc = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        dequantize_row_tq4_0(&kx[b], tmp, QK_TQ);
+        for (int i = 0; i < QK_TQ; ++i) acc += (double) q[(size_t) b * QK_TQ + i] * (double) tmp[i];
+    }
+    *s = (float) acc;
+}

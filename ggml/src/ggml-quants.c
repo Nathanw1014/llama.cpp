@@ -5665,3 +5665,149 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+// ===========================================================================
+// TurboQuant KV-cache quantization (Zandieh et al., arXiv:2504.19874).
+//
+// Per QK_TQ-coordinate block: rotate by a fixed randomized Walsh-Hadamard
+// transform (makes coords ~i.i.d. Gaussian), scale by the per-block RMS
+// (block->d, fp16), quantize each coord against a fixed Lloyd-Max Gaussian
+// codebook, and store a 1-bit residual sign selecting one of two conditional-
+// mean sub-centroids (a 2-bit codebook then behaves like ~3-bit).  Data-
+// oblivious: no calibration, no imatrix.  QK_TQ = 64 divides the common head
+// dims (64/128/192/256), so a head_dim vector is 1..4 blocks.  Computed in
+// float; the algorithm is cross-validated in double by the numpy/C reference
+// (~/turboquant).  MSE-neutral vs the head_dim-length rotation (0.036 @ TQ3).
+// ===========================================================================
+
+// Fixed randomized-Hadamard sign vector (length QK_TQ), shared enc/dec.
+static const float tq_rht_sign[QK_TQ] = {
+    -1,  1, -1,  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1, -1,
+    -1,  1, -1,  1, -1, -1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1,
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1,
+     1, -1,  1,  1, -1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,  1,
+};
+// TQ3: 2-bit Lloyd-Max Gaussian codebook + per-bin conditional-mean sub-centroids.
+static const float tq3_centroids[4] = { -1.5105785f, -0.45407808f, 0.44827677f, 1.5068180f };
+static const float tq3_subcent[4][2] = {
+    { -1.9503599f, -1.2182396f }, { -0.7018253f, -0.2238370f },
+    {  0.2191074f,  0.6958017f }, {  1.2132320f,  1.9444058f },
+};
+// TQ4: 3-bit Lloyd-Max Gaussian codebook.
+static const float tq4_centroids[8] = {
+    -2.1517644f, -1.3379617f, -0.7502900f, -0.2392333f, 0.2489758f, 0.7585201f, 1.3472227f, 2.1569649f,
+};
+static const float tq4_subcent[8][2] = {
+    { -2.5114917f, -1.9226571f }, { -1.5200004f, -1.1829770f }, { -0.8905068f, -0.6194176f }, { -0.3653122f, -0.1166592f },
+    {  0.1263628f,  0.3743534f }, {  0.6277232f,  0.8995532f }, {  1.1912387f,  1.5285123f }, {  1.9283417f,  2.5125852f },
+};
+
+static void tq_fwht(float * a) { // unnormalized fast Walsh-Hadamard, length QK_TQ
+    for (int h = 1; h < QK_TQ; h <<= 1) {
+        for (int i = 0; i < QK_TQ; i += (h << 1)) {
+            for (int j = i; j < i + h; ++j) {
+                const float u = a[j], v = a[j + h];
+                a[j] = u + v; a[j + h] = u - v;
+            }
+        }
+    }
+}
+static void tq_rht_forward(const float * x, float * u) { // R(x): norm-preserving
+    const float s = 1.0f / sqrtf((float) QK_TQ);
+    for (int i = 0; i < QK_TQ; ++i) u[i] = tq_rht_sign[i] * x[i];
+    tq_fwht(u);
+    for (int i = 0; i < QK_TQ; ++i) u[i] *= s;
+}
+static void tq_rht_inverse(const float * u, float * x) { // R^{-1} = R^T (H symmetric)
+    const float s = 1.0f / sqrtf((float) QK_TQ);
+    for (int i = 0; i < QK_TQ; ++i) x[i] = u[i];
+    tq_fwht(x);
+    for (int i = 0; i < QK_TQ; ++i) x[i] = tq_rht_sign[i] * (x[i] * s);
+}
+static inline void tq_put_bits(uint8_t * buf, int bitpos, int nbits, uint32_t val) {
+    for (int b = 0; b < nbits; ++b) { const int p = bitpos + b;
+        if (val & (1u << b)) buf[p >> 3] |=  (uint8_t)(1u << (p & 7));
+        else                 buf[p >> 3] &= (uint8_t)~(1u << (p & 7)); }
+}
+static inline uint32_t tq_get_bits(const uint8_t * buf, int bitpos, int nbits) {
+    uint32_t v = 0;
+    for (int b = 0; b < nbits; ++b) { const int p = bitpos + b;
+        if (buf[p >> 3] & (1u << (p & 7))) v |= (1u << b); }
+    return v;
+}
+static inline int tq_nearest(float w, const float * c, int L) {
+    int best = 0; float bd = fabsf(w - c[0]);
+    for (int k = 1; k < L; ++k) { const float d = fabsf(w - c[k]); if (d < bd) { bd = d; best = k; } }
+    return best;
+}
+
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ == 0);
+    const int64_t nb = k / QK_TQ;
+    for (int64_t b = 0; b < nb; ++b, x += QK_TQ, ++y) {
+        float u[QK_TQ];
+        tq_rht_forward(x, u);
+        float nrm = 0.0f; for (int i = 0; i < QK_TQ; ++i) nrm += u[i] * u[i];
+        float gamma = sqrtf(nrm) / sqrtf((float) QK_TQ);
+        if (gamma < 1e-12f) gamma = 1e-12f;
+        memset(y->idx, 0, sizeof(y->idx));
+        memset(y->sgn, 0, sizeof(y->sgn));
+        const float inv = 1.0f / gamma;
+        for (int i = 0; i < QK_TQ; ++i) {
+            const float w = u[i] * inv;
+            const int idx = tq_nearest(w, tq3_centroids, 4);
+            tq_put_bits(y->idx, i * 2, 2, (uint32_t) idx);
+            if (w >= tq3_centroids[idx]) y->sgn[i >> 3] |= (uint8_t)(1u << (i & 7));
+        }
+        y->d = GGML_FP32_TO_FP16(gamma);
+    }
+}
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ == 0);
+    const int64_t nb = k / QK_TQ;
+    for (int64_t b = 0; b < nb; ++b, ++x, y += QK_TQ) {
+        const float gamma = GGML_FP16_TO_FP32(x->d);
+        float u[QK_TQ];
+        for (int i = 0; i < QK_TQ; ++i) {
+            const int idx = (int) tq_get_bits(x->idx, i * 2, 2);
+            const int sg  = (x->sgn[i >> 3] >> (i & 7)) & 1;
+            u[i] = gamma * tq3_subcent[idx][sg];
+        }
+        tq_rht_inverse(u, y);
+    }
+}
+void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ == 0);
+    const int64_t nb = k / QK_TQ;
+    for (int64_t b = 0; b < nb; ++b, x += QK_TQ, ++y) {
+        float u[QK_TQ];
+        tq_rht_forward(x, u);
+        float nrm = 0.0f; for (int i = 0; i < QK_TQ; ++i) nrm += u[i] * u[i];
+        float gamma = sqrtf(nrm) / sqrtf((float) QK_TQ);
+        if (gamma < 1e-12f) gamma = 1e-12f;
+        memset(y->idx, 0, sizeof(y->idx));
+        memset(y->sgn, 0, sizeof(y->sgn));
+        const float inv = 1.0f / gamma;
+        for (int i = 0; i < QK_TQ; ++i) {
+            const float w = u[i] * inv;
+            const int idx = tq_nearest(w, tq4_centroids, 8);
+            tq_put_bits(y->idx, i * 3, 3, (uint32_t) idx);
+            if (w >= tq4_centroids[idx]) y->sgn[i >> 3] |= (uint8_t)(1u << (i & 7));
+        }
+        y->d = GGML_FP32_TO_FP16(gamma);
+    }
+}
+void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ == 0);
+    const int64_t nb = k / QK_TQ;
+    for (int64_t b = 0; b < nb; ++b, ++x, y += QK_TQ) {
+        const float gamma = GGML_FP16_TO_FP32(x->d);
+        float u[QK_TQ];
+        for (int i = 0; i < QK_TQ; ++i) {
+            const int idx = (int) tq_get_bits(x->idx, i * 3, 3);
+            const int sg  = (x->sgn[i >> 3] >> (i & 7)) & 1;
+            u[i] = gamma * tq4_subcent[idx][sg];
+        }
+        tq_rht_inverse(u, y);
+    }
+}

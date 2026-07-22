@@ -99,6 +99,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_BF16 30u
 #define FA_TYPE_Q1_0 41u
+#define FA_TYPE_TQ3_0 43u // TurboQuant KV: block dequant-with-RHT (see flash_attn_dequant.glsl)
 
 #if defined(BFLOAT16)
 #define O_TYPE float
@@ -122,6 +123,7 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_BF16: return 1u;
         case FA_TYPE_Q1_0: return uint(QUANT_K_Q1_0); // cm2-only, harmless elsewhere
+        case FA_TYPE_TQ3_0: return 64u;               // TurboQuant block = 64 coords
         default:           return 1u;
     }
 }

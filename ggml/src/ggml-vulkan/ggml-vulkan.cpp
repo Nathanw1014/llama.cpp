@@ -17614,6 +17614,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_TQ3_0: // TurboQuant: block dequant-with-RHT in flash_attn_dequant.glsl
                         return true;
                     case GGML_TYPE_Q1_0:
                         return coopmat2;

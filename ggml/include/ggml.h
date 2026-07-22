@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TQ3_0   = 43, // TurboQuant KV (2-bit codebook + 1-bit residual sign)
+        GGML_TYPE_TQ4_0   = 44, // TurboQuant KV (3-bit codebook + 1-bit residual sign)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision

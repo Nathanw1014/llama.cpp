@@ -287,6 +287,26 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TurboQuant KV-cache types (Zandieh et al., arXiv:2504.19874).  Unrelated to the
+// ternary tq1_0/tq2_0 above: each block is a QK_TQ-coordinate sub-vector, stored as
+// a randomized-Hadamard-rotated codebook index + 1-bit residual sign per coord,
+// plus a per-block RMS scale (fp16).  See ggml-quants.c.  QK_TQ = 64 divides the
+// common head dims (64/128/192/256), so a head_dim vector is 1..4 blocks; head dims
+// that are not a multiple of 64 are not yet supported (would need padding).
+#define QK_TQ 64
+typedef struct {
+    uint8_t   idx[QK_TQ * 2 / 8]; // 16: 2-bit codebook indices (LSB-first packed)
+    uint8_t   sgn[QK_TQ     / 8]; //  8: 1-bit residual signs
+    ggml_half d;                  //  2: per-block RMS scale (gamma)
+} block_tq3_0;                    // 26 B -> 3.25 bits/val (4.9x vs fp16)
+static_assert(sizeof(block_tq3_0) == 26, "wrong tq3_0 block size/padding");
+typedef struct {
+    uint8_t   idx[QK_TQ * 3 / 8]; // 24: 3-bit codebook indices
+    uint8_t   sgn[QK_TQ     / 8]; //  8: 1-bit residual signs
+    ggml_half d;                  //  2: per-block RMS scale (gamma)
+} block_tq4_0;                    // 34 B -> 4.25 bits/val (3.8x vs fp16)
+static_assert(sizeof(block_tq4_0) == 34, "wrong tq4_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

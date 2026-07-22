@@ -36,6 +36,24 @@ layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_
 layout (binding = 1) readonly buffer K_PACKED_Q4_1_P32 { block_q4_1_packed32 data[]; } k_packed_q4_1_p32;
 layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 data[]; } k_packed_q5_1_p32;
 
+// TurboQuant TQ3: a block is a whole 64-coord vector (unlike the per-element
+// quants above), so dequantize4 dequantizes the ENTIRE block with the inverse
+// randomized Walsh-Hadamard rotation and returns the 4 requested coords. 26-byte
+// block via 16-bit members (idx: 8 x 2-bit per u16; sgn: 16 x 1-bit per u16;
+// d = fp16 gamma). Redundant (recomputes the block per dequantize4 call) but
+// correct; a cooperative once-per-block dequant is the perf follow-up.
+struct block_tq3_0 { uint16_t idx[8]; uint16_t sgn[4]; uint16_t d; };
+layout (binding = 1) readonly buffer K_PACKED_TQ3_0 { block_tq3_0 data[]; } k_packed_tq3_0;
+layout (binding = 2) readonly buffer V_PACKED_TQ3_0 { block_tq3_0 data[]; } v_packed_tq3_0;
+const float TQ3_SGN[64] = float[64](
+    -1., 1.,-1., 1., 1.,-1.,-1.,-1.,-1., 1., 1., 1., 1., 1., 1.,-1.,
+    -1., 1.,-1., 1.,-1.,-1.,-1., 1., 1., 1.,-1.,-1., 1.,-1.,-1.,-1.,
+    -1., 1., 1.,-1.,-1., 1.,-1., 1.,-1.,-1.,-1.,-1.,-1., 1., 1.,-1.,
+     1.,-1., 1., 1.,-1.,-1.,-1., 1.,-1., 1., 1.,-1., 1., 1., 1., 1.);
+const float TQ3_SUB[8] = float[8](
+    -1.9503599, -1.2182396, -0.7018253, -0.2238370,
+     0.2191074,  0.6958017,  1.2132320,  1.9444058);
+
 // Per-quant decode bodies are expanded once for the K view set and once for
 // the V view set. The macros take the buffer name as a parameter.
 #define FA_DEQUANT4_F32(BUF) \
@@ -102,6 +120,29 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     return FLOAT_TYPE(BUF.data[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);          \
 }
 
+// Direct inverse RHT of only the 4 requested coords: out[i] = sign[i]*(gamma/8)*
+// sum_j H(i,j)*subcent_j, with H(i,j) = (-1)^popcount(i&j). No u[64] / FWHT /
+// register spill; computes 4 coords per call instead of the full 64-then-discard-60.
+#define FA_DEQUANT4_TQ3_0(BUF) {                                                                  \
+    float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x * 0.125;                         \
+    float _a0 = 0.0, _a1 = 0.0, _a2 = 0.0, _a3 = 0.0;                                             \
+    for (uint _j = 0u; _j < 64u; ++_j) {                                                          \
+        uint _iw = uint(BUF.data[a_offset + ib].idx[_j >> 3]);                                    \
+        int  _ix = int((_iw >> ((_j & 7u) * 2u)) & 3u);                                           \
+        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                    \
+        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                 \
+        float _sc = TQ3_SUB[_ix * 2 + _sg];                                                       \
+        _a0 += ((bitCount(iqs        & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a1 += ((bitCount((iqs + 1u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a2 += ((bitCount((iqs + 2u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a3 += ((bitCount((iqs + 3u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+    }                                                                                            \
+    return FLOAT_TYPEV4(FLOAT_TYPE(TQ3_SGN[iqs     ] * _g * _a0),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 1u] * _g * _a1),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 2u] * _g * _a2),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 3u] * _g * _a3));                                \
+}
+
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
@@ -114,6 +155,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
+            case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(k_packed_tq3_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
         }
     } else {
@@ -124,6 +166,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
+            case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(v_packed_tq3_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
         }
     }
