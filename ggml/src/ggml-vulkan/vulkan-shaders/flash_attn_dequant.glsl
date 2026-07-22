@@ -246,8 +246,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
+#ifdef FA_TQ_ROTATED_Q
+            // O = sum_j p_j R^-1(u_j) = R^-1(sum_j p_j u_j), so accumulate the
+            // stored values and inverse-rotate the accumulator once at the end.
+            case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0_U(v_packed_tq3_0)
+            case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0_U(v_packed_tq4_0)
+#else
             case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(v_packed_tq3_0)
             case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0(v_packed_tq4_0)
+#endif
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
         }
     }

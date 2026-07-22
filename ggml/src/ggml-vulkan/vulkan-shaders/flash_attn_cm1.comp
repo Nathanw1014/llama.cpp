@@ -520,7 +520,9 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
-#if !defined(BFLOAT16)
+// As with K: under the asymmetric path the V decode is per-element, so the
+// cooperative block fill is dead weight -- the output rotation replaces it.
+#if !defined(BFLOAT16) && !defined(FA_TQ_ROTATED_Q)
             if (FaTypeV == FA_TYPE_TQ3_0 || FaTypeV == FA_TYPE_TQ4_0) {
                 // Cooperative once-per-block dequant of the V tile into kvsh (mirror of K).
                 const uint _bpr = HSV / 64u;
@@ -715,6 +717,58 @@ void main() {
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
         Lf[r] = subgroupAdd(Lf[r]);
     }
+
+#if !defined(BFLOAT16)
+    // Asymmetric V: Of holds sum_j p_j * u_j in the packed domain. R^-1 is
+    // linear, so the true output is R^-1 of that -- inverse-rotate the
+    // accumulator ONCE here rather than rotating every V block in the KV loop.
+    // Commutes with the later 1/L scaling and with split_k's partial sum, both
+    // being linear. pvsh is free after the loop and is exactly Br x 64 scalars.
+    if (FaTypeV == FA_TYPE_TQ3_0 || FaTypeV == FA_TYPE_TQ4_0) {
+        const uint _vbpr = HSV / 64u;
+        const uint _grp  = gl_WorkGroupSize.x / 64u;
+        const uint _gid  = tid / 64u;
+        const uint _lane = tid % 64u;
+        for (uint _b = 0u; _b < _vbpr; ++_b) {
+            barrier();
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                [[unroll]] for (uint32_t dl = 0; dl < d_per_thread; ++dl) {
+                    const uint _c0 = 4u * (dl * threads_per_rowgroup + col_tid);
+                    if (_c0 >= _b * 64u && _c0 < _b * 64u + 64u && _c0 < HSV) {
+                        pvsh[tile_row(r) * osh_stride + ((_c0 - _b * 64u) >> 2)] = Of[r][dl];
+                    }
+                }
+            }
+            barrier();
+            for (uint _it = 0u; _it * _grp < Br; ++_it) {
+                const uint _row = _it * _grp + _gid;
+                const bool _act = _row < Br;
+                tq_sh[tid] = _act ? float(pvsh[_row * osh_stride + (_lane >> 2)][_lane & 3u]) : 0.0;
+                barrier();
+                for (uint _h = 1u; _h < 64u; _h <<= 1u) {
+                    float _mine = tq_sh[tid];
+                    float _oth  = tq_sh[_gid * 64u + (_lane ^ _h)];
+                    barrier();
+                    tq_sh[tid] = ((_lane & _h) == 0u) ? (_mine + _oth) : (_oth - _mine);
+                    barrier();
+                }
+                if (_act) {
+                    pvsh[_row * osh_stride + (_lane >> 2)][_lane & 3u] = O_TYPE(TQ3_SGN[_lane] * tq_sh[tid] * 0.125);
+                }
+                barrier();
+            }
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                [[unroll]] for (uint32_t dl = 0; dl < d_per_thread; ++dl) {
+                    const uint _c0 = 4u * (dl * threads_per_rowgroup + col_tid);
+                    if (_c0 >= _b * 64u && _c0 < _b * 64u + 64u && _c0 < HSV) {
+                        Of[r][dl] = pvsh[tile_row(r) * osh_stride + ((_c0 - _b * 64u) >> 2)];
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+#endif
 
     // If there is split_k, then the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
