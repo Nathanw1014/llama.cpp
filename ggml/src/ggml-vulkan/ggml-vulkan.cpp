@@ -3509,7 +3509,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(v_type);
     GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
@@ -3535,7 +3534,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // block-FWHT dequant, so force the shmem-staging path for it (normally NV-only).
     // GGML_VK_TQ_NO_STAGING=1 disables the force -> falls back to the non-staging
     // direct-Hadamard dequant4 path (for A/B benchmarking).
-    const bool tq_block = (k_type == GGML_TYPE_TQ3_0) && (getenv("GGML_VK_TQ_NO_STAGING") == nullptr);
+    // Either side being TurboQuant is enough: the K and V staging fills each have
+    // their own cooperative path, and the shared FWHT scratch is sized for both.
+    const auto is_tq = [](ggml_type t) { return t == GGML_TYPE_TQ3_0 || t == GGML_TYPE_TQ4_0; };
+    const bool tq_block = (is_tq(k_type) || is_tq(v_type)) && (getenv("GGML_VK_TQ_NO_STAGING") == nullptr);
     result.shmem_staging = (((device->vendor_id == VK_VENDOR_ID_NVIDIA) || tq_block) && hsk < 256 && hsv < 256) ? 1 : 0;
 
     return result;

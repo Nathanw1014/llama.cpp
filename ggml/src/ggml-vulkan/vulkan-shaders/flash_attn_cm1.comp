@@ -63,7 +63,10 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 // TurboQuant cooperative block-FWHT scratch (one float/thread; sized to ~nothing
 // for non-tq3_0 pipelines via the spec-constant, full for the tq3_0 pipeline).
-shared float tq_sh[(FaTypeK == FA_TYPE_TQ3_0) ? 256u : 1u];
+// Cooperative TurboQuant FWHT scratch. Sized from BOTH K and V: the V fill uses
+// it too, so an asymmetric pair (e.g. K=q8_0, V=tq3_0) must still allocate it.
+shared float tq_sh[(FaTypeK == FA_TYPE_TQ3_0 || FaTypeK == FA_TYPE_TQ4_0 ||
+                    FaTypeV == FA_TYPE_TQ3_0 || FaTypeV == FA_TYPE_TQ4_0) ? 256u : 1u];
 
 shared ACC_TYPE slope[Br];
 
@@ -230,10 +233,11 @@ void main() {
 
         if (SHMEM_STAGING != 0) {
 #if !defined(BFLOAT16)
-            if (FaTypeK == FA_TYPE_TQ3_0) {
+            if (FaTypeK == FA_TYPE_TQ3_0 || FaTypeK == FA_TYPE_TQ4_0) {
                 // Cooperative once-per-block dequant of the K tile into kvsh: one
                 // 64-lane group per 64-coord block does the inverse RHT via a
                 // shared FWHT (no per-4-coord redundancy, no register spill).
+                // TQ3/TQ4 share everything but the per-lane codebook fetch.
                 const uint _bpr = HSK / 64u;            // blocks per row
                 const uint _NB  = Bc * _bpr;
                 const uint _grp = gl_WorkGroupSize.x / 64u;
@@ -249,10 +253,20 @@ void main() {
                     float _sc = 0.0;
                     if (_val) {
                         uint _ib = k_offset + (j * Bc + _c) * k_stride + _bir;
-                        float _g = unpackHalf2x16(uint(k_packed_tq3_0.data[_ib].d)).x;
-                        int _ix = int((uint(k_packed_tq3_0.data[_ib].idx[_lane >> 3]) >> ((_lane & 7u) * 2u)) & 3u);
-                        int _sg = int((uint(k_packed_tq3_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
-                        _sc = _g * TQ3_SUB[_ix * 2 + _sg];
+                        if (FaTypeK == FA_TYPE_TQ3_0) {
+                            float _g = unpackHalf2x16(uint(k_packed_tq3_0.data[_ib].d)).x;
+                            int _ix = int((uint(k_packed_tq3_0.data[_ib].idx[_lane >> 3]) >> ((_lane & 7u) * 2u)) & 3u);
+                            int _sg = int((uint(k_packed_tq3_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
+                            _sc = _g * TQ3_SUB[_ix * 2 + _sg];
+                        } else {
+                            // TQ4: 3-bit index straddles the u16 words (3 does not divide 16)
+                            float _g = unpackHalf2x16(uint(k_packed_tq4_0.data[_ib].d)).x;
+                            uint _p = _lane * 3u, _w = _p >> 4u, _o = _p & 15u;
+                            uint _iv = uint(k_packed_tq4_0.data[_ib].idx[_w]) >> _o;
+                            if (_o > 13u) _iv |= uint(k_packed_tq4_0.data[_ib].idx[_w + 1u]) << (16u - _o);
+                            int _sg = int((uint(k_packed_tq4_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
+                            _sc = _g * TQ4_SUB[int(_iv & 7u) * 2 + _sg];
+                        }
                     }
                     tq_sh[tid] = _sc;
                     barrier();
@@ -446,7 +460,7 @@ void main() {
 
         if (SHMEM_STAGING != 0) {
 #if !defined(BFLOAT16)
-            if (FaTypeV == FA_TYPE_TQ3_0) {
+            if (FaTypeV == FA_TYPE_TQ3_0 || FaTypeV == FA_TYPE_TQ4_0) {
                 // Cooperative once-per-block dequant of the V tile into kvsh (mirror of K).
                 const uint _bpr = HSV / 64u;
                 const uint _NB  = Bc * _bpr;
@@ -463,10 +477,20 @@ void main() {
                     float _sc = 0.0;
                     if (_val) {
                         uint _ib = v_offset + (j * Bc + _c) * v_stride + _bir;
-                        float _g = unpackHalf2x16(uint(v_packed_tq3_0.data[_ib].d)).x;
-                        int _ix = int((uint(v_packed_tq3_0.data[_ib].idx[_lane >> 3]) >> ((_lane & 7u) * 2u)) & 3u);
-                        int _sg = int((uint(v_packed_tq3_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
-                        _sc = _g * TQ3_SUB[_ix * 2 + _sg];
+                        if (FaTypeV == FA_TYPE_TQ3_0) {
+                            float _g = unpackHalf2x16(uint(v_packed_tq3_0.data[_ib].d)).x;
+                            int _ix = int((uint(v_packed_tq3_0.data[_ib].idx[_lane >> 3]) >> ((_lane & 7u) * 2u)) & 3u);
+                            int _sg = int((uint(v_packed_tq3_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
+                            _sc = _g * TQ3_SUB[_ix * 2 + _sg];
+                        } else {
+                            // TQ4: 3-bit index straddles the u16 words (3 does not divide 16)
+                            float _g = unpackHalf2x16(uint(v_packed_tq4_0.data[_ib].d)).x;
+                            uint _p = _lane * 3u, _w = _p >> 4u, _o = _p & 15u;
+                            uint _iv = uint(v_packed_tq4_0.data[_ib].idx[_w]) >> _o;
+                            if (_o > 13u) _iv |= uint(v_packed_tq4_0.data[_ib].idx[_w + 1u]) << (16u - _o);
+                            int _sg = int((uint(v_packed_tq4_0.data[_ib].sgn[_lane >> 4]) >> (_lane & 15u)) & 1u);
+                            _sc = _g * TQ4_SUB[int(_iv & 7u) * 2 + _sg];
+                        }
                     }
                     tq_sh[tid] = _sc;
                     barrier();
