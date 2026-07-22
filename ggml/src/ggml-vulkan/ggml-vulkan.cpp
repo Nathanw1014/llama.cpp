@@ -3507,7 +3507,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 }
 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
     GGML_UNUSED(f32acc);
 
@@ -3530,14 +3529,40 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const auto is_tq = [](ggml_type t) { return t == GGML_TYPE_TQ3_0 || t == GGML_TYPE_TQ4_0; };
     const bool tq_block = (is_tq(k_type) || is_tq(v_type)) && (getenv("GGML_VK_TQ_NO_STAGING") == nullptr);
 
-    // NOTE: Br is NOT independently widenable here, despite being a spec constant.
-    // TurboQuant re-dequantizes the KV tile per QUERY tile, so a wider Br would
-    // amortize the block-RHT over more queries -- but the coopmat1 PV path is built
-    // around the fixed 16-row cooperative-matrix tile (pvsh is sized on MatBr=16),
-    // so Br>16 silently corrupts the output. Verified: Br=32/64 produce garbage.
-    // Widening requires restructuring the QK/PV matmuls to loop over Br/MatBr
-    // row-tiles -- a real shader change, not a tuning knob.
-    result.block_rows = coopmat_block_rows;
+    // FA re-stages the KV tile for every QUERY tile. For ordinary quants that is a
+    // cheap re-read, but TurboQuant pays a full block-RHT each time, so its cost is
+    // dominated by how many query tiles it has to sweep. The cm1 shader iterates
+    // Br/MatBr row-tiles with the K/V loads hoisted out, so a wider Br reuses each
+    // dequantized KV tile across more query rows.
+    //
+    // Only worth it once there are enough query rows to fill the wider tile -- below
+    // that the extra rows are wasted work. Measured on gfx1151 (Llama-1B, d16384,
+    // tq4_0 t/s, Br=16/32/64; the 32/48 rows are r=10 on an otherwise idle GPU):
+    //     n_rows=1     40.5 / 26.9 / 25.5     -> 16
+    //     n_rows=16   171.5 / 99.2 / 92.1     -> 16
+    //     n_rows=32   183.9 / 193.6 / 181.7   -> all three within noise
+    //     n_rows=48   244.7 / 146.3 / 261.2   -> Br=32 is 40% WORSE than Br=16
+    //     n_rows=64   221.2 / 228.4 / 396.6   -> 64  (+79%)
+    //     n_rows=256  320.0 /   -   / 444.3   -> 64  (+39%)
+    // There is deliberately NO Br=32 tier. Its apparent +7% at n_rows=32 did not
+    // survive re-measurement on an idle GPU (error bars overlap at r=10), and at
+    // n_rows=48 it collapses: two tiles that each waste rows, without the
+    // single-sweep win Br=64 gets. So this is a two-state rule -- a wide tile for
+    // prefill-sized batches, 16 otherwise (decode pays ~37% for a wide tile).
+    // TurboQuant only; other types are unmeasured and keep the default.
+    // Override for A/B: GGML_VK_TQ_BR = 16 | 32 | 64.
+    uint32_t tq_block_rows = coopmat_block_rows;
+    if (tq_block) {
+        tq_block_rows = (n_rows >= 64) ? 64 : coopmat_block_rows;
+        if (const char * s = getenv("GGML_VK_TQ_BR")) {
+            const uint32_t v = (uint32_t) atoi(s);
+            if (v == 16 || v == 32 || v == 64) {
+                tq_block_rows = v;
+            }
+        }
+    }
+
+    result.block_rows = tq_block ? tq_block_rows : coopmat_block_rows;
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
@@ -10396,11 +10421,18 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    // pvsh is indexed by QUERY row, so it scales with Br (these coincide only at Br==16).
+    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope;
+    // TurboQuant's cooperative block-FWHT scratch (shared float tq_sh[256]).
+    // Only allocated for TQ pipelines. Note: the shader sizes it from K *or* V, but
+    // only k_type is available here, so an asymmetric (K=q8_0, V=tq) pair undercounts
+    // by this 1 KiB.
+    const uint32_t tq_sh = (k_type == GGML_TYPE_TQ3_0 || k_type == GGML_TYPE_TQ4_0) ? 256u * 4u : 0u;
+
+    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope + tq_sh;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
