@@ -19,6 +19,11 @@
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
+// TurboQuant asymmetric path: this shader forward-rotates Q into the packed
+// domain during Q staging, so the K dequant can skip the inverse RHT entirely
+// (<q, R^-1(u)> == <R(q), u>, R orthogonal). Scoped to this shader -- the
+// scalar path does not rotate Q, so it keeps the self-contained K decode.
+#define FA_TQ_ROTATED_Q 1
 #if !defined(BFLOAT16)
 #include "flash_attn_dequant.glsl"
 #endif
@@ -114,6 +119,45 @@ void main() {
         }
     }
     barrier();
+
+#if !defined(BFLOAT16)
+    // TurboQuant asymmetric path: forward-rotate Q into the packed domain, ONCE
+    // per query tile. This replaces a full inverse RHT per K block (which scaled
+    // with n_kv) by one rotation of Br rows -- the whole point of the asymmetric
+    // formulation. One 64-lane group per 64-coord block, FWHT through tq_sh.
+    if (FaTypeK == FA_TYPE_TQ3_0 || FaTypeK == FA_TYPE_TQ4_0) {
+        const uint _bpr  = HSK / 64u;             // 64-coord blocks per Q row
+        const uint _NB   = Br * _bpr;
+        const uint _grp  = gl_WorkGroupSize.x / 64u;
+        const uint _gid  = tid / 64u;
+        const uint _lane = tid % 64u;
+        const uint _nit  = (_NB + _grp - 1u) / _grp;
+        for (uint _it = 0u; _it < _nit; ++_it) {
+            const uint _bi = _it * _grp + _gid;
+            const bool _act = _bi < _NB;
+            const uint _r = _act ? (_bi / _bpr) : 0u;
+            const uint _b = _act ? (_bi % _bpr) : 0u;
+            const uint _qi = _r * qstride + _b * 16u + (_lane >> 2);
+            float _v = 0.0;
+            if (_act) {
+                _v = TQ3_SGN[_lane] * float(Qf[_qi][_lane & 3u]);
+            }
+            tq_sh[tid] = _v;
+            barrier();
+            for (uint _h = 1u; _h < 64u; _h <<= 1u) {
+                float _mine = tq_sh[tid];
+                float _oth  = tq_sh[_gid * 64u + (_lane ^ _h)];
+                barrier();
+                tq_sh[tid] = ((_lane & _h) == 0u) ? (_mine + _oth) : (_oth - _mine);
+                barrier();
+            }
+            if (_act) {
+                Qf[_qi][_lane & 3u] = FLOAT_TYPE(tq_sh[tid] * 0.125);
+            }
+            barrier();
+        }
+    }
+#endif
 
     O_TYPEV4 Of[rows_per_thread][d_per_thread];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -239,7 +283,10 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
-#if !defined(BFLOAT16)
+// Under the asymmetric path the K decode is per-element (no inverse RHT), so the
+// cooperative block fill has nothing left to amortize -- the plain staging loop
+// calling dequantize4 is both simpler and cheaper. V still needs it.
+#if !defined(BFLOAT16) && !defined(FA_TQ_ROTATED_Q)
             if (FaTypeK == FA_TYPE_TQ3_0 || FaTypeK == FA_TYPE_TQ4_0) {
                 // Cooperative once-per-block dequant of the K tile into kvsh: one
                 // 64-lane group per 64-coord block does the inverse RHT via a

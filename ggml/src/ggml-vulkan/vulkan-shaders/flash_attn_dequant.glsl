@@ -179,6 +179,42 @@ const float TQ4_SUB[16] = float[16](
                         FLOAT_TYPE(TQ3_SGN[iqs + 3u] * _g * _a3));                                \
 }
 
+// Asymmetric K decode. Returns the STORED rotated-domain values u = gamma *
+// sub_centroid, with NO inverse RHT: since R is orthogonal, <q, R^-1(u)> equals
+// <R(q), u>, so the including shader forward-rotates Q once per query tile and
+// these dot against the packed values directly. That turns the block-coupled
+// transform into a per-element lookup, which is what dequantize4 actually wants.
+// Only valid under FA_TQ_ROTATED_Q; V still needs the full inverse rotation.
+#define FA_DEQUANT4_TQ3_0_U(BUF) {                                                                   \
+    float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x;                                    \
+    float _o[4];                                                                                     \
+    for (uint _k = 0u; _k < 4u; ++_k) {                                                              \
+        uint _j  = iqs + _k;                                                                         \
+        uint _iw = uint(BUF.data[a_offset + ib].idx[_j >> 3]);                                       \
+        int  _ix = int((_iw >> ((_j & 7u) * 2u)) & 3u);                                              \
+        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                       \
+        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                    \
+        _o[_k]   = _g * TQ3_SUB[_ix * 2 + _sg];                                                      \
+    }                                                                                                \
+    return FLOAT_TYPEV4(FLOAT_TYPE(_o[0]), FLOAT_TYPE(_o[1]), FLOAT_TYPE(_o[2]), FLOAT_TYPE(_o[3])); \
+}
+
+#define FA_DEQUANT4_TQ4_0_U(BUF) {                                                                   \
+    float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x;                                    \
+    float _o[4];                                                                                     \
+    for (uint _k = 0u; _k < 4u; ++_k) {                                                              \
+        uint _j  = iqs + _k;                                                                         \
+        uint _p  = _j * 3u;                                                                          \
+        uint _w  = _p >> 4u, _off = _p & 15u;                                                        \
+        uint _iv = uint(BUF.data[a_offset + ib].idx[_w]) >> _off;                                    \
+        if (_off > 13u) _iv |= uint(BUF.data[a_offset + ib].idx[_w + 1u]) << (16u - _off);           \
+        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                       \
+        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                     \
+        _o[_k]   = _g * TQ4_SUB[int(_iv & 7u) * 2 + _sg];                                            \
+    }                                                                                                \
+    return FLOAT_TYPEV4(FLOAT_TYPE(_o[0]), FLOAT_TYPE(_o[1]), FLOAT_TYPE(_o[2]), FLOAT_TYPE(_o[3])); \
+}
+
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
@@ -191,8 +227,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
+#ifdef FA_TQ_ROTATED_Q
+            // Q was forward-rotated by the including shader; dot against the
+            // packed values directly (no per-block inverse RHT).
+            case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0_U(k_packed_tq3_0)
+            case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0_U(k_packed_tq4_0)
+#else
             case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(k_packed_tq3_0)
             case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0(k_packed_tq4_0)
+#endif
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
         }
     } else {
