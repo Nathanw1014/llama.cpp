@@ -54,6 +54,16 @@ const float TQ3_SUB[8] = float[8](
     -1.9503599, -1.2182396, -0.7018253, -0.2238370,
      0.2191074,  0.6958017,  1.2132320,  1.9444058);
 
+// TurboQuant TQ4: same block shape as TQ3 but a 3-bit codebook (8 levels -> 16
+// sub-centroids). 34-byte block: idx = 12 x u16 (64 x 3-bit, packed LSB-first
+// across word boundaries), sgn = 4 x u16 (64 x 1-bit), d = fp16 gamma.
+struct block_tq4_0 { uint16_t idx[12]; uint16_t sgn[4]; uint16_t d; };
+layout (binding = 1) readonly buffer K_PACKED_TQ4_0 { block_tq4_0 data[]; } k_packed_tq4_0;
+layout (binding = 2) readonly buffer V_PACKED_TQ4_0 { block_tq4_0 data[]; } v_packed_tq4_0;
+const float TQ4_SUB[16] = float[16](
+    -2.5114917, -1.9226571, -1.5200004, -1.1829770, -0.8905068, -0.6194176, -0.3653122, -0.1166592,
+     0.1263628,  0.3743534,  0.6277232,  0.8995532,  1.1912387,  1.5285123,  1.9283417,  2.5125852);
+
 // Per-quant decode bodies are expanded once for the K view set and once for
 // the V view set. The macros take the buffer name as a parameter.
 #define FA_DEQUANT4_F32(BUF) \
@@ -143,6 +153,32 @@ const float TQ3_SUB[8] = float[8](
                         FLOAT_TYPE(TQ3_SGN[iqs + 3u] * _g * _a3));                                \
 }
 
+// TQ4 mirror of the TQ3 direct-Hadamard dequant: 3-bit index read with a
+// cross-u16-word fetch (fields straddle 16-bit words since 3 does not divide
+// 16), 16 sub-centroids, shared TQ3_SGN. Same per-4-coord Hadamard as TQ3.
+#define FA_DEQUANT4_TQ4_0(BUF) {                                                                  \
+    float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x * 0.125;                         \
+    float _a0 = 0.0, _a1 = 0.0, _a2 = 0.0, _a3 = 0.0;                                             \
+    for (uint _j = 0u; _j < 64u; ++_j) {                                                          \
+        uint _p = _j * 3u;                                                                        \
+        uint _w = _p >> 4u, _o = _p & 15u;                                                        \
+        uint _iv = uint(BUF.data[a_offset + ib].idx[_w]) >> _o;                                   \
+        if (_o > 13u) _iv |= uint(BUF.data[a_offset + ib].idx[_w + 1u]) << (16u - _o);            \
+        int  _ix = int(_iv & 7u);                                                                 \
+        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                    \
+        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                 \
+        float _sc = TQ4_SUB[_ix * 2 + _sg];                                                       \
+        _a0 += ((bitCount(iqs        & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a1 += ((bitCount((iqs + 1u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a2 += ((bitCount((iqs + 2u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+        _a3 += ((bitCount((iqs + 3u) & _j) & 1) == 0) ? _sc : -_sc;                               \
+    }                                                                                            \
+    return FLOAT_TYPEV4(FLOAT_TYPE(TQ3_SGN[iqs     ] * _g * _a0),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 1u] * _g * _a1),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 2u] * _g * _a2),                                 \
+                        FLOAT_TYPE(TQ3_SGN[iqs + 3u] * _g * _a3));                                \
+}
+
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
@@ -156,6 +192,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
             case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(k_packed_tq3_0)
+            case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0(k_packed_tq4_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
         }
     } else {
@@ -167,6 +204,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
             case FA_TYPE_TQ3_0: FA_DEQUANT4_TQ3_0(v_packed_tq3_0)
+            case FA_TYPE_TQ4_0: FA_DEQUANT4_TQ4_0(v_packed_tq4_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
         }
     }

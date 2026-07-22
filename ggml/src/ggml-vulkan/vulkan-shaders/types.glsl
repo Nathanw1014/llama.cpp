@@ -211,6 +211,21 @@ struct block_tq3_0
 #define A_TYPE block_tq3_0
 #endif
 
+// TurboQuant TQ4: 3-bit codebook. 3-bit indices are packed LSB-first across the
+// 16-bit words, so a field can straddle a word boundary (handled in the encoder).
+#if defined(DATA_A_TQ4_0)
+struct block_tq4_0
+{
+    uint16_t  idx[12]; // 64 x 3-bit codebook indices (LSB-first, cross-word)
+    uint16_t  sgn[4];  // 64 x 1-bit residual signs (16 per u16)
+    float16_t d;       // per-block RMS scale (gamma)
+};
+#define QUANT_K 64
+#define QUANT_R 1
+#define QUANT_AUXF 1
+#define A_TYPE block_tq4_0
+#endif
+
 #define QUANT_K_Q1_0 128
 #define QUANT_R_Q1_0 1
 
