@@ -195,6 +195,22 @@ struct block_q8_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+// TurboQuant TQ3: 64-coord block (RHT-rotated codebook idx + 1-bit sign + fp16
+// gamma). Struct guarded so only the copy_to_quant TQ3 variant (which enables
+// int16) sees the 16-bit members; the FA read path defines its own copy.
+#if defined(DATA_A_TQ3_0)
+struct block_tq3_0
+{
+    uint16_t  idx[8];  // 64 x 2-bit codebook indices (8 per u16, LSB-first)
+    uint16_t  sgn[4];  // 64 x 1-bit residual signs (16 per u16)
+    float16_t d;       // per-block RMS scale (gamma)
+};
+#define QUANT_K 64
+#define QUANT_R 1
+#define QUANT_AUXF 1
+#define A_TYPE block_tq3_0
+#endif
+
 #define QUANT_K_Q1_0 128
 #define QUANT_R_Q1_0 1
 

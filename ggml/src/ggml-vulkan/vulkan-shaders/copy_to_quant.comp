@@ -1,5 +1,11 @@
 #version 450
 
+#if defined(DATA_A_TQ3_0)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 #include "types.glsl"
 
 #if defined(SET_ROWS) && QUANT_K == 1
@@ -179,6 +185,40 @@ void quantize(uint dst_idx, uint src_idx)
         const float x0 = float(data_s[src_idx + j])*id;
 
         data_q[dst_idx].qs[j] = int8_t(round(x0));
+    }
+}
+#endif
+
+#if defined(DATA_A_TQ3_0)
+// TurboQuant TQ3 block encode: randomized-Hadamard forward rotation, per-block
+// RMS scale (gamma), nearest 2-bit codebook index + 1-bit residual sign.
+const float TQ3_SGN[64] = float[64](
+    -1., 1.,-1., 1., 1.,-1.,-1.,-1.,-1., 1., 1., 1., 1., 1., 1.,-1.,
+    -1., 1.,-1., 1.,-1.,-1.,-1., 1., 1., 1.,-1.,-1., 1.,-1.,-1.,-1.,
+    -1., 1., 1.,-1.,-1., 1.,-1., 1.,-1.,-1.,-1.,-1.,-1., 1., 1.,-1.,
+     1.,-1., 1., 1.,-1.,-1.,-1., 1.,-1., 1., 1.,-1., 1., 1., 1., 1.);
+const float TQ3_CENT[4] = float[4](-1.5105785, -0.45407808, 0.44827677, 1.5068180);
+void quantize(uint dst_idx, uint src_idx)
+{
+    float u[64];
+    for (int i = 0; i < 64; ++i) u[i] = TQ3_SGN[i] * float(data_s[src_idx + i]);
+    for (int h = 1; h < 64; h <<= 1)
+        for (int i = 0; i < 64; i += (h << 1))
+            for (int j = i; j < i + h; ++j) { float a = u[j], b = u[j + h]; u[j] = a + b; u[j + h] = a - b; }
+    float nrm = 0.0;
+    for (int i = 0; i < 64; ++i) { u[i] *= 0.125; nrm += u[i] * u[i]; }   // 0.125 = 1/sqrt(64)
+    float gamma = sqrt(nrm) * 0.125;
+    if (gamma < 1e-12) gamma = 1e-12;
+    data_q[dst_idx].d = float16_t(gamma);
+    float inv = 1.0 / gamma;
+    for (int i = 0; i < 8; ++i) data_q[dst_idx].idx[i] = uint16_t(0u);
+    for (int i = 0; i < 4; ++i) data_q[dst_idx].sgn[i] = uint16_t(0u);
+    for (int i = 0; i < 64; ++i) {
+        float w = u[i] * inv;
+        int ix = 0; float bd = abs(w - TQ3_CENT[0]);
+        for (int k = 1; k < 4; ++k) { float dd = abs(w - TQ3_CENT[k]); if (dd < bd) { bd = dd; ix = k; } }
+        data_q[dst_idx].idx[i >> 3] |= uint16_t(uint(ix) << uint((i & 7) * 2));
+        if (w >= TQ3_CENT[ix]) data_q[dst_idx].sgn[i >> 4] |= uint16_t(1u << uint(i & 15));
     }
 }
 #endif
