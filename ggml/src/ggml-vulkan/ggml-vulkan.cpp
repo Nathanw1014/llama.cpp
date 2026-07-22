@@ -3521,6 +3521,22 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     const uint32_t num_subgroups = 4;
 
+    // TurboQuant needs the full 64-coord block staged together for a cooperative
+    // block-FWHT dequant, so force the shmem-staging path for it (normally NV-only).
+    // GGML_VK_TQ_NO_STAGING=1 disables the force -> falls back to the non-staging
+    // direct-Hadamard dequant4 path (for A/B benchmarking).
+    // Either side being TurboQuant is enough: the K and V staging fills each have
+    // their own cooperative path, and the shared FWHT scratch is sized for both.
+    const auto is_tq = [](ggml_type t) { return t == GGML_TYPE_TQ3_0 || t == GGML_TYPE_TQ4_0; };
+    const bool tq_block = (is_tq(k_type) || is_tq(v_type)) && (getenv("GGML_VK_TQ_NO_STAGING") == nullptr);
+
+    // NOTE: Br is NOT independently widenable here, despite being a spec constant.
+    // TurboQuant re-dequantizes the KV tile per QUERY tile, so a wider Br would
+    // amortize the block-RHT over more queries -- but the coopmat1 PV path is built
+    // around the fixed 16-row cooperative-matrix tile (pvsh is sized on MatBr=16),
+    // so Br>16 silently corrupts the output. Verified: Br=32/64 produce garbage.
+    // Widening requires restructuring the QK/PV matmuls to loop over Br/MatBr
+    // row-tiles -- a real shader change, not a tuning knob.
     result.block_rows = coopmat_block_rows;
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
@@ -3530,14 +3546,6 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
-    // TurboQuant needs the full 64-coord block staged together for a cooperative
-    // block-FWHT dequant, so force the shmem-staging path for it (normally NV-only).
-    // GGML_VK_TQ_NO_STAGING=1 disables the force -> falls back to the non-staging
-    // direct-Hadamard dequant4 path (for A/B benchmarking).
-    // Either side being TurboQuant is enough: the K and V staging fills each have
-    // their own cooperative path, and the shared FWHT scratch is sized for both.
-    const auto is_tq = [](ggml_type t) { return t == GGML_TYPE_TQ3_0 || t == GGML_TYPE_TQ4_0; };
-    const bool tq_block = (is_tq(k_type) || is_tq(v_type)) && (getenv("GGML_VK_TQ_NO_STAGING") == nullptr);
     result.shmem_staging = (((device->vendor_id == VK_VENDOR_ID_NVIDIA) || tq_block) && hsk < 256 && hsv < 256) ? 1 : 0;
 
     return result;
