@@ -48,9 +48,16 @@ static float array_rmse(const float * a1, const float * a2, size_t n) {
     return sqrtf(sum) / n;
 }
 
+// Bytes needed to hold `n` elements encoded as the type described by `t`. The
+// buffers below used to be sized as 2*n, which silently assumes no type is
+// wider than 2 bytes/element -- that overflows for a vec_dot_type of F32.
+static size_t quantized_bytes(const ggml_type_traits * t, size_t n) {
+    return (n / t->blck_size) * t->type_size;
+}
+
 // Total quantization error on test data
 static float total_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data) {
-    std::vector<uint8_t> tmp_q(2*test_size);
+    std::vector<uint8_t> tmp_q(quantized_bytes(qfns, test_size));
     std::vector<float> tmp_out(test_size);
 
     qfns_cpu->from_float(test_data, tmp_q.data(), test_size);
@@ -60,7 +67,7 @@ static float total_quantization_error(const ggml_type_traits * qfns, const ggml_
 
 // Total quantization error on test data
 static float reference_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data) {
-    std::vector<uint8_t> tmp_q(2*test_size);
+    std::vector<uint8_t> tmp_q(quantized_bytes(qfns, test_size));
     std::vector<float> tmp_out(test_size);
     std::vector<float> tmp_out_ref(test_size);
 
@@ -84,12 +91,13 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 
 // Total dot product error
 static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
-    GGML_UNUSED(qfns);
+    // tmp_q2 holds the vec_dot_type encoding, which is not necessarily the type
+    // under test -- e.g. tq3_0/tq4_0 keep the second operand in F32.
+    const auto * vdot      = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    const auto * vdot_base = ggml_get_type_traits(qfns_cpu->vec_dot_type);
 
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
-
-    const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    std::vector<uint8_t> tmp_q1(quantized_bytes(qfns,      test_size));
+    std::vector<uint8_t> tmp_q2(quantized_bytes(vdot_base, test_size));
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
     vdot->from_float(test_data2, tmp_q2.data(), test_size);
@@ -163,6 +171,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                type == GGML_TYPE_TQ3_0   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);

@@ -9545,6 +9545,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
+    // TurboQuant KV. A head_dim row is ceil(hs/QK_TQ=64) blocks, so hs=64 is one block
+    // per row and hs=128 is two -- cover both, since the cooperative (shmem-staged)
+    // dequant indexes blocks and rows separately.
+    for (ggml_type type_KV : {GGML_TYPE_TQ3_0, GGML_TYPE_TQ4_0}) {
+        for (int64_t hs : {64, 128}) {
+            for (int64_t nb : {1, 2, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 128, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+            // GQA, and KV sizes that are not a multiple of the KV block (bounds-check path),
+            // including a KV shorter than a single block -- the short-prompt prefill shape
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {8, 1}, 512, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1},  96, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {4, 1},   8, 6, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+        // mixed head sizes and mixed with f16, so the K and V fills are exercised independently
+        test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, type_KV));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
