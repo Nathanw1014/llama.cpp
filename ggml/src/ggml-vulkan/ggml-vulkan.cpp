@@ -3573,6 +3573,18 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     result.shmem_staging = (((device->vendor_id == VK_VENDOR_ID_NVIDIA) || tq_block) && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // A wider tile costs shared memory (Qf, Psh, sfsh and pvsh all scale with Br).
+    // If it no longer fits, the caller drops the WHOLE op to the scalar path, which
+    // for TurboQuant also loses the cooperative block-FWHT dequant -- measured 17.7x
+    // slower at hd128 (pp256 @ d4096: 9.6 t/s at Br=64-via-scalar vs 169.3 at Br=16).
+    // So step the tile down until it fits rather than letting it fall off coopmat1.
+    // This is what picks Br=32 at hd128, where 64 does not fit but 32 is the best
+    // option anyway (208.0 vs 169.3 t/s), without hard-coding a per-head-dim table.
+    while (tq_block && result.block_rows > coopmat_block_rows &&
+           !ggml_vk_flash_attn_coopmat_shmem_support(device, result, hsk, hsv, f32acc, k_type)) {
+        result.block_rows /= 2;
+    }
+
     return result;
 }
 
