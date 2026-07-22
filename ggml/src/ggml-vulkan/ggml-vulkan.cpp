@@ -3551,9 +3551,19 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // prefill-sized batches, 16 otherwise (decode pays ~37% for a wide tile).
     // TurboQuant only; other types are unmeasured and keep the default.
     // Override for A/B: GGML_VK_TQ_BR = 16 | 32 | 64.
+    // Restricted to small head dims by default. A wider tile also costs DEVICE
+    // memory (bigger FA workspace), which is invisible here -- and at head-dim 128
+    // that is enough to tip an already-tight model over the edge: GLM-4.5-Air
+    // Q3_K_S at 128k ctx (49.0 GiB weights + 6.2 GiB KV against a 58 GiB GTT
+    // ceiling) runs fine at Br=16 but dies with "Not enough memory for command
+    // submission" at Br=32. The coopmat1 path itself is what carries the win there
+    // (staying on it is worth +75% generation vs the scalar fallback); the extra
+    // tile width only buys prefill, so it is not worth a hard device-lost.
+    // Opt in on roomier hd128 setups with GGML_VK_TQ_BR=32.
+    const bool tq_wide_ok = hsk <= 64 && hsv <= 64;
     uint32_t tq_block_rows = coopmat_block_rows;
     if (tq_block) {
-        tq_block_rows = (n_rows >= 64) ? 64 : coopmat_block_rows;
+        tq_block_rows = (n_rows >= 64 && tq_wide_ok) ? 64 : coopmat_block_rows;
         if (const char * s = getenv("GGML_VK_TQ_BR")) {
             const uint32_t v = (uint32_t) atoi(s);
             if (v == 16 || v == 32 || v == 64) {
