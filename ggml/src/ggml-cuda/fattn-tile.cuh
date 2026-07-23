@@ -479,17 +479,29 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
     ggml_cuda_unroll<5>{}(load);
 }
 
-// Dequantize quantized K/V into the shared tile once so grouped Q heads can reuse it.
+// Dequant-on-load for quantized K/V.
+//
+// The vec kernel fuses dequantization into the KQ dot product, so the dequantized value is never
+// materialized and cannot be reused: at gqa_ratio > 1 each of the gqa_ratio Q heads sharing a KV head
+// re-dequantizes it in its own block. Here the tile is dequantized ONCE into SRAM and then reused by
+// all ncols2 Q heads in this block, so dequant work stops scaling with gqa_ratio.
+//
+// KV points at row 0 of the tile (raw quantized bytes), stride_KV_bytes is the row stride (nb11/nb21),
+// elem0 is the element offset of the tile's first column within the row (k_KQ_0 for K, 0 for V).
 template<ggml_type type_KV, int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, typename T>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
         const char * const __restrict__ KV, T * const __restrict__ tile_KV,
         const int stride_KV_bytes, const int elem0, const int i_sup) {
+    // Elements per dequantize_V call: q8_0 accepts any even value, but q4_0 decodes nibbles through a
+    // 4-byte int and only supports 2 or 4. Keep the per-thread chunk (epc) the same for both types and
+    // issue several calls per chunk for the narrower ones -- the loader is bound by per-chunk overhead,
+    // not by bytes, so matching epc rather than ne is what matters.
     constexpr int ne_call  = type_KV == GGML_TYPE_Q4_0 ? 4 : 8;
-    constexpr int epc      = 8;
+    constexpr int epc      = 8; // elements per thread chunk
     constexpr int ncalls   = epc / ne_call;
     static_assert(epc % ne_call == 0, "bad epc");
     constexpr int nthreads = warp_size*nwarps;
-    constexpr int cpr      = J / epc;
+    constexpr int cpr      = J / epc; // chunks per row
     static_assert(J % epc == 0, "bad J for dequant-on-load");
 
     const int tid = threadIdx.y*warp_size + threadIdx.x;
@@ -502,8 +514,8 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
             continue;
         }
 
-        const int i = idx / cpr;
-        const int j = (idx % cpr)*epc;
+        const int i = idx / cpr;       // row within the tile == KV token
+        const int j = (idx % cpr)*epc; // element offset within the row
 
         if constexpr (std::is_same<T, half2>::value) {
             constexpr dequantize_V_t dequantize_KV = get_dequantize_V<type_KV, half, ne_call>();
@@ -943,6 +955,7 @@ static __global__ void flash_attn_tile(
     const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
     const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
 
+    // Raw (possibly quantized) K/V rows, used by the dequant-on-load path.
     const char * K_c = K + nb13*sequence + nb12*(head0 / gqa_ratio);
     const char * V_c = V + nb23*sequence + nb22*(head0 / gqa_ratio);
 
@@ -1432,6 +1445,7 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
     template void ggml_cuda_flash_attn_ext_tile_case              \
     <DKQ, DV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
+// Dequant-on-load tile cases for symmetric quantized KV.
 #define DECL_FATTN_TILE_CASE_Q(DKQ, DV, type_K, type_V)                          \
     template void ggml_cuda_flash_attn_ext_tile_case                             \
     <DKQ, DV, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
