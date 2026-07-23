@@ -216,8 +216,7 @@ struct block_tq3_0
 #if defined(DATA_A_TQ4_0)
 struct block_tq4_0
 {
-    uint16_t  idx[12]; // 64 x 3-bit codebook indices (LSB-first, cross-word)
-    uint16_t  sgn[4];  // 64 x 1-bit residual signs (16 per u16)
+    uint16_t  qs[16];  // 64 x 4-bit flat-codebook indices (4 per u16)
     float16_t d;       // per-block RMS scale (gamma)
 };
 #define QUANT_K 64

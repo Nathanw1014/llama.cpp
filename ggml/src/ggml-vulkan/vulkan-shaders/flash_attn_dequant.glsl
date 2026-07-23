@@ -57,12 +57,12 @@ const float TQ3_SUB[8] = float[8](
 // TurboQuant TQ4: same block shape as TQ3 but a 3-bit codebook (8 levels -> 16
 // sub-centroids). 34-byte block: idx = 12 x u16 (64 x 3-bit, packed LSB-first
 // across word boundaries), sgn = 4 x u16 (64 x 1-bit), d = fp16 gamma.
-struct block_tq4_0 { uint16_t idx[12]; uint16_t sgn[4]; uint16_t d; };
+struct block_tq4_0 { uint16_t qs[16]; uint16_t d; };   // 32 B 4-bit idx (4/u16) + fp16 gamma
 layout (binding = 1) readonly buffer K_PACKED_TQ4_0 { block_tq4_0 data[]; } k_packed_tq4_0;
 layout (binding = 2) readonly buffer V_PACKED_TQ4_0 { block_tq4_0 data[]; } v_packed_tq4_0;
-const float TQ4_SUB[16] = float[16](
-    -2.5114917, -1.9226571, -1.5200004, -1.1829770, -0.8905068, -0.6194176, -0.3653122, -0.1166592,
-     0.1263628,  0.3743534,  0.6277232,  0.8995532,  1.1912387,  1.5285123,  1.9283417,  2.5125852);
+const float TQ4_FLAT[16] = float[16](
+    -2.7049634, -2.0371418, -1.5844692, -1.2247417, -0.9154250, -0.6371235, -0.3761664, -0.1241511,
+     0.1241390,  0.3748262,  0.6351883,  0.9144387,  1.2230867,  1.5816159,  2.0314538,  2.6930776);
 
 // Per-quant decode bodies are expanded once for the K view set and once for
 // the V view set. The macros take the buffer name as a parameter.
@@ -153,21 +153,15 @@ const float TQ4_SUB[16] = float[16](
                         FLOAT_TYPE(TQ3_SGN[iqs + 3u] * _g * _a3));                                \
 }
 
-// TQ4 mirror of the TQ3 direct-Hadamard dequant: 3-bit index read with a
-// cross-u16-word fetch (fields straddle 16-bit words since 3 does not divide
-// 16), 16 sub-centroids, shared TQ3_SGN. Same per-4-coord Hadamard as TQ3.
+// TQ4 flat direct-Hadamard dequant: one aligned nibble read + a single 16-level
+// LUT per coord (no cross-word, no sign, no sub-centroid). Same per-4-coord
+// Hadamard as TQ3, shared TQ3_SGN.
 #define FA_DEQUANT4_TQ4_0(BUF) {                                                                  \
     float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x * 0.125;                         \
     float _a0 = 0.0, _a1 = 0.0, _a2 = 0.0, _a3 = 0.0;                                             \
     for (uint _j = 0u; _j < 64u; ++_j) {                                                          \
-        uint _p = _j * 3u;                                                                        \
-        uint _w = _p >> 4u, _o = _p & 15u;                                                        \
-        uint _iv = uint(BUF.data[a_offset + ib].idx[_w]) >> _o;                                   \
-        if (_o > 13u) _iv |= uint(BUF.data[a_offset + ib].idx[_w + 1u]) << (16u - _o);            \
-        int  _ix = int(_iv & 7u);                                                                 \
-        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                    \
-        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                 \
-        float _sc = TQ4_SUB[_ix * 2 + _sg];                                                       \
+        uint _iw = uint(BUF.data[a_offset + ib].qs[_j >> 2]);                                     \
+        float _sc = TQ4_FLAT[(_iw >> ((_j & 3u) * 4u)) & 0xFu];                                   \
         _a0 += ((bitCount(iqs        & _j) & 1) == 0) ? _sc : -_sc;                               \
         _a1 += ((bitCount((iqs + 1u) & _j) & 1) == 0) ? _sc : -_sc;                               \
         _a2 += ((bitCount((iqs + 2u) & _j) & 1) == 0) ? _sc : -_sc;                               \
@@ -199,18 +193,16 @@ const float TQ4_SUB[16] = float[16](
     return FLOAT_TYPEV4(FLOAT_TYPE(_o[0]), FLOAT_TYPE(_o[1]), FLOAT_TYPE(_o[2]), FLOAT_TYPE(_o[3])); \
 }
 
+// Flat asymmetric K/V decode: the cheap path. One aligned nibble read + one
+// 16-level LUT per coord -- no cross-word, no sign, no sub-centroid. This is the
+// single-LUT decode Step 0 profiling identified as the win.
 #define FA_DEQUANT4_TQ4_0_U(BUF) {                                                                   \
     float _g = unpackHalf2x16(uint(BUF.data[a_offset + ib].d)).x;                                    \
     float _o[4];                                                                                     \
     for (uint _k = 0u; _k < 4u; ++_k) {                                                              \
         uint _j  = iqs + _k;                                                                         \
-        uint _p  = _j * 3u;                                                                          \
-        uint _w  = _p >> 4u, _off = _p & 15u;                                                        \
-        uint _iv = uint(BUF.data[a_offset + ib].idx[_w]) >> _off;                                    \
-        if (_off > 13u) _iv |= uint(BUF.data[a_offset + ib].idx[_w + 1u]) << (16u - _off);           \
-        uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                       \
-        int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                     \
-        _o[_k]   = _g * TQ4_SUB[int(_iv & 7u) * 2 + _sg];                                            \
+        uint _iw = uint(BUF.data[a_offset + ib].qs[_j >> 2]);                                        \
+        _o[_k]   = _g * TQ4_FLAT[(_iw >> ((_j & 3u) * 4u)) & 0xFu];                                  \
     }                                                                                                \
     return FLOAT_TYPEV4(FLOAT_TYPE(_o[0]), FLOAT_TYPE(_o[1]), FLOAT_TYPE(_o[2]), FLOAT_TYPE(_o[3])); \
 }

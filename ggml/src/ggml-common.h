@@ -301,10 +301,9 @@ typedef struct {
 } block_tq3_0;                    // 26 B -> 3.25 bits/val (4.9x vs fp16)
 static_assert(sizeof(block_tq3_0) == 26, "wrong tq3_0 block size/padding");
 typedef struct {
-    uint8_t   idx[QK_TQ * 3 / 8]; // 24: 3-bit codebook indices
-    uint8_t   sgn[QK_TQ     / 8]; //  8: 1-bit residual signs
+    uint8_t   qs[QK_TQ / 2];      // 32: 4-bit flat-codebook indices (2 per byte)
     ggml_half d;                  //  2: per-block RMS scale (gamma)
-} block_tq4_0;                    // 34 B -> 4.25 bits/val (3.8x vs fp16)
+} block_tq4_0;                    // 34 B -> 4.25 bits/val (3.8x vs fp16); flat 16-level codebook, no residual
 static_assert(sizeof(block_tq4_0) == 34, "wrong tq4_0 block size/padding");
 
 //

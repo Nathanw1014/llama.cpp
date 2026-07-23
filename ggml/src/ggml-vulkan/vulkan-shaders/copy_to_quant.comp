@@ -224,16 +224,16 @@ void quantize(uint dst_idx, uint src_idx)
 #endif
 
 #if defined(DATA_A_TQ4_0)
-// TurboQuant TQ4 block encode: forward RHT, per-block RMS gamma, nearest 3-bit
-// codebook index + 1-bit residual sign. 3-bit indices are packed LSB-first and
-// straddle 16-bit words, so the write spills into the next word when needed.
+// TurboQuant TQ4 flat block encode: forward RHT, per-block RMS gamma, nearest of
+// 16 flat-codebook centroids, packed as aligned 4-bit nibbles (no residual sign).
 const float TQ4_SGN[64] = float[64](
     -1., 1.,-1., 1., 1.,-1.,-1.,-1.,-1., 1., 1., 1., 1., 1., 1.,-1.,
     -1., 1.,-1., 1.,-1.,-1.,-1., 1., 1., 1.,-1.,-1., 1.,-1.,-1.,-1.,
     -1., 1., 1.,-1.,-1., 1.,-1., 1.,-1.,-1.,-1.,-1.,-1., 1., 1.,-1.,
      1.,-1., 1., 1.,-1.,-1.,-1., 1.,-1., 1., 1.,-1., 1., 1., 1., 1.);
-const float TQ4_CENT[8] = float[8](
-    -2.1517644, -1.3379617, -0.7502900, -0.2392333, 0.2489758, 0.7585201, 1.3472227, 2.1569649);
+const float TQ4_FLAT[16] = float[16](
+    -2.7049634, -2.0371418, -1.5844692, -1.2247417, -0.9154250, -0.6371235, -0.3761664, -0.1241511,
+     0.1241390,  0.3748262,  0.6351883,  0.9144387,  1.2230867,  1.5816159,  2.0314538,  2.6930776);
 void quantize(uint dst_idx, uint src_idx)
 {
     float u[64];
@@ -247,16 +247,12 @@ void quantize(uint dst_idx, uint src_idx)
     if (gamma < 1e-12) gamma = 1e-12;
     data_q[dst_idx].d = float16_t(gamma);
     float inv = 1.0 / gamma;
-    for (int i = 0; i < 12; ++i) data_q[dst_idx].idx[i] = uint16_t(0u);
-    for (int i = 0; i < 4; ++i) data_q[dst_idx].sgn[i] = uint16_t(0u);
+    for (int i = 0; i < 16; ++i) data_q[dst_idx].qs[i] = uint16_t(0u);
     for (int i = 0; i < 64; ++i) {
         float w = u[i] * inv;
-        int ix = 0; float bd = abs(w - TQ4_CENT[0]);
-        for (int k = 1; k < 8; ++k) { float dd = abs(w - TQ4_CENT[k]); if (dd < bd) { bd = dd; ix = k; } }
-        uint p = uint(i) * 3u, wd = p >> 4u, o = p & 15u;
-        data_q[dst_idx].idx[wd] |= uint16_t((uint(ix) << o) & 0xFFFFu);
-        if (o > 13u) data_q[dst_idx].idx[wd + 1u] |= uint16_t(uint(ix) >> (16u - o));
-        if (w >= TQ4_CENT[ix]) data_q[dst_idx].sgn[i >> 4] |= uint16_t(1u << uint(i & 15));
+        int ix = 0; float bd = abs(w - TQ4_FLAT[0]);
+        for (int k = 1; k < 16; ++k) { float dd = abs(w - TQ4_FLAT[k]); if (dd < bd) { bd = dd; ix = k; } }
+        data_q[dst_idx].qs[i >> 2] |= uint16_t(uint(ix) << uint((i & 3) * 4));
     }
 }
 #endif

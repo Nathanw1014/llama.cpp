@@ -5707,13 +5707,12 @@ static const float tq3_subcent[4][2] = {
     { -1.9503599f, -1.2182396f }, { -0.7018253f, -0.2238370f },
     {  0.2191074f,  0.6958017f }, {  1.2132320f,  1.9444058f },
 };
-// TQ4: 3-bit Lloyd-Max Gaussian codebook.
-static const float tq4_centroids[8] = {
-    -2.1517644f, -1.3379617f, -0.7502900f, -0.2392333f, 0.2489758f, 0.7585201f, 1.3472227f, 2.1569649f,
-};
-static const float tq4_subcent[8][2] = {
-    { -2.5114917f, -1.9226571f }, { -1.5200004f, -1.1829770f }, { -0.8905068f, -0.6194176f }, { -0.3653122f, -0.1166592f },
-    {  0.1263628f,  0.3743534f }, {  0.6277232f,  0.8995532f }, {  1.1912387f,  1.5285123f }, {  1.9283417f,  2.5125852f },
+// TQ4: flat 16-level Lloyd-Max Gaussian codebook (4-bit index, no residual).
+// A flat (b+1)-bit codebook is ~4% lower MSE than the paper's b-bit + 1-bit
+// residual at the same budget, and decodes with a single aligned nibble lookup.
+static const float tq4_flat[16] = {
+    -2.7049634f, -2.0371418f, -1.5844692f, -1.2247417f, -0.9154250f, -0.6371235f, -0.3761664f, -0.1241511f,
+     0.1241390f,  0.3748262f,  0.6351883f,  0.9144387f,  1.2230867f,  1.5816159f,  2.0314538f,  2.6930776f,
 };
 
 static void tq_fwht(float * a) { // unnormalized fast Walsh-Hadamard, length QK_TQ
@@ -5799,14 +5798,11 @@ void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RE
         float nrm = 0.0f; for (int i = 0; i < QK_TQ; ++i) nrm += u[i] * u[i];
         float gamma = sqrtf(nrm) / sqrtf((float) QK_TQ);
         if (gamma < 1e-12f) gamma = 1e-12f;
-        memset(y->idx, 0, sizeof(y->idx));
-        memset(y->sgn, 0, sizeof(y->sgn));
+        memset(y->qs, 0, sizeof(y->qs));
         const float inv = 1.0f / gamma;
         for (int i = 0; i < QK_TQ; ++i) {
-            const float w = u[i] * inv;
-            const int idx = tq_nearest(w, tq4_centroids, 8);
-            tq_put_bits(y->idx, i * 3, 3, (uint32_t) idx);
-            if (w >= tq4_centroids[idx]) y->sgn[i >> 3] |= (uint8_t)(1u << (i & 7));
+            const int idx = tq_nearest(u[i] * inv, tq4_flat, 16);
+            y->qs[i >> 1] |= (uint8_t)((uint32_t) idx << ((i & 1) * 4));
         }
         y->d = GGML_FP32_TO_FP16(gamma);
     }
@@ -5818,9 +5814,8 @@ void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_REST
         const float gamma = GGML_FP16_TO_FP32(x->d);
         float u[QK_TQ];
         for (int i = 0; i < QK_TQ; ++i) {
-            const int idx = (int) tq_get_bits(x->idx, i * 3, 3);
-            const int sg  = (x->sgn[i >> 3] >> (i & 7)) & 1;
-            u[i] = gamma * tq4_subcent[idx][sg];
+            const int idx = (x->qs[i >> 1] >> ((i & 1) * 4)) & 0xF;
+            u[i] = gamma * tq4_flat[idx];
         }
         tq_rht_inverse(u, y);
     }
