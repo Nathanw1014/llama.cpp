@@ -5701,11 +5701,11 @@ static const float tq_rht_sign[QK_TQ] = {
     -1,  1,  1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1,
      1, -1,  1,  1, -1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,  1,
 };
-// TQ3: 2-bit Lloyd-Max Gaussian codebook + per-bin conditional-mean sub-centroids.
-static const float tq3_centroids[4] = { -1.5105785f, -0.45407808f, 0.44827677f, 1.5068180f };
-static const float tq3_subcent[4][2] = {
-    { -1.9503599f, -1.2182396f }, { -0.7018253f, -0.2238370f },
-    {  0.2191074f,  0.6958017f }, {  1.2132320f,  1.9444058f },
+// TQ3: flat 8-level Lloyd-Max Gaussian codebook (3-bit index, no residual). The
+// 3-bit index is stored planar -- low 2 bits in idx[], high bit in sgn[] -- so
+// both reads stay aligned (no cross-word). Same layout as the old 2-bit+sign.
+static const float tq3_flat[8] = {
+    -2.1517644f, -1.3379617f, -0.7502900f, -0.2392333f, 0.2489758f, 0.7585201f, 1.3472227f, 2.1569649f,
 };
 // TQ4: flat 16-level Lloyd-Max Gaussian codebook (4-bit index, no residual).
 // A flat (b+1)-bit codebook is ~4% lower MSE than the paper's b-bit + 1-bit
@@ -5767,10 +5767,9 @@ void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RE
         memset(y->sgn, 0, sizeof(y->sgn));
         const float inv = 1.0f / gamma;
         for (int i = 0; i < QK_TQ; ++i) {
-            const float w = u[i] * inv;
-            const int idx = tq_nearest(w, tq3_centroids, 4);
-            tq_put_bits(y->idx, i * 2, 2, (uint32_t) idx);
-            if (w >= tq3_centroids[idx]) y->sgn[i >> 3] |= (uint8_t)(1u << (i & 7));
+            const int idx = tq_nearest(u[i] * inv, tq3_flat, 8);   // 0..7
+            tq_put_bits(y->idx, i * 2, 2, (uint32_t) (idx & 3));    // low 2 bits
+            if (idx & 4) y->sgn[i >> 3] |= (uint8_t)(1u << (i & 7)); // high bit
         }
         y->d = GGML_FP32_TO_FP16(gamma);
     }
@@ -5782,9 +5781,9 @@ void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_REST
         const float gamma = GGML_FP16_TO_FP32(x->d);
         float u[QK_TQ];
         for (int i = 0; i < QK_TQ; ++i) {
-            const int idx = (int) tq_get_bits(x->idx, i * 2, 2);
-            const int sg  = (x->sgn[i >> 3] >> (i & 7)) & 1;
-            u[i] = gamma * tq3_subcent[idx][sg];
+            const int lo  = (int) tq_get_bits(x->idx, i * 2, 2);
+            const int hi  = (x->sgn[i >> 3] >> (i & 7)) & 1;
+            u[i] = gamma * tq3_flat[lo | (hi << 2)];
         }
         tq_rht_inverse(u, y);
     }

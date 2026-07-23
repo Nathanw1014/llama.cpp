@@ -190,14 +190,15 @@ void quantize(uint dst_idx, uint src_idx)
 #endif
 
 #if defined(DATA_A_TQ3_0)
-// TurboQuant TQ3 block encode: randomized-Hadamard forward rotation, per-block
-// RMS scale (gamma), nearest 2-bit codebook index + 1-bit residual sign.
+// TurboQuant TQ3 flat block encode: forward RHT, per-block RMS gamma, nearest of
+// 8 flat centroids, stored planar (low 2 bits in idx[], high bit in sgn[]).
 const float TQ3_SGN[64] = float[64](
     -1., 1.,-1., 1., 1.,-1.,-1.,-1.,-1., 1., 1., 1., 1., 1., 1.,-1.,
     -1., 1.,-1., 1.,-1.,-1.,-1., 1., 1., 1.,-1.,-1., 1.,-1.,-1.,-1.,
     -1., 1., 1.,-1.,-1., 1.,-1., 1.,-1.,-1.,-1.,-1.,-1., 1., 1.,-1.,
      1.,-1., 1., 1.,-1.,-1.,-1., 1.,-1., 1., 1.,-1., 1., 1., 1., 1.);
-const float TQ3_CENT[4] = float[4](-1.5105785, -0.45407808, 0.44827677, 1.5068180);
+const float TQ3_FLAT[8] = float[8](
+    -2.1517644, -1.3379617, -0.7502900, -0.2392333, 0.2489758, 0.7585201, 1.3472227, 2.1569649);
 void quantize(uint dst_idx, uint src_idx)
 {
     float u[64];
@@ -215,10 +216,10 @@ void quantize(uint dst_idx, uint src_idx)
     for (int i = 0; i < 4; ++i) data_q[dst_idx].sgn[i] = uint16_t(0u);
     for (int i = 0; i < 64; ++i) {
         float w = u[i] * inv;
-        int ix = 0; float bd = abs(w - TQ3_CENT[0]);
-        for (int k = 1; k < 4; ++k) { float dd = abs(w - TQ3_CENT[k]); if (dd < bd) { bd = dd; ix = k; } }
-        data_q[dst_idx].idx[i >> 3] |= uint16_t(uint(ix) << uint((i & 7) * 2));
-        if (w >= TQ3_CENT[ix]) data_q[dst_idx].sgn[i >> 4] |= uint16_t(1u << uint(i & 15));
+        int ix = 0; float bd = abs(w - TQ3_FLAT[0]);
+        for (int k = 1; k < 8; ++k) { float dd = abs(w - TQ3_FLAT[k]); if (dd < bd) { bd = dd; ix = k; } }
+        data_q[dst_idx].idx[i >> 3] |= uint16_t(uint(ix & 3) << uint((i & 7) * 2));   // low 2 bits
+        if ((ix & 4) != 0) data_q[dst_idx].sgn[i >> 4] |= uint16_t(1u << uint(i & 15)); // high bit
     }
 }
 #endif

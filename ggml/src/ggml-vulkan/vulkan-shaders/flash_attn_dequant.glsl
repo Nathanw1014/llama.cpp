@@ -50,9 +50,9 @@ const float TQ3_SGN[64] = float[64](
     -1., 1.,-1., 1.,-1.,-1.,-1., 1., 1., 1.,-1.,-1., 1.,-1.,-1.,-1.,
     -1., 1., 1.,-1.,-1., 1.,-1., 1.,-1.,-1.,-1.,-1.,-1., 1., 1.,-1.,
      1.,-1., 1., 1.,-1.,-1.,-1., 1.,-1., 1., 1.,-1., 1., 1., 1., 1.);
-const float TQ3_SUB[8] = float[8](
-    -1.9503599, -1.2182396, -0.7018253, -0.2238370,
-     0.2191074,  0.6958017,  1.2132320,  1.9444058);
+const float TQ3_FLAT[8] = float[8](   // flat 8-level codebook; index = lo2 | (hi1<<2)
+    -2.1517644, -1.3379617, -0.7502900, -0.2392333,
+     0.2489758,  0.7585201,  1.3472227,  2.1569649);
 
 // TurboQuant TQ4: same block shape as TQ3 but a 3-bit codebook (8 levels -> 16
 // sub-centroids). 34-byte block: idx = 12 x u16 (64 x 3-bit, packed LSB-first
@@ -141,7 +141,7 @@ const float TQ4_FLAT[16] = float[16](
         int  _ix = int((_iw >> ((_j & 7u) * 2u)) & 3u);                                           \
         uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                    \
         int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                 \
-        float _sc = TQ3_SUB[_ix * 2 + _sg];                                                       \
+        float _sc = TQ3_FLAT[_ix | (_sg << 2)];                                                   \
         _a0 += ((bitCount(iqs        & _j) & 1) == 0) ? _sc : -_sc;                               \
         _a1 += ((bitCount((iqs + 1u) & _j) & 1) == 0) ? _sc : -_sc;                               \
         _a2 += ((bitCount((iqs + 2u) & _j) & 1) == 0) ? _sc : -_sc;                               \
@@ -188,7 +188,7 @@ const float TQ4_FLAT[16] = float[16](
         int  _ix = int((_iw >> ((_j & 7u) * 2u)) & 3u);                                              \
         uint _sw = uint(BUF.data[a_offset + ib].sgn[_j >> 4]);                                       \
         int  _sg = int((_sw >> (_j & 15u)) & 1u);                                                    \
-        _o[_k]   = _g * TQ3_SUB[_ix * 2 + _sg];                                                      \
+        _o[_k]   = _g * TQ3_FLAT[_ix | (_sg << 2)];                                                  \
     }                                                                                                \
     return FLOAT_TYPEV4(FLOAT_TYPE(_o[0]), FLOAT_TYPE(_o[1]), FLOAT_TYPE(_o[2]), FLOAT_TYPE(_o[3])); \
 }
