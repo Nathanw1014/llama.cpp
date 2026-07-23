@@ -3346,6 +3346,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * next = cgraph->nodes[i + 1];
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src0_next = next->src[0];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+
+        const bool shared_inputs = next->op == GGML_OP_MUL_MAT_ID &&
+            node->src[1] == next->src[1] && node->src[2] == next->src[2];
+        const bool use_mmq = shared_inputs &&
+            ggml_cuda_should_use_mmq(src0->type, cc, node->src[1]->ne[2], src0->ne[2]) &&
+            ggml_cuda_should_use_mmq(src0_next->type, cc, next->src[1]->ne[2], src0_next->ne[2]);
+        const bool compatible = use_mmq && node->src[1]->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(src0, src0_next) && ggml_are_same_shape(node, next) &&
+            mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_next->type) &&
+            !blackwell_mma_available(cc);
+        const bool use_mmvq = compatible && node->ne[2] <= MMVQ_MAX_BATCH_SIZE &&
+            (node->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc) ||
+             next->ne[2] <= get_mmvq_mmid_max_batch(src0_next->type, cc));
+
+        if (compatible && !use_mmvq) {
+            ggml_cuda_mul_mat_q_pair(*cuda_ctx, node, next);
+            return 1;
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
