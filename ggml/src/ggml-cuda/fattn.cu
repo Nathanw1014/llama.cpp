@@ -525,6 +525,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
+            const bool tile_has_kv_type = K->type == V->type &&
+                (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+                (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256) && V->ne[0] == K->ne[0];
+            const bool tile_reuses_kv = gqa_ratio % 2 == 0;
+            if (gqa_opt_applies && tile_has_kv_type && tile_reuses_kv) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
