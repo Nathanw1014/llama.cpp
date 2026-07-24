@@ -30,6 +30,23 @@ gfx1151, stack gates `SMALLN+BM64+WAVE32+F16B` enabled on the branch arm:
 both arms — so relative gains are not comparable across windows; each row above is a
 single-window pairing.)
 
+Same protocol on **Qwen3-Coder-30B-A3B UD-Q6_K_XL** (same day, same window discipline,
+branch arm gates `SMALLN+BM64+WAVE32` — the recommended config for this model):
+
+| test           | pre-PR `5c3a586` (t/s) | this branch `8e3a670` (t/s) |   gain |
+|----------------|-----------------------:|----------------------------:|-------:|
+| pp512 @ d0     |          1096.7 ± 4.2  |               1163.8 ± 5.0  |  +6.1% |
+| pp512 @ d32768 |           226.8 ± 4.5  |               313.4 ± 3.0   | +38.2% |
+| tg32 @ d0      |          67.77 ± 0.02  |               67.21 ± 0.30  |   flat |
+| tg32 @ d32768  |          41.65 ± 0.17  |               41.92 ± 0.11  |   flat |
+
+A third arm re-tested `GGML_VK_MMID_F16B=1` on this model (earlier measurements had it
+mildly negative here): in this window it was neutral within noise (1165.8 / 314.4), so
+F16B remains a per-model tunable with no benefit on Coder-30B. The pattern across the two
+models is consistent with the design: the mmid stack drives the shallow-prefill gain
+(larger on the 35B, whose per-expert row counts underfill the stock tiles), while the FA
+dequant-once base PR drives the depth gain (larger on Coder, which is more FA-dominated).
+
 ## Build — toolchain requirement (important)
 
 This tree needs a **current glslc and current Vulkan headers**. A default cmake configure
