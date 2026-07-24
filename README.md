@@ -15,6 +15,21 @@ pp512 @ 128k depth **+42.2%** vs pre-PR (210.1 → 298.7 t/s, r=1). `test-backen
 MUL_MAT_ID 790/790. NVIDIA sanity check on RTX 3070 (KHR_coopmat): stack ≈ +4.9%, no
 regressions on the default cm2 path.
 
+Fresh single-window A/B on this branch as published (commit `8e3a670`, 2026-07-24):
+Qwen3.6-35B-A3B UD-Q5_K_XL, q8_0 K/V, `-fa 1`, r=3, RADV (Mesa git build), Radeon 8060S /
+gfx1151, stack gates `SMALLN+BM64+WAVE32+F16B` enabled on the branch arm:
+
+| test           | pre-PR `5c3a586` (t/s) | this branch `8e3a670` (t/s) |   gain |
+|----------------|-----------------------:|----------------------------:|-------:|
+| pp512 @ d0     |          1004.5 ± 6.6  |               1206.2 ± 5.3  | +20.1% |
+| pp512 @ d32768 |           553.7 ± 7.5  |                707.0 ± 9.3  | +27.7% |
+| tg32 @ d0      |          58.43 ± 0.08  |               58.43 ± 0.16  |   flat |
+| tg32 @ d32768  |          52.13 ± 0.47  |               51.84 ± 0.45  |   flat |
+
+(The pre-PR baseline here runs ~8% above the July-14 receipts — a newer Mesa build lifts
+both arms — so relative gains are not comparable across windows; each row above is a
+single-window pairing.)
+
 ## Build — toolchain requirement (important)
 
 This tree needs a **current glslc and current Vulkan headers**. A default cmake configure
