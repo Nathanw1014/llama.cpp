@@ -1,3 +1,52 @@
+# Branch: mmid-fullstack — Vulkan MUL_MAT_ID (MoE prefill) optimization stack
+
+**Backend: Vulkan only (developed and measured on RADV / Mesa, AMD Strix Halo gfx1151, KHR_coopmat path). This branch does not touch the ROCm/HIP backend.**
+
+This branch carries an experimental optimization stack for `MUL_MAT_ID` (the MoE
+expert-routed matmul) on top of the FA dequant-once+transpose PR
+([ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494), base commit
+`b805834`): a row-list prepass that removes the per-workgroup id scan, per-expert-n tile
+selection, subgroup/tile tuning, and a K-quant scale cache. Also included: an unconditional
+experimental extension of the PR's dequant-once FA scratch to all KV quant types (`d15ec05`).
+
+Measured on Qwen3.6-35B-A3B (single-window A/B ladders with canary; token gen flat):
+pp512 @ d0 **+22.8%** vs the PR head (931.0 → 1143.3 t/s, r=3); combined with the FA PR,
+pp512 @ 128k depth **+42.2%** vs pre-PR (210.1 → 298.7 t/s, r=1). `test-backend-ops`
+MUL_MAT_ID 790/790. NVIDIA sanity check on RTX 3070 (KHR_coopmat): stack ≈ +4.9%, no
+regressions on the default cm2 path.
+
+## Build — toolchain requirement (important)
+
+This tree needs a **current glslc and current Vulkan headers**. A default cmake configure
+that picks up an old system shaderc (e.g. Ubuntu 24.04's glslc / shaderc 2023.8) either
+fails on missing `spv::` headers or — worse — **succeeds silently with a 3-year-old shader
+compiler**, producing different SPIR-V and benchmark numbers that are not comparable to
+anything measured here. Always point cmake at a modern toolchain explicitly, e.g.:
+
+```
+cmake -B build -DGGML_VULKAN=ON \
+  -DVulkan_INCLUDE_DIR=$HOME/.local/include \
+  -DVulkan_GLSLC_EXECUTABLE=$HOME/shaderc/build/glslc/glslc
+```
+
+(paths are examples from the dev box — use wherever your recent Vulkan headers and a
+recent shaderc build live).
+
+## Runtime gates and A/B caveats
+
+- Row-list prepass is ON by default; `GGML_VK_MMID_ROWLISTS=0` restores the upstream path.
+- Opt-in gates (all default OFF): `GGML_VK_MMID_SMALLN=1`, `GGML_VK_MMID_BM64=1`,
+  `GGML_VK_MMID_WAVE32=1` (safe everywhere), `GGML_VK_MMID_F16B=1` (model-dependent),
+  `GGML_VK_MMID_M128=1` (only matters at ubatch ≥ 2048). `GGML_VK_MMID_INT=1` and
+  `GGML_VK_MMID_TILE16=1` are kept as **measured-negative** receipts — do not enable
+  expecting a win.
+- **The K-quant scale cache (scache) is compile-time, not env-gated** — it is always on
+  for q4_K/q5_K in this tree. A/B-ing it requires a second build with
+  `MMID_QK_SCACHE` undefined; one binary cannot isolate it.
+- Larger ubatch is part of the win: `-ub 1024` was the sweet spot on gfx1151.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
