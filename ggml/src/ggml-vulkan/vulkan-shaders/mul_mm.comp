@@ -135,7 +135,10 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 // packed 6-bit scale extraction can run once per row per superblock instead of
 // once per 4-weight load (8x redundant across the loading lanes). Both types
 // share the dm + scales[12] block prefix, so one fill serves both.
-#define MMID_QK_SCACHE 1
+// Disabled 2026-07-28: measured a pure loss on the current stack (Qwen3.6-35B Q5_K,
+// RADV gfx1151): -4% pp512@ub512, -20% pp2048@ub2048 vs the cache off; decode unaffected.
+// The July-14 win it was added for did not survive the later tile/rebase changes.
+#define MMID_QK_SCACHE 0
 // 8 sub-block (d, m) pairs per tile row, refilled once per superblock (every
 // 8th BK=32 iteration) so 7 of 8 iterations pay no fill or extra barrier.
 shared vec2 scache_dm[BM * 8];
