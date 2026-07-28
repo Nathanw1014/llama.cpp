@@ -6821,8 +6821,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
 
+    const bool kv_view; // K/V as sparse views (default); false = dense permuted like the model KV cache
+
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view);
     }
 
     double max_nmse_err() override {
@@ -6838,9 +6840,10 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        bool kv_view = true)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6868,7 +6871,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -6882,7 +6885,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -9549,6 +9552,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // dense-permuted K/V (model KV-cache layout, engages the f16 contiguize path at nb>=64)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(96, 96, 8, {4, 1}, 512, 80, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {8, 1}, 512, 75, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 96, true, false, 0, 30.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -9900,6 +9909,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Qwen3-Coder-30B-A3B prefill at depth: hd128, 4 KV heads, GQA 8, ub 2048
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  2048, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  6144, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240,  512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // MALL-spill probe: same FLOPs, 32 distinct KV heads (no GQA) -> K/V footprint 8x (168MB > 32MB MALL)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 32, {1, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // KV-cache layout probe: same shape, K/V strided token-major like the real cache (heads interleaved)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    // Same, dense-permuted (exact model KV-cache layout; eligible for the f16 contiguize path)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    // L2-residence probe: 1 KV head x GQA 32 (K/V 5.2MB fits L2) - distinguishes cache-BW-bound from issue-bound
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {32, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // cost-partition probes: no mask; f16 accumulate
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240, 2048, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
