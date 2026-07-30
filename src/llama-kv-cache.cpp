@@ -2138,8 +2138,13 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
+        ggml_tensor * k = is_head_major(layer.k, n_embd_head_k)
+            ? ggml_view_3d(ctx, layer.k,
+                n_rot, n_head_kv, get_size()*n_stream,
+                layer.k->nb[2],   // head
+                layer.k->nb[1],   // token (contiguous)
+                ggml_row_size(layer.k->type, n_embd_nope))
+            : ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
