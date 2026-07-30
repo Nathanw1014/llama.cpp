@@ -1353,6 +1353,11 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+// Head-major storage is self-describing: dim0 is one head rather than all of them.
+static bool is_head_major(const ggml_tensor * t, uint32_t n_embd_head) {
+    return t && t->ne[0] == (int64_t) n_embd_head;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1364,6 +1369,16 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    if (is_head_major(k, hparams.n_embd_head_k(il))) {
+        // [n_embd_head_k, kv_size, n_head_kv]: successive tokens of a head are adjacent
+        return ggml_view_4d(ctx, k,
+                hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+                k->nb[2],           // head
+                k->nb[1],           // token (contiguous)
+                k->nb[2]*k->ne[2],  // stream (single stream here)
+                0);
+    }
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
@@ -1385,6 +1400,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    if (!v_trans && is_head_major(v, hparams.n_embd_head_v(il))) {
+        return ggml_view_4d(ctx, v,
+                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+                v->nb[2],           // head
+                v->nb[1],           // token (contiguous)
+                v->nb[2]*v->ne[2],
+                0);
+    }
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
