@@ -2401,8 +2401,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
+                 int   il,
+                bool   v_trans) const {
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -2685,7 +2685,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, mctx_cur->get_v_trans());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2940,7 +2940,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, mctx_cur->get_v_trans());
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
