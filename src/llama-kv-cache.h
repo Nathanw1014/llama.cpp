@@ -171,6 +171,8 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
+    bool get_v_trans() const;
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -376,6 +378,10 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
+    // true when the V cache is stored transposed; callers must not infer this
+    // from stride order, which is also what a head-major layout produces
+    bool get_v_trans() const;
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il) const;

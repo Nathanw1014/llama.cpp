@@ -240,10 +240,7 @@ llama_kv_cache::llama_kv_cache(
 
         const bool hm_k = !is_mla && n_stream == 1 && n_head_kv_l > 1 &&
                           n_embd_head_k_l*n_head_kv_l == n_embd_k_gqa;
-        // V stays token-major: llm_graph_context::build_attn_mha infers "V is
-        // transposed" from the stride order (v->nb[1] > v->nb[2]), which head-major
-        // V trivially satisfies, so it would silently take the transposed path.
-        // Lifting that requires plumbing v_trans explicitly instead of inferring it.
+        // Enabled in the following commit, once v_trans is no longer inferred.
         const bool hm_v = false;
         GGML_UNUSED(n_embd_head_v_l);
 
@@ -1379,6 +1376,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 // Head-major storage is self-describing: dim0 is one head rather than all of them.
 static bool is_head_major(const ggml_tensor * t, uint32_t n_embd_head) {
     return t && t->ne[0] == (int64_t) n_embd_head;
+}
+
+bool llama_kv_cache::get_v_trans() const {
+    return v_trans;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -2899,6 +2900,10 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+bool llama_kv_cache_context::get_v_trans() const {
+    return kv->get_v_trans();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
