@@ -1459,6 +1459,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
 
+    if (is_head_major(k, (uint32_t) n_embd_head)) {
+        // cache is [n_embd_head, kv_size, n_head_kv]; permute the incoming
+        // [n_embd_head, n_head, n_tokens] to [n_embd_head, n_tokens, n_head] so each
+        // head's tokens are rows. set_rows broadcasts the token idxs over dim2.
+        ggml_tensor * k_src = ggml_permute(ctx, k_cur, 0, 2, 1, 3);
+        return ggml_set_rows(ctx, k, k_src, k_idxs);
+    }
+
     // we can merge dims 0 and 1
     // TODO: add ggml helper function for this?
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
@@ -1498,6 +1506,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
 
     const int64_t n_stream = v->ne[2];
+
+    if (!v_trans && is_head_major(v, (uint32_t) n_embd_head)) {
+        ggml_tensor * v_src = ggml_permute(ctx, v_cur, 0, 2, 1, 3);
+        return ggml_set_rows(ctx, v, v_src, v_idxs);
+    }
 
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
