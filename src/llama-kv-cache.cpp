@@ -228,8 +228,31 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // Head-major KV storage: [n_embd_head, kv_size, n_head_kv] rather than
+        // [n_embd_gqa, kv_size, n_stream]. Attention reads one head's K/V across
+        // many tokens; token-major makes that walk stride by n_embd_gqa per token,
+        // head-major makes it contiguous. Same allocation size either way.
+        // Restricted to the shapes where the rewrite is unambiguous: single stream,
+        // real GQA, and (for V) the non-transposed cache used with flash attention.
+        const uint32_t n_embd_head_k_l = hparams.n_embd_head_k(il);
+        const uint32_t n_embd_head_v_l = hparams.n_embd_head_v(il);
+        const uint32_t n_head_kv_l     = hparams.n_head_kv(il);
+
+        const bool hm_k = !is_mla && n_stream == 1 && n_head_kv_l > 1 &&
+                          n_embd_head_k_l*n_head_kv_l == n_embd_k_gqa;
+        // V stays token-major: llm_graph_context::build_attn_mha infers "V is
+        // transposed" from the stride order (v->nb[1] > v->nb[2]), which head-major
+        // V trivially satisfies, so it would silently take the transposed path.
+        // Lifting that requires plumbing v_trans explicitly instead of inferring it.
+        const bool hm_v = false;
+        GGML_UNUSED(n_embd_head_v_l);
+
+        ggml_tensor * k = has_k ? (hm_k
+            ? ggml_new_tensor_3d(ctx, type_k, n_embd_head_k_l, kv_size, n_head_kv_l)
+            : ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream)) : nullptr;
+        ggml_tensor * v = has_v ? (hm_v
+            ? ggml_new_tensor_3d(ctx, type_v, n_embd_head_v_l, kv_size, n_head_kv_l)
+            : ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream)) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -238,8 +261,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? (hm_k ? k : ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2])) : nullptr);
+            v_stream.push_back(has_v ? (hm_v ? v : ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2])) : nullptr);
         }
 
         const uint32_t n_embd_k_idx = hparams.n_embd_k_idx(il);
