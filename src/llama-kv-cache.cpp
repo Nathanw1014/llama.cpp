@@ -243,9 +243,16 @@ llama_kv_cache::llama_kv_cache(
         // ggml_mul_mat instead and does not produce correct results from a
         // head-major view (verified on both the CPU and Vulkan backends), so the
         // layout stays opt-in to the flash-attention path.
-        const bool hm_k = !is_mla && !v_trans && n_stream == 1 && n_head_kv_l > 1 &&
+        // Only for float caches. A quantized cache is dequantized into a scratch
+        // before flash attention reads it, and that scratch is already written
+        // per-head-contiguous, so head-major storage would save nothing there -
+        // it would only change which addressing the dequant pass uses.
+        const bool kv_float_k = type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_BF16 || type_k == GGML_TYPE_F32;
+        const bool kv_float_v = type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_BF16 || type_v == GGML_TYPE_F32;
+
+        const bool hm_k = !is_mla && !v_trans && n_stream == 1 && n_head_kv_l > 1 && kv_float_k &&
                           n_embd_head_k_l*n_head_kv_l == n_embd_k_gqa;
-        const bool hm_v = hm_k && !v_trans &&
+        const bool hm_v = hm_k && !v_trans && kv_float_v &&
                           n_embd_head_v_l*n_head_kv_l == n_embd_v_gqa;
 
         ggml_tensor * k = has_k ? (hm_k
