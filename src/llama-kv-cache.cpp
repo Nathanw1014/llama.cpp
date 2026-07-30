@@ -240,9 +240,8 @@ llama_kv_cache::llama_kv_cache(
 
         const bool hm_k = !is_mla && n_stream == 1 && n_head_kv_l > 1 &&
                           n_embd_head_k_l*n_head_kv_l == n_embd_k_gqa;
-        // Enabled in the following commit, once v_trans is no longer inferred.
-        const bool hm_v = false;
-        GGML_UNUSED(n_embd_head_v_l);
+        const bool hm_v = hm_k && !v_trans &&
+                          n_embd_head_v_l*n_head_kv_l == n_embd_v_gqa;
 
         ggml_tensor * k = has_k ? (hm_k
             ? ggml_new_tensor_3d(ctx, type_k, n_embd_head_k_l, kv_size, n_head_kv_l)
