@@ -238,7 +238,12 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_head_v_l = hparams.n_embd_head_v(il);
         const uint32_t n_head_kv_l     = hparams.n_head_kv(il);
 
-        const bool hm_k = !is_mla && n_stream == 1 && n_head_kv_l > 1 &&
+        // !v_trans means flash attention, which is the only consumer that reads K
+        // through ggml_flash_attn_ext. The fallback path multiplies K with
+        // ggml_mul_mat instead and does not produce correct results from a
+        // head-major view (verified on both the CPU and Vulkan backends), so the
+        // layout stays opt-in to the flash-attention path.
+        const bool hm_k = !is_mla && !v_trans && n_stream == 1 && n_head_kv_l > 1 &&
                           n_embd_head_k_l*n_head_kv_l == n_embd_k_gqa;
         const bool hm_v = hm_k && !v_trans &&
                           n_embd_head_v_l*n_head_kv_l == n_embd_v_gqa;
@@ -2360,11 +2365,38 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         io.write(&k_size_row, sizeof(k_size_row));
 
-        // Read each range of cells of k_size length and write out
+        // The serialized order is one cell per row, all heads of a cell adjacent,
+        // independent of how the cache is stored, so session files stay portable
+        // between the two layouts. Token-major storage matches that already; the
+        // head-major one is contiguous per head instead, so gather it head by head
+        // into the cell-major order before writing.
+        const bool hm = is_head_major(k, hparams.n_embd_head_k(il));
+
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+
+            if (!hm) {
+                io.write_tensor(k, range.first * k_size_row, range_size * k_size_row);
+                continue;
+            }
+
+            const uint32_t n_head_kv  = hparams.n_head_kv(il);
+            const size_t   head_row   = ggml_row_size(k->type, hparams.n_embd_head_k(il));
+            const size_t   head_span  = (size_t) k->ne[1] * head_row;   // kv_size rows of one head
+
+            std::vector<uint8_t> head_buf(range_size * head_row);
+            std::vector<uint8_t> cell_buf(range_size * k_size_row);
+
+            for (uint32_t h = 0; h < n_head_kv; ++h) {
+                ggml_backend_tensor_get(k, head_buf.data(),
+                        h * head_span + range.first * head_row, head_buf.size());
+                for (size_t c = 0; c < range_size; ++c) {
+                    memcpy(cell_buf.data() + c * k_size_row + h * head_row,
+                           head_buf.data() + c * head_row, head_row);
+                }
+            }
+
+            io.write(cell_buf.data(), cell_buf.size());
         }
     }
 
@@ -2633,7 +2665,33 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         if (cell_count) {
-            if (sinfo.is_contiguous()) {
+            // The stream is cell-major (see state_write_data). Head-major storage wants
+            // each head's cells contiguous, so scatter through a host buffer.
+            if (is_head_major(k, hparams.n_embd_head_k(il))) {
+                const uint32_t n_head_kv = hparams.n_head_kv(il);
+                const size_t   head_row  = ggml_row_size(k->type, hparams.n_embd_head_k(il));
+                const size_t   head_span = (size_t) k->ne[1] * head_row;
+
+                std::vector<uint8_t> cell_buf(cell_count * k_size_row);
+                std::vector<uint8_t> head_buf(cell_count * head_row);
+                io.read(cell_buf.data(), cell_buf.size());
+
+                for (uint32_t h = 0; h < n_head_kv; ++h) {
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        memcpy(head_buf.data() + i * head_row,
+                               cell_buf.data() + i * k_size_row + h * head_row, head_row);
+                    }
+                    if (sinfo.is_contiguous()) {
+                        ggml_backend_tensor_set(k, head_buf.data(),
+                                h * head_span + sinfo.head() * head_row, head_buf.size());
+                    } else {
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            ggml_backend_tensor_set(k, head_buf.data() + i * head_row,
+                                    h * head_span + sinfo.idxs[0][i] * head_row, head_row);
+                        }
+                    }
+                }
+            } else if (sinfo.is_contiguous()) {
                 // Fast path: contiguous cells, single memcpy
                 io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
             } else {
