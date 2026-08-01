@@ -130,6 +130,12 @@ jobs:
           fi
           # fork-side trigger tags are strix-v*; toolbox releases use the plain v* lineage (v0.1, v0.2, ...)
           TAG="${TAG#strix-}"
+          # if the release already exists (portable tarball published from the Strix box first),
+          # append the CI binaries to it instead of failing
+          if gh release view "$TAG" --repo "Nathanw1014/strix-halo-llamacpp" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "Nathanw1014/strix-halo-llamacpp"
+            exit 0
+          fi
           gh release create "$TAG" dist/* \
             --repo "Nathanw1014/strix-halo-llamacpp" \
             --title "Strix Halo llama.cpp (gfx1151) — $TAG" \
