@@ -128,6 +128,8 @@ jobs:
             echo "::error::TOOLBOX_RELEASE_TOKEN secret is not set — cannot publish to the toolbox repo."
             exit 1
           fi
+          # fork-side trigger tags are strix-v*; toolbox releases use the plain v* lineage (v0.1, v0.2, ...)
+          TAG="${TAG#strix-}"
           gh release create "$TAG" dist/* \
             --repo "Nathanw1014/strix-halo-llamacpp" \
             --title "Strix Halo llama.cpp (gfx1151) — $TAG" \
