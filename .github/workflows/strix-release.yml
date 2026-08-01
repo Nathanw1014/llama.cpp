@@ -117,12 +117,19 @@ jobs:
           find artifacts -type f -exec cp {} dist/ \;
           ls -la dist
       - name: Create / update release
+        # Releases publish to the TOOLBOX repo (the user-facing distribution point), not this
+        # fork. That needs TOOLBOX_RELEASE_TOKEN in this repo's Actions secrets: a fine-grained
+        # PAT with contents: read+write on Nathanw1014/strix-halo-llamacpp only.
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.TOOLBOX_RELEASE_TOKEN }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::TOOLBOX_RELEASE_TOKEN secret is not set — cannot publish to the toolbox repo."
+            exit 1
+          fi
           gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
+            --repo "Nathanw1014/strix-halo-llamacpp" \
             --title "Strix Halo llama.cpp (gfx1151) — $TAG" \
             --notes "$(cat <<'EOF'
           The full gfx1151 Vulkan stack from the strix-halo-vulkan branch: FA + MoE-prefill
