@@ -1,0 +1,144 @@
+name: Strix Halo build
+
+# Auto-builds gfx1151 binaries on every push/merge to strix-halo-vulkan (artifacts, 30 days),
+# and publishes a GitHub Release when a strix-v* tag is pushed (or via workflow_dispatch).
+#
+# GitHub-hosted runners have no AMD GPU: these jobs BUILD and PACKAGE only. On-device
+# validation (test-backend-ops, llama-bench receipts, model E2E) happens on real gfx1151
+# hardware before a tag is cut — see github.com/Nathanw1014/strix-halo-llamacpp.
+#
+# The CI tarballs are BINARIES ONLY (they need a system Vulkan driver / ROCm runtime).
+# The fully portable tarball with the bundled RADV driver is cut locally on the Strix box,
+# where the pinned Mesa build lives.
+
+on:
+  push:
+    branches: [ "strix-halo-vulkan" ]
+    tags: [ "strix-v*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. strix-v0.2)"
+        required: false
+        type: string
+
+permissions:
+  contents: write   # required for the release job to create/upload a Release
+
+jobs:
+  build-rocm:
+    name: ROCm / HIP (gfx1151)
+    runs-on: ubuntu-24.04
+    container:
+      image: rocm/dev-ubuntu-24.04:7.2.4-complete
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates
+      - name: Configure + build (gfx1151)
+        run: |
+          export PATH=/opt/rocm/bin:$PATH
+          cmake -S . -B build-hip -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HIP=ON \
+            -DAMDGPU_TARGETS=gfx1151 \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DLLAMA_CURL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+          cmake --build build-hip -j "$(nproc)"
+      - name: Package
+        run: |
+          echo "source: ${GITHUB_REF_NAME} @ ${GITHUB_SHA}" > build-hip/bin/MANIFEST.txt
+          echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ) in CI (compile-and-package only)" >> build-hip/bin/MANIFEST.txt
+          mkdir -p dist
+          tar -C build-hip/bin -czf dist/llama-strix-halo-gfx1151-rocm.tar.gz .
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS-rocm.txt )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm
+          path: dist/*
+          retention-days: 30
+
+  build-vulkan:
+    name: Vulkan / RADV
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK (LunarG) + build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build wget ca-certificates build-essential
+          # Distro glslc/SPIRV-Headers are often too old for current shaders; use the LunarG SDK.
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+      - name: Configure + build
+        run: |
+          source /etc/profile.d/vulkan-sdk.sh 2>/dev/null || true
+          cmake -S . -B build-vulkan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_CURL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+          cmake --build build-vulkan -j "$(nproc)"
+      - name: Package
+        run: |
+          echo "source: ${GITHUB_REF_NAME} @ ${GITHUB_SHA}" > build-vulkan/bin/MANIFEST.txt
+          echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ) in CI (compile-and-package only)" >> build-vulkan/bin/MANIFEST.txt
+          mkdir -p dist
+          tar -C build-vulkan/bin -czf dist/llama-strix-halo-vulkan.tar.gz .
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS-vulkan.txt )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkan
+          path: dist/*
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: [ build-rocm, build-vulkan ]
+    if: startsWith(github.ref, 'refs/tags/strix-v') || github.event.inputs.tag != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -la dist
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Strix Halo llama.cpp (gfx1151) — $TAG" \
+            --notes "$(cat <<'EOF'
+          The full gfx1151 Vulkan stack from the strix-halo-vulkan branch: FA + MoE-prefill
+          fixes, DeepSeek V4 lightning indexer + sparse attention (prefill and flat-cost
+          decode). See github.com/Nathanw1014/strix-halo-llamacpp for docs, measured gains
+          and per-fix upstream branches.
+
+          Artifacts
+          - llama-strix-halo-vulkan.tar.gz — Vulkan build, runs on RADV (Mesa) with no ROCm
+            dependency. Needs a system Vulkan driver; for the tarball with the bundled RADV
+            driver, use the portable tarball from the toolbox repo.
+          - llama-strix-halo-gfx1151-rocm.tar.gz — HIP build, AMDGPU target gfx1151. Requires
+            a ROCm 7.2.x runtime.
+          - SHA256SUMS-*.txt — checksums.
+
+          Built in CI on GitHub-hosted runners (no AMD GPU): compile-and-package only.
+          On-device validation happens on gfx1151 hardware before each tag is cut.
+          EOF
+          )"
