@@ -1475,6 +1475,21 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    static const char * mmq_id_j_env = getenv("GGML_CUDA_MMQ_ID_J");
+    int J_forced = args.ids_dst && mmq_id_j_env ? atoi(mmq_id_j_env) : 0;
+    const bool auto_j = args.ids_dst && (!mmq_id_j_env || strcmp(mmq_id_j_env, "auto") == 0) && GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0;
+    if (auto_j) {
+        const int ncols_avg = (args.ncols_dst + args.nchannels_y - 1)/args.nchannels_y;
+        J_forced = ncols_avg <= 24 ? 16 : ncols_avg <= 32 ? 32 : ncols_avg <= 48 ? 48 : ncols_avg <= 64 ? 96 : 0;
+    }
+    if (J_forced > 0) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_forced, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = J_forced;
+            ntiles_J_best = 1;
+        }
+    }
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
