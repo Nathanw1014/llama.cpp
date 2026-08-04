@@ -4004,6 +4004,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            static const bool disable_mmvq_q8_1_cache = getenv("GGML_CUDA_DISABLE_MMVQ_Q8_1_CACHE") != nullptr;
+            const bool use_mmvq_q8_1_cache = !disable_mmvq_q8_1_cache && !use_cuda_graph &&
+                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+            if (use_mmvq_q8_1_cache) {
+                cuda_ctx->mmvq_q8_1_cache_begin();
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4079,7 +4086,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
-               }
+                }
+            }
+
+            if (use_mmvq_q8_1_cache) {
+                cuda_ctx->mmvq_q8_1_cache_end();
             }
         }
 
