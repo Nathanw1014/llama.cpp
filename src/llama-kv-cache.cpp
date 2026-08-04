@@ -61,6 +61,44 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// [TAG_KV_ROW_PAD] Optional KV row padding, in BYTES, via LLAMA_KV_ROW_PAD.
+// The per-head KV read stride is n_embd_*_gqa*type_size. On a memory system whose
+// channel map is a plain bit-slice (gfx1151: 256 B granule x 16 channels, bits [11:8]),
+// a large power-of-two stride camps every read onto 1-2 channels. Padding the row so
+// stride/256 is odd spreads reads across all channels. 0 = upstream behaviour.
+static uint32_t llama_kv_row_pad_bytes() {
+    const char * e = getenv("LLAMA_KV_ROW_PAD");
+    return e ? (uint32_t) atoi(e) : 0;
+}
+
+// Channel-interleave granule of the target memory system (gfx1151: 256 B x 16 channels).
+static const size_t LLAMA_KV_CHANNEL_GRANULE = 256;
+
+// A row only camps when it spans an EVEN number of channel granules: successive tokens
+// then step by an even lattice stride and reach only 16/gcd(k,16) of the channels. Rows
+// that are not a whole number of granules straddle them and already spread across all
+// of them -- which is every quantised type, whose block size makes row sizes
+// non-power-of-two (q8_0: 1024 elems -> 1088 B = 4.25 granules). Those must NOT be
+// padded: it would buy nothing, cost memory, and disable the dequant-once path, which
+// requires a contiguously-allocated cache.
+// Returns the pad in ELEMENTS, block-aligned so ne[0] stays valid for quantised types.
+static int64_t llama_kv_row_pad_elems(ggml_type type, int64_t ne0, uint32_t pad_bytes) {
+    if (pad_bytes == 0) {
+        return 0;
+    }
+
+    const size_t row = ggml_row_size(type, ne0);
+
+    if ((row % LLAMA_KV_CHANNEL_GRANULE) != 0 || ((row / LLAMA_KV_CHANNEL_GRANULE) % 2) != 0) {
+        return 0;
+    }
+
+    const int64_t blck  = ggml_blck_size(type);
+    const int64_t nblck = (pad_bytes + ggml_type_size(type) - 1) / ggml_type_size(type);
+
+    return nblck * blck;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -112,7 +150,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(2 + n_stream)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -228,8 +266,40 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // [TAG_KV_ROW_PAD] only the FA layout (v not transposed) and a single stream are
+        // supported; cpy_k/cpy_v reshape the cache when n_stream > 1, which needs contiguity.
+        const uint32_t pad_b = (!v_trans && n_stream == 1) ? llama_kv_row_pad_bytes() : 0;
+
+        const int64_t pad_k = has_k ? llama_kv_row_pad_elems(type_k, n_embd_k_gqa, pad_b) : 0;
+        const int64_t pad_v = has_v ? llama_kv_row_pad_elems(type_v, n_embd_v_gqa, pad_b) : 0;
+
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+
+        if (has_k) {
+            if (pad_k > 0) {
+                ggml_tensor * ka = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa + pad_k, kv_size, n_stream);
+                ggml_format_name(ka, "cache_k_pad_l%d", il);
+                k = ggml_view_3d(ctx, ka, n_embd_k_gqa, kv_size, n_stream, ka->nb[1], ka->nb[2], 0);
+            } else {
+                k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+            }
+        }
+
+        if (has_v) {
+            if (pad_v > 0) {
+                ggml_tensor * va = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa + pad_v, kv_size, n_stream);
+                ggml_format_name(va, "cache_v_pad_l%d", il);
+                v = ggml_view_3d(ctx, va, n_embd_v_gqa, kv_size, n_stream, va->nb[1], va->nb[2], 0);
+            } else {
+                v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+            }
+        }
+
+        if (pad_b > 0 && il == 0) {
+            LLAMA_LOG_INFO("%s: KV row pad: k %+lld elems, v %+lld elems (0 = row already spreads)\n",
+                    __func__, (long long) pad_k, (long long) pad_v);
+        }
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -1249,15 +1319,16 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    GGML_UNUSED(kv_size);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            k->nb[1],   // [TAG_KV_ROW_PAD] may carry a pad
+            k->nb[2],
+            k->nb[2]*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1278,9 +1349,9 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
         return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
-                ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                v->nb[1],                                               // v->nb[2], may carry a pad
+                v->nb[2],                                               // v->nb[3]
+                v->nb[2]*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
