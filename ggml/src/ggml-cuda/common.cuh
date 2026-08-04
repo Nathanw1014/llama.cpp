@@ -1228,6 +1228,29 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_mmvq_q8_1_cache_key {
+    const ggml_tensor * src;
+    ggml_type type;
+    size_t size;
+
+    bool operator==(const ggml_cuda_mmvq_q8_1_cache_key & other) const {
+        return src == other.src && type == other.type && size == other.size;
+    }
+};
+
+struct ggml_cuda_mmvq_q8_1_cache_key_hash {
+    size_t operator()(const ggml_cuda_mmvq_q8_1_cache_key & key) const {
+        return std::hash<const ggml_tensor *>{}(key.src) ^ (size_t(key.type) << 1) ^ (key.size << 2);
+    }
+};
+
+struct ggml_cuda_mmvq_q8_1_cache_entry {
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> data;
+};
+
+using ggml_cuda_mmvq_q8_1_cache = std::unordered_map<ggml_cuda_mmvq_q8_1_cache_key,
+    ggml_cuda_mmvq_q8_1_cache_entry, ggml_cuda_mmvq_q8_1_cache_key_hash>;
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1523,6 +1546,53 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    ggml_cuda_mmvq_q8_1_cache mmvq_q8_1_cache[GGML_CUDA_MAX_STREAMS];
+    bool mmvq_q8_1_cache_active = false;
+
+    void mmvq_q8_1_cache_begin() {
+        GGML_ASSERT(!mmvq_q8_1_cache_active);
+        mmvq_q8_1_cache_active = true;
+    }
+
+    char * mmvq_q8_1_cache_get(const ggml_tensor * src, ggml_type type, size_t size, bool & created) {
+        if (!mmvq_q8_1_cache_active) {
+            return nullptr;
+        }
+
+        const ggml_tensor * cache_src = src;
+        while (cache_src->view_src && cache_src->view_src->data == src->data &&
+                ggml_are_same_shape(cache_src->view_src, src) && ggml_are_same_stride(cache_src->view_src, src)) {
+            cache_src = cache_src->view_src;
+        }
+
+        auto & cache = mmvq_q8_1_cache[curr_stream_no];
+        const ggml_cuda_mmvq_q8_1_cache_key key{cache_src, type, size};
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            created = false;
+            return it->second.data->get();
+        }
+
+        static constexpr size_t max_entries = 16;
+        if (cache.size() == max_entries) {
+            cache.clear();
+        }
+
+        auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(pool(), size);
+        char * ptr = data->get();
+        cache.emplace(key, ggml_cuda_mmvq_q8_1_cache_entry{std::move(data)});
+        created = true;
+        return ptr;
+    }
+
+    void mmvq_q8_1_cache_end() {
+        GGML_ASSERT(mmvq_q8_1_cache_active);
+        mmvq_q8_1_cache_active = false;
+        for (auto & cache : mmvq_q8_1_cache) {
+            cache.clear();
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1666,4 +1736,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
