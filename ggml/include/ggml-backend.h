@@ -174,6 +174,9 @@ extern "C" {
         const char * device_id;
         // device capabilities
         struct ggml_backend_dev_caps caps;
+        // granularity of the device memory channel interleave in bytes, 0 if not known
+        //   rows of a 2D tensor that are an even multiple of this apart all start in the same few channels
+        size_t memory_channel_granularity;
     };
 
     GGML_API const char *                  ggml_backend_dev_name(ggml_backend_dev_t device);
