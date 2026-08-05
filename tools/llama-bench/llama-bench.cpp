@@ -40,10 +40,22 @@ struct scoped_roctx_range {
         roctxRangePop();
     }
 };
+
+struct scoped_roctx_profile {
+    scoped_roctx_profile() {
+        roctxProfilerResume(0);
+    }
+
+    ~scoped_roctx_profile() {
+        roctxProfilerPause(0);
+    }
+};
 #else
 struct scoped_roctx_range {
     explicit scoped_roctx_range(const char *) {}
 };
+
+struct scoped_roctx_profile {};
 #endif
 
 #ifdef _WIN32
@@ -2451,6 +2463,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                scoped_roctx_profile profile;
                 scoped_roctx_range range("llama-bench/prompt");
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
