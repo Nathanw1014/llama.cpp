@@ -281,6 +281,17 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# a padded KV row is not contiguous, so the state has to be written and read one cell at a time
+llama_test(test-save-load-state NAME test-save-load-state-kv-row-pad ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-save-load-state-kv-row-pad PROPERTIES
+    FIXTURES_REQUIRED test-download-model
+    ENVIRONMENT "LLAMA_KV_ROW_PAD=16"
+)
+
+# Test that the KV cache layout does not change what a context shift produces
+llama_build_and_test(test-context-shift.cpp ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-context-shift PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
