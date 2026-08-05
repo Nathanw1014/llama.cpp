@@ -57,6 +57,40 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
+// [TAG_KV_ROW_PAD] a KV row that is an even multiple of the memory channel granularity wide keeps
+// every token of a given head on the same few channels, which costs most of the read bandwidth
+// at depth. pad the row by 8 elements to spread it over all of them - 8 elements also keeps the
+// stride aligned for the vector load paths. LLAMA_KV_ROW_PAD overrides the pad in bytes
+static int64_t llama_kv_row_pad(size_t granularity, ggml_type type, int64_t ne0) {
+    // quantized rows are not a whole multiple of it to begin with
+    if (ggml_is_quantized(type)) {
+        return 0;
+    }
+
+    const char * env = getenv("LLAMA_KV_ROW_PAD");
+    if (env) {
+        const int64_t pad = atoi(env);
+        return pad > 0 ? (pad + ggml_type_size(type) - 1)/ggml_type_size(type) : 0;
+    }
+
+    if (granularity == 0 || ggml_row_size(type, ne0) % (2*granularity) != 0) {
+        return 0;
+    }
+
+    return 8;
+}
+
+static size_t llama_kv_memory_channel_granularity(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return 0;
+    }
+
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+
+    return props.memory_channel_granularity;
+}
+
 //
 // llama_kv_cache
 //
@@ -112,7 +146,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(2 + n_stream)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -210,9 +244,10 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_dev_t         dev  = nullptr;
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            dev  = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -228,8 +263,28 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // [TAG_KV_ROW_PAD] the write path reshapes the cache when it is transposed or has more
+        // than one stream, and a reshape needs contiguous rows. MLA is left out as well, it
+        // reads the cache through its own serialization path
+        const bool can_pad = !v_trans && n_stream == 1 && !is_mla;
+
+        const size_t granularity = can_pad ? llama_kv_memory_channel_granularity(dev) : 0;
+
+        const int64_t pad_k = has_k && can_pad ? llama_kv_row_pad(granularity, type_k, n_embd_k_gqa) : 0;
+        const int64_t pad_v = has_v && can_pad ? llama_kv_row_pad(granularity, type_v, n_embd_v_gqa) : 0;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa + pad_k, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa + pad_v, kv_size, n_stream) : nullptr;
+
+        if (pad_k > 0) {
+            ggml_format_name(k, "cache_k_pad_l%d", il);
+            k = ggml_view_3d(ctx, k, n_embd_k_gqa, kv_size, n_stream, k->nb[1], k->nb[2], 0);
+        }
+
+        if (pad_v > 0) {
+            ggml_format_name(v, "cache_v_pad_l%d", il);
+            v = ggml_view_3d(ctx, v, n_embd_v_gqa, kv_size, n_stream, v->nb[1], v->nb[2], 0);
+        }
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -1251,19 +1306,17 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_k_gqa = k->ne[0];
-
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    assert(k->ne[0] == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // [TAG_KV_ROW_PAD] nb[1] and nb[2] carry the pad, if any
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            k->nb[1],
+            k->nb[2],
+            k->nb[2]*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1281,12 +1334,13 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
+        // [TAG_KV_ROW_PAD] v->nb[1] and v->nb[2] carry the pad, if any
         return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
-                ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                v->nb[1],                                               // v->nb[2]
+                v->nb[2],                                               // v->nb[3]
+                v->nb[2]*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1931,8 +1985,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
-        const int64_t n_head_kv    = hparams.n_head_kv(il);
-        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const int64_t n_head_kv = hparams.n_head_kv(il);
 
         const auto n_rot         = hparams.n_rot(il);
         const auto n_embd_head_k = hparams.n_embd_head_k(il);
@@ -1943,11 +1996,12 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        // [TAG_KV_ROW_PAD] nb[1] carries the pad, if any
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
+                layer.k->nb[1],
                 ggml_row_size(layer.k->type, n_embd_nope));
 
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
@@ -1958,6 +2012,18 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     res->add_input(std::move(inp));
 
     return gf;
+}
+
+// [TAG_KV_ROW_PAD] cells are back to back in the state, but nb[1] apart in a padded cache
+static void llama_kv_state_write_rows(llama_io_write_i & io, ggml_tensor * t, uint32_t i0, uint32_t n, size_t row_size) {
+    if (t->nb[1] == row_size) {
+        io.write_tensor(t, i0*row_size, n*row_size);
+        return;
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        io.write_tensor(t, (i0 + i)*t->nb[1], row_size);
+    }
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -2139,9 +2205,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         // Read each range of cells of k_size length and write out
         for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+            llama_kv_state_write_rows(io, k, range.first, range.second - range.first, k_size_row);
         }
     }
 
@@ -2166,9 +2230,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
             // Read each range of cells of v_size length and write out
             for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
+                llama_kv_state_write_rows(io, v, range.first, range.second - range.first, v_size_row);
             }
         }
     } else {
@@ -2380,13 +2442,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         if (cell_count) {
-            if (sinfo.is_contiguous()) {
+            // [TAG_KV_ROW_PAD] a padded cache has to take the scatter path
+            if (sinfo.is_contiguous() && k->nb[1] == k_size_row) {
                 // Fast path: contiguous cells, single memcpy
                 io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
             } else {
                 // Slow path: scatter to non-contiguous positions
                 for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
+                    const size_t dst_offset = sinfo.idxs[0][i] * k->nb[1];
                     io.read_tensor(k, dst_offset, k_size_row);
                 }
             }
@@ -2423,13 +2486,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
 
             if (cell_count) {
-                if (sinfo.is_contiguous()) {
+                // [TAG_KV_ROW_PAD] a padded cache has to take the scatter path
+                if (sinfo.is_contiguous() && v->nb[1] == v_size_row) {
                     // Fast path: contiguous cells, single memcpy
                     io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
                 } else {
                     // Slow path: scatter to non-contiguous positions
                     for (uint32_t i = 0; i < cell_count; ++i) {
-                        const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
+                        const size_t dst_offset = sinfo.idxs[0][i] * v->nb[1];
                         io.read_tensor(v, dst_offset, v_size_row);
                     }
                 }
