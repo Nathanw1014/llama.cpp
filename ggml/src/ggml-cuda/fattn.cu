@@ -555,7 +555,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_V = false;
 
     switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
+        case BEST_FATTN_KERNEL_TILE: {
+            // Dequant-on-load reads the quantized K/V directly, so no f16 scratch is needed.
+            const bool dequant_on_load = K->type == V->type &&
+                (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+                (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256 || K->ne[0] == 512) && V->ne[0] == K->ne[0];
+            need_f16_K = !dequant_on_load;
+            need_f16_V = !dequant_on_load;
+        } break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
