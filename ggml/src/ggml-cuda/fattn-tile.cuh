@@ -728,15 +728,15 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 const int jc = (threadIdx.y / np)*cpw;
                 const int j = fastmodulo(col_Q_0 + jc/ncols2, ne01);
                 const bool selected = i_KQ < k_VKQ_sup && __half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) != -INFINITY;
-                uint32_t selected_lanes = (uint32_t) __ballot_sync(0xFFFFFFFFFFFFFFFFull, selected);
-                const int n_selected = __popc(selected_lanes);
+                uint64_t selected_lanes = __ballot_sync(0xFFFFFFFFFFFFFFFFull, selected);
+                const int n_selected = __popcll((unsigned long long) selected_lanes);
                 n_KQ_map[i_KQ_0/(np*warp_size)] = n_selected;
 
                 if (threadIdx.x < n_selected) {
                     for (int i = 0; i < threadIdx.x; ++i) {
                         selected_lanes &= selected_lanes - 1;
                     }
-                    i_KQ_map[i_KQ_0/(np*warp_size)] = i_KQ_0 + (threadIdx.y % np)*warp_size + __ffs(selected_lanes) - 1;
+                    i_KQ_map[i_KQ_0/(np*warp_size)] = i_KQ_0 + (threadIdx.y % np)*warp_size + __ffsll((unsigned long long) selected_lanes) - 1;
                 } else {
                     i_KQ_map[i_KQ_0/(np*warp_size)] = k_VKQ_sup;
                 }
@@ -773,7 +773,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         if constexpr (common_mask) {
             const int jc = (threadIdx.y / np)*cpw;
             const int j = fastmodulo(col_Q_0 + jc/ncols2, ne01);
-            if (!oob_check || i_KQ < k_VKQ_sup) {
+            // With compaction, lanes past n_selected carry i_KQ == k_VKQ_sup as a sentinel, so the
+            // bounds test must run even when oob_check is false (matches the softmax guard below).
+            if ((!compact_mask && !oob_check) || i_KQ < k_VKQ_sup) {
                 mask_value = __half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]);
             }
         }
@@ -792,7 +794,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
             }
 
-            if (!oob_check || i_KQ < k_VKQ_sup) {
+            if ((!compact_mask && !oob_check) || i_KQ < k_VKQ_sup) {
                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
                     slope*(common_mask ? mask_value : __half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ])) : 0.0f;
 
