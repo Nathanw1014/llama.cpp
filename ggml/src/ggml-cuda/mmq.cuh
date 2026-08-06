@@ -481,12 +481,17 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+    constexpr int warps_i   = I / (ntx*tile_C::I);
+    constexpr int warps_j   = nwarps / warps_i > 0 ? nwarps / warps_i : 1;
+    const int wg = threadIdx.y / ntx;
+    const int i0 = (wg % warps_i) * (ntx*tile_C::I);
+    const int jg = wg / warps_i;
 
     const bool y_scale_used = y_scale != nullptr;
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int jl = 0; jl < J / (warps_j*ntx*tile_C::J); ++jl) {
+        const int j0 = (jl*warps_j + jg) * (ntx*tile_C::J);
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #pragma unroll
@@ -505,12 +510,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
 
                 if constexpr (type == GGML_TYPE_NVFP4) {
                     if (y_scale_used) {
-                        dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(jl*ntx + n)*tile_C::ne + l];
                     } else {
-                        dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        dst[ids_dst[j]*stride + i] = sum[(jl*ntx + n)*tile_C::ne + l];
                     }
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    dst[ids_dst[j]*stride + i] = sum[(jl*ntx + n)*tile_C::ne + l];
                     GGML_UNUSED(y_scale_used);
                 }
             }
