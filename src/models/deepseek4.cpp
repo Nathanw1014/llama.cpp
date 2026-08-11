@@ -292,7 +292,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
 
-    if (cparams.fused_dsv4_hc_pre && il >= 0) {
+    if (cparams.fused_dsv4_hc_pre && cparams.use_fused(LLM_FUSED_OP_DSV4_HC_PRE, il) && il >= 0) {
         ggml_tensor * result = ggml_dsv4_hc_pre(ctx0, x, weights);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, result, il});
         return result;
@@ -385,7 +385,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     *post = ggml_scale(ctx0, *post, 2.0f);
     cb(*post, "hc_post", il);
 
-    if (cparams.fused_dsv4_hc_comb) {
+    if (cparams.fused_dsv4_hc_comb && cparams.use_fused(LLM_FUSED_OP_DSV4_HC_COMB, il)) {
         *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
@@ -413,7 +413,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == hparams.dsv4_hc_mult);
 
-    if (cparams.fused_dsv4_hc_post) {
+    if (cparams.fused_dsv4_hc_post && cparams.use_fused(LLM_FUSED_OP_DSV4_HC_POST, il)) {
         ggml_tensor * result = ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
         return result;
