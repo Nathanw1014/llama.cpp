@@ -40,14 +40,18 @@ layout(push_constant) uniform Parameters {
 } p;
 
 // Shape constants pinned by the dispatch gate in ggml_vk_flash_attn_top_k: DeepSeek V4
-// CSA attention only (hd 512, 64 heads MQA over an f16 K==V latent). The gate also pins
-// the pipeline to subgroup size 64, so per-lane sizing uses LANES rather than the
-// SUBGROUP_SIZE specialization constant (a spec-constant array bound would be folded at
-// compile time from the default and silently break under a different runtime subgroup).
+// CSA attention only (hd 512, 64 heads MQA over an f16 K==V latent).
 const uint HEAD_SIZE = 512;
-const uint HEADS_PER_GROUP = 8;
 const uint KEYS_PER_BLOCK = 16;
-const uint LANES = 64;
+
+// One head per subgroup, so the workgroup carries WORKGROUP_SIZE / SUBGROUP_SIZE heads: 8 at
+// wave64, 16 at wave32. ggml_vk_flash_attn_top_k divides the grid's y extent by this same
+// value, and its gate rejects any subgroup size for which n_head is not a whole multiple of
+// it - the loop below has no bounds check and relies on the grid covering n_head exactly.
+const uint HEADS_PER_GROUP = WORKGROUP_SIZE / SUBGROUP_SIZE;
+
+// Each lane covers a strided slice of the head dimension: 8 elements at wave64, 16 at wave32.
+const uint ELEM_PER_LANE = HEAD_SIZE / SUBGROUP_SIZE;
 // f16 -inf (or the lowest f16 normal some mask writers use in its place) marks a
 // masked-out key.
 const float MASK_NEG_INF = -65500.0;
@@ -67,8 +71,8 @@ void main() {
     // workgroup, which is undefined behavior — do not reintroduce one without restructuring
     // the barrier flow.
 
-    float accum[HEAD_SIZE / LANES];
-    [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+    float accum[ELEM_PER_LANE];
+    [[unroll]] for (uint i = 0; i < ELEM_PER_LANE; ++i) {
         accum[i] = 0.0;
     }
 
@@ -111,8 +115,8 @@ void main() {
             }
 
             float partial = 0.0;
-            [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
-                const uint dim = lane + i * LANES;
+            [[unroll]] for (uint i = 0; i < ELEM_PER_LANE; ++i) {
+                const uint dim = lane + i * SUBGROUP_SIZE;
                 partial += data_q[q_base + dim] * float(key_sh[col * HEAD_SIZE + dim]);
             }
             const float mask = float(data_m[mask_base + key]);
@@ -127,8 +131,8 @@ void main() {
             row_sum = row_sum * old_scale + value_scale;
             row_max = new_max;
 
-            [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
-                const uint dim = lane + i * LANES;
+            [[unroll]] for (uint i = 0; i < ELEM_PER_LANE; ++i) {
+                const uint dim = lane + i * SUBGROUP_SIZE;
                 accum[i] = accum[i] * old_scale + value_scale * float(key_sh[col * HEAD_SIZE + dim]);
             }
         }
@@ -141,14 +145,14 @@ void main() {
         const float old_scale = row_sum == 0.0 ? 0.0 : exp(row_max - new_max);
         const float sink_scale = exp(sink - new_max);
         row_sum = row_sum * old_scale + sink_scale;
-        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+        [[unroll]] for (uint i = 0; i < ELEM_PER_LANE; ++i) {
             accum[i] *= old_scale;
         }
     }
 
     const uint dst_base = stream * p.nb3 + token * p.nb2 + head * p.nb1;
     const float inv_sum = row_sum == 0.0 ? 0.0 : 1.0 / row_sum;
-    [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
-        data_dst[dst_base + lane + i * LANES] = accum[i] * inv_sum;
+    [[unroll]] for (uint i = 0; i < ELEM_PER_LANE; ++i) {
+        data_dst[dst_base + lane + i * SUBGROUP_SIZE] = accum[i] * inv_sum;
     }
 }

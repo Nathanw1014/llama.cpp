@@ -36,6 +36,14 @@ layout(push_constant) uniform Parameters {
 const uint K_PER_GROUP = 8;
 const uint N_HEAD = 64;
 
+// the indexer head dimension. supports_op rejects anything else, so it is safe to fix here.
+const uint HEAD_DIM = 128;
+
+// each lane covers a strided slice of the head dimension, so SUBGROUP_SIZE must divide
+// HEAD_DIM: 2 elements per lane at wave64, 4 at wave32. supports_op enforces the same
+// divisibility before this pipeline is selected.
+const uint ELEM_PER_LANE = HEAD_DIM / SUBGROUP_SIZE;
+
 void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint token = gl_WorkGroupID.y;
@@ -46,17 +54,18 @@ void main() {
         return;
     }
 
-    float k0[K_PER_GROUP];
-    float k1[K_PER_GROUP];
+    float kvals[K_PER_GROUP * ELEM_PER_LANE];
     [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
         const uint kv = kv_base + j;
         if (kv < p.n_kv) {
             const uint k_base = stream * p.nbk3 + kv * p.nbk2;
-            k0[j] = float(data_k[k_base + lane]);
-            k1[j] = float(data_k[k_base + lane + SUBGROUP_SIZE]);
+            [[unroll]] for (uint e = 0; e < ELEM_PER_LANE; ++e) {
+                kvals[j * ELEM_PER_LANE + e] = float(data_k[k_base + lane + e * SUBGROUP_SIZE]);
+            }
         } else {
-            k0[j] = 0.0;
-            k1[j] = 0.0;
+            [[unroll]] for (uint e = 0; e < ELEM_PER_LANE; ++e) {
+                kvals[j * ELEM_PER_LANE + e] = 0.0;
+            }
         }
     }
 
@@ -67,12 +76,20 @@ void main() {
 
     for (uint head = 0; head < N_HEAD; ++head) {
         const uint q_base = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1;
-        const float q0 = data_q[q_base + lane];
-        const float q1 = data_q[q_base + lane + SUBGROUP_SIZE];
+        float qvals[ELEM_PER_LANE];
+        [[unroll]] for (uint e = 0; e < ELEM_PER_LANE; ++e) {
+            qvals[e] = data_q[q_base + lane + e * SUBGROUP_SIZE];
+        }
         const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head];
 
         [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
-            const float qk = subgroupAdd(q0 * k0[j] + q1 * k1[j]);
+            // accumulated in the same order as the wave64 q0*k0 + q1*k1 form, so the
+            // wave64 result stays bit-identical
+            float acc = 0.0;
+            [[unroll]] for (uint e = 0; e < ELEM_PER_LANE; ++e) {
+                acc += qvals[e] * kvals[j * ELEM_PER_LANE + e];
+            }
+            const float qk = subgroupAdd(acc);
             if (lane == 0) {
                 score[j] += max(qk, 0.0) * weight;
             }

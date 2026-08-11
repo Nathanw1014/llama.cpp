@@ -4196,6 +4196,65 @@ static bool ggml_vk_mmid_f16b_enabled() {
     return enabled;
 }
 
+// Shapes the DeepSeek V4 sparse-attention shaders are pinned to by their dispatch gates.
+static constexpr uint32_t LIGHTNING_INDEXER_HEAD_DIM = 128;
+static constexpr uint32_t FA_TOP_K_HEAD_SIZE        = 512;
+static constexpr uint32_t FA_TOP_K_WORKGROUP_SIZE   = 512;
+static constexpr uint32_t FA_TOP_K_N_HEAD           = 64;
+static constexpr uint32_t FA_GATHER_LOCAL_SIZE      = 64;
+
+// Subgroup size the DSv4 sparse-attention pipelines are built for. GGML_VK_DSV4_SUBGROUP forces a
+// value so wave32 can be exercised on a wave64 device; unset reproduces the device size exactly.
+// It must drive both the spec constants and the required subgroup size, or the shader's view of
+// the subgroup and the real one disagree.
+static uint32_t ggml_vk_dsv4_subgroup_size(const vk_device& device) {
+    static const uint32_t forced = [] {
+        const char * env = getenv("GGML_VK_DSV4_SUBGROUP");
+        return (uint32_t)(env ? atoi(env) : 0);
+    }();
+    return forced ? forced : device->subgroup_size;
+}
+
+// Each lane covers HEAD_DIM / subgroup_size elements of the head dimension, so the size must
+// divide it. Floor of 32 keeps the per-lane array small; nothing below that is worth supporting.
+static bool ggml_vk_lightning_indexer_subgroup_ok(const vk_device& device) {
+    if (!device->subgroup_arithmetic) {
+        return false;
+    }
+    const uint32_t sg = ggml_vk_dsv4_subgroup_size(device);
+    return sg >= 32 && sg <= LIGHTNING_INDEXER_HEAD_DIM && (LIGHTNING_INDEXER_HEAD_DIM % sg) == 0;
+}
+
+// top_k runs one head per subgroup, so the workgroup must split into whole subgroups and n_head
+// must be a whole multiple of the resulting heads-per-group: the shader has no bounds check and
+// relies on the grid covering n_head exactly. Each lane also covers HEAD_SIZE / subgroup_size
+// elements. ggml_vk_flash_attn_top_k() derives its grid from the same heads-per-group.
+static uint32_t ggml_vk_fa_top_k_heads_per_group(const vk_device& device) {
+    return FA_TOP_K_WORKGROUP_SIZE / ggml_vk_dsv4_subgroup_size(device);
+}
+
+static bool ggml_vk_fa_top_k_subgroup_ok(const vk_device& device) {
+    if (!device->subgroup_arithmetic) {
+        return false;
+    }
+    const uint32_t sg = ggml_vk_dsv4_subgroup_size(device);
+    if (sg < 32 || sg > FA_TOP_K_HEAD_SIZE) {
+        return false;
+    }
+    if ((FA_TOP_K_WORKGROUP_SIZE % sg) != 0 || (FA_TOP_K_HEAD_SIZE % sg) != 0) {
+        return false;
+    }
+    const uint32_t heads_per_group = FA_TOP_K_WORKGROUP_SIZE / sg;
+    return heads_per_group != 0 && (FA_TOP_K_N_HEAD % heads_per_group) == 0;
+}
+
+// gather uses no subgroup ops at all; it is a workgroup-wide strided copy. The only constraint is
+// require_full_subgroups, which needs the fixed local size to split into whole subgroups.
+static bool ggml_vk_fa_gather_subgroup_ok(const vk_device& device) {
+    const uint32_t sg = ggml_vk_dsv4_subgroup_size(device);
+    return sg != 0 && (FA_GATHER_LOCAL_SIZE % sg) == 0;
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -6118,11 +6177,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-    if (device->subgroup_arithmetic && device->subgroup_size == 64) {
+    // The scalar indexer splits LIGHTNING_INDEXER_HEAD_DIM across the subgroup, ELEM_PER_LANE
+    // elements per lane, so any subgroup size that divides it works (2 per lane at wave64, 4 at
+    // wave32). ggml_vk_lightning_indexer_subgroup_ok() is the single source of truth and
+    // supports_op gates on the same call. GGML_VK_LID_SUBGROUP overrides the size for testing
+    // wave32 on a wave64 device; it must drive both the spec constant and the required size, or
+    // the shader's view of the subgroup and the real one disagree.
+    if (ggml_vk_lightning_indexer_subgroup_ok(device)) {
+        const uint32_t lid_subgroup_size = ggml_vk_dsv4_subgroup_size(device);
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16,
             "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5,
-            sizeof(vk_op_lightning_indexer_push_constants), {8, 1, 1}, {device->subgroup_size}, 1, true, true,
-            device->subgroup_size);
+            sizeof(vk_op_lightning_indexer_push_constants), {8, 1, 1}, {lid_subgroup_size}, 1, true, true,
+            lid_subgroup_size);
+    }
+
+    // the coopmat indexer variants, top_k and gather have not been audited for subgroup sizes
+    // other than 64, so they stay on the original gate
+    if (device->subgroup_arithmetic && device->subgroup_size == 64) {
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && device->subgroup_size_control) {
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
@@ -6135,14 +6206,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->subgroup_size);
         }
 #endif
+    }
+
+    if (ggml_vk_fa_top_k_subgroup_ok(device)) {
+        const uint32_t sg = ggml_vk_dsv4_subgroup_size(device);
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
             "flash_attn_top_k_f16", flash_attn_top_k_f16_len, flash_attn_top_k_f16_data, "main", 6,
-            sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
-            device->subgroup_size);
+            sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {FA_TOP_K_WORKGROUP_SIZE, sg}, 1, true, true,
+            sg);
+    }
+
+    if (ggml_vk_fa_gather_subgroup_ok(device)) {
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_f16,
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
-            device->subgroup_size);
+            ggml_vk_dsv4_subgroup_size(device));
     }
 
     // DSv4 fused hyper-connection ops: plain f32 compute, no subgroup/coopmat requirements
@@ -11244,11 +11322,19 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_pipeline pipeline = ctx->device->pipeline_flash_attn_top_k_f16;
+    // one-shot: the sparse path is easy to miss silently, and a run that quietly fell back
+    // looks identical to one that engaged (see the CSA empty-context trap)
+    static bool top_k_logged = false;
+    if (!top_k_logged) {
+        top_k_logged = true;
+        GGML_LOG_INFO("ggml_vulkan: DSv4 sparse FA top_k engaged (subgroup %u, %u heads/group)\n",
+                      ggml_vk_dsv4_subgroup_size(ctx->device), ggml_vk_fa_top_k_heads_per_group(ctx->device));
+    }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
          ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
-        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], 8), (uint32_t) q->ne[3]});
+        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], ggml_vk_fa_top_k_heads_per_group(ctx->device)), (uint32_t) q->ne[3]});
     return true;
 }
 
@@ -11316,6 +11402,12 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     }
 
     vk_pipeline pipeline = ctx->device->pipeline_flash_attn_gather_f16;
+    static bool gather_logged = false;
+    if (!gather_logged) {
+        gather_logged = true;
+        GGML_LOG_INFO("ggml_vulkan: DSv4 sparse FA gather engaged (subgroup %u)\n",
+                      ggml_vk_dsv4_subgroup_size(ctx->device));
+    }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_op_flash_attn_gather_push_constants pc = {
@@ -19382,7 +19474,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * w = op->src[2];
                 const ggml_tensor * m = op->src[3];
 
-                if (device->subgroup_size != 64 || !device->subgroup_arithmetic) {
+                // same gate the pipeline was created under, so admission and dispatch agree
+                if (!ggml_vk_lightning_indexer_subgroup_ok(device)) {
                     return false;
                 }
                 if (op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 ||
