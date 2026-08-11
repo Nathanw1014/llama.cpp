@@ -76,7 +76,11 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
     /*.n_tokens_per_seq =*/ 1,
-    /*.keep_on_mismatch =*/ true,
+    // off by default: the unfused fallback allocates by full context, but where it fits it is
+    // measurably faster than running the fused op off-device (a reporter measured decode at
+    // 20 t/s unfused vs 14 t/s fused-on-CPU on a Strix Halo + RTX 5090 split). Opt in with
+    // LLAMA_FUSED_KEEP_ON_MISMATCH=1 when the unfused buffer will not allocate.
+    /*.keep_on_mismatch =*/ false,
     /*.per_layer        =*/ false,
 };
 
@@ -588,7 +592,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             return;
         }
 
-        if (probe.keep_on_mismatch) {
+        static const bool keep_on_mismatch_forced = [] {
+            const char * env = getenv("LLAMA_FUSED_KEEP_ON_MISMATCH");
+            return env != nullptr && atoi(env) != 0;
+        }();
+
+        if (probe.keep_on_mismatch || keep_on_mismatch_forced) {
             // unfusing costs far more than running the fused op off-device, so stay fused and let
             // the scheduler place the mismatching nodes wherever they are supported
             enabled = true;
