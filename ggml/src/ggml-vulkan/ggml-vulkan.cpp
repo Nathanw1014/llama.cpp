@@ -2214,10 +2214,113 @@ std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
+// print the aggregate table to stderr; off when only GGML_VK_PERF_TRACE is set
+static bool vk_perf_logger_print = false;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+
+// GGML_VK_PERF_TRACE=<file>: write one Chrome trace event per timed interval, viewable in
+// ui.perfetto.dev and post-processable as JSON. Reuses the perf logger query machinery, so
+// per-op mode serializes the graph like the logger does; set GGML_VK_PERF_LOGGER_CONCURRENT=1
+// for a wall-clock-true timeline at sync-interval granularity.
+static bool vk_perf_trace_enabled = false;
+static uint32_t vk_perf_trace_skip = 0;
+static uint32_t vk_perf_trace_count = UINT32_MAX;
+
+struct vk_perf_trace_writer {
+    FILE * f {};
+    std::mutex mutex;
+    int64_t t0_ns {};
+    uint32_t graph_seq {};
+    std::vector<bool> tid_named;
+
+    static int64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // mutex must be held
+    void open_once() {
+        if (f) {
+            return;
+        }
+        const char * path = getenv("GGML_VK_PERF_TRACE");
+        f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "ggml_vulkan: failed to open GGML_VK_PERF_TRACE file %s\n", path);
+            vk_perf_trace_enabled = false;
+            return;
+        }
+        // a trace event array may stay unterminated, so the file is valid even after a crash
+        fputs("[\n", f);
+        t0_ns = now_ns();
+    }
+
+    static void escape(std::string & out, const char * s) {
+        for (; *s; s++) {
+            const char c = *s;
+            if (c == '"' || c == '\\') {
+                out += '\\';
+                out += c;
+            } else if ((unsigned char) c < 0x20) {
+                out += ' ';
+            } else {
+                out += c;
+            }
+        }
+    }
+
+    // returns true when this graph is inside the SKIP/COUNT capture window
+    bool begin_graph(int64_t * t_entry, uint32_t * seq) {
+        std::lock_guard<std::mutex> guard(mutex);
+        const uint32_t s = graph_seq++;
+        if (s < vk_perf_trace_skip || s - vk_perf_trace_skip >= vk_perf_trace_count) {
+            return false;
+        }
+        open_once();
+        if (!f) {
+            return false;
+        }
+        *t_entry = now_ns();
+        *seq = s;
+        return true;
+    }
+
+    void event(uint32_t tid, const char * tid_name, const char * name, int64_t ts_ns, int64_t dur_ns, const std::string & args_json) {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!f) {
+            return;
+        }
+        if (tid >= tid_named.size()) {
+            tid_named.resize(tid + 1, false);
+        }
+        if (!tid_named[tid]) {
+            tid_named[tid] = true;
+            fprintf(f, "{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":0,\"tid\":%u,\"args\":{\"name\":\"%s\"}},\n", tid, tid_name);
+        }
+        std::string esc;
+        escape(esc, name);
+        fprintf(f, "{\"ph\":\"X\",\"name\":\"%s\",\"pid\":0,\"tid\":%u,\"ts\":%.3f,\"dur\":%.3f%s%s},\n",
+                esc.c_str(), tid, (ts_ns - t0_ns) / 1e3, dur_ns / 1e3,
+                args_json.empty() ? "" : ",\"args\":", args_json.c_str());
+    }
+
+    void flush() {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (f) {
+            fflush(f);
+        }
+    }
+
+    ~vk_perf_trace_writer() {
+        if (f) {
+            fclose(f);
+        }
+    }
+};
+static vk_perf_trace_writer vk_perf_trace;
 
 // Total memory traffic of a node (dst + srcs). Used to bound command buffer
 // execution time for bandwidth-bound ops with no flops estimate (large copies,
@@ -2299,6 +2402,12 @@ class vk_perf_logger {
   public:
     void print_timings(bool force = false) {
         if (timings.empty()) {
+            return;
+        }
+        if (!vk_perf_logger_print) {
+            // trace-only mode: the accumulators still fill, discard them silently
+            timings.clear();
+            flops.clear();
             return;
         }
         print_count++;
@@ -8053,8 +8162,19 @@ static void ggml_vk_instance_init() {
         vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
     }
 
-    vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_logger_print = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_trace_enabled = getenv("GGML_VK_PERF_TRACE") != nullptr;
+    // the trace rides on the perf logger query machinery
+    vk_perf_logger_enabled = vk_perf_logger_print || vk_perf_trace_enabled;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    const char * GGML_VK_PERF_TRACE_SKIP = getenv("GGML_VK_PERF_TRACE_SKIP");
+    if (GGML_VK_PERF_TRACE_SKIP != nullptr) {
+        vk_perf_trace_skip = std::stoul(GGML_VK_PERF_TRACE_SKIP);
+    }
+    const char * GGML_VK_PERF_TRACE_COUNT = getenv("GGML_VK_PERF_TRACE_COUNT");
+    if (GGML_VK_PERF_TRACE_COUNT != nullptr) {
+        vk_perf_trace_count = std::stoul(GGML_VK_PERF_TRACE_COUNT);
+    }
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -18928,7 +19048,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
+    bool trace_this = false;
+    uint32_t trace_seq = 0;
+    int64_t trace_t_entry = 0;
+    int64_t trace_t_submit = 0;
     if (vk_perf_logger_enabled) {
+        if (vk_perf_trace_enabled) {
+            trace_this = vk_perf_trace.begin_graph(&trace_t_entry, &trace_seq);
+        }
         // allocate/resize the query pool
         if (ctx->num_queries < cgraph->n_nodes + 1) {
             if (ctx->query_pool) {
@@ -19326,7 +19453,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_ctx_end(compute_ctx);
 
         ggml_vk_submit(compute_ctx, ctx->device->fence);
+        if (trace_this) {
+            trace_t_submit = vk_perf_trace_writer::now_ns();
+        }
         VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
+        // sample the CPU clock at fence signal to place GPU timestamps on the CPU timeline
+        const int64_t trace_t_signal = trace_this ? vk_perf_trace_writer::now_ns() : 0;
         ctx->device->device.resetFences({ ctx->device->fence });
         ctx->compute_ctx.reset();
 
@@ -19334,6 +19466,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Sized to the pool, not n_nodes+1: sub-op marks push query_idx past the node count.
         std::vector<uint64_t> timestamps(ctx->num_queries);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, ctx->num_queries*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
+
+        const double trace_period = ctx->device->properties.limits.timestampPeriod;
+        const uint64_t trace_last_tick = ctx->query_idx > 0 ? timestamps[ctx->query_idx - 1] : 0;
+        // GPU ticks -> CPU ns, anchored on the last timestamp retiring ~at the fence signal.
+        // Tick deltas stay small, so the double multiply keeps ns precision.
+        auto trace_ts = [&](uint64_t tick) {
+            return trace_t_signal - (int64_t) ((trace_last_tick - tick) * trace_period);
+        };
+        const uint32_t trace_tid_gpu = (uint32_t) (2 * ctx->device->idx);
         if (!vk_perf_logger_concurrent) {
             // Log each op separately
             for (int i = 1; i < ctx->query_idx; i++) {
@@ -19342,11 +19483,35 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     // sub-node interval (e.g. the FA K/V contiguize pass) - billed separately so
                     // it is not silently folded into the op that dispatched it
                     ctx->perf_logger->log_timing_named(ctx->query_sub_names[i], dt);
+                    if (trace_this) {
+                        vk_perf_trace.event(trace_tid_gpu, "GPU", ctx->query_sub_names[i], trace_ts(timestamps[i-1]), dt,
+                                            "{\"graph\":" + std::to_string(trace_seq) + "}");
+                    }
                     continue;
                 }
                 auto node = ctx->query_nodes[i];
                 auto name = ctx->query_fusion_names[i];
                 ctx->perf_logger->log_timing(node, name, dt);
+                if (trace_this) {
+                    uint64_t n_flops = 0;
+                    const std::string ev = ctx->perf_logger->get_node_fusion_name(node, name, &n_flops);
+                    std::string args = "{\"op\":\"";
+                    args += ggml_op_name(node->op);
+                    args += "\",\"tensor\":\"";
+                    vk_perf_trace_writer::escape(args, node->name);
+                    args += "\",\"graph\":" + std::to_string(trace_seq);
+                    if (dt > 0) {
+                        char rate[64];
+                        if (n_flops > 0) {
+                            snprintf(rate, sizeof(rate), ",\"gflops\":%.1f", double(n_flops) / double(dt));
+                            args += rate;
+                        }
+                        snprintf(rate, sizeof(rate), ",\"gbps\":%.2f", double(ggml_vk_get_node_bytes(node)) / double(dt));
+                        args += rate;
+                    }
+                    args += "}";
+                    vk_perf_trace.event(trace_tid_gpu, "GPU", ev.c_str(), trace_ts(timestamps[i-1]), dt, args);
+                }
             }
         } else {
             // Log each group of nodes
@@ -19364,10 +19529,59 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     node_idx += ctx->query_fusion_node_count[node_idx];
                 }
                 prev_node_idx = cur_node_idx;
-                ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                const uint64_t dt = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+                ctx->perf_logger->log_timing(nodes, names, dt);
+                if (trace_this) {
+                    uint64_t total_flops = 0;
+                    uint64_t total_bytes = 0;
+                    std::string ev;
+                    std::string ops = "[";
+                    for (size_t n = 0; n < nodes.size(); ++n) {
+                        uint64_t n_flops = 0;
+                        const std::string nm = ctx->perf_logger->get_node_fusion_name(nodes[n], names[n], &n_flops);
+                        total_flops += n_flops;
+                        total_bytes += ggml_vk_get_node_bytes(nodes[n]);
+                        if (n == 0) {
+                            ev = nm;
+                        } else {
+                            ops += ",";
+                        }
+                        ops += "\"";
+                        vk_perf_trace_writer::escape(ops, nm.c_str());
+                        ops += "\"";
+                    }
+                    ops += "]";
+                    if (ev.empty()) {
+                        ev = "sync";
+                    }
+                    if (nodes.size() > 1) {
+                        ev += " (+" + std::to_string(nodes.size() - 1) + " ops)";
+                    }
+                    std::string args = "{\"graph\":" + std::to_string(trace_seq) + ",\"n_ops\":" + std::to_string(nodes.size());
+                    if (dt > 0) {
+                        char rate[64];
+                        if (total_flops > 0) {
+                            snprintf(rate, sizeof(rate), ",\"gflops\":%.1f", double(total_flops) / double(dt));
+                            args += rate;
+                        }
+                        snprintf(rate, sizeof(rate), ",\"gbps\":%.2f", double(total_bytes) / double(dt));
+                        args += rate;
+                    }
+                    args += ",\"ops\":" + ops + "}";
+                    vk_perf_trace.event(trace_tid_gpu, "GPU", ev.c_str(), trace_ts(timestamps[i-1]), dt, args);
+                }
             }
         }
         ctx->perf_logger->print_timings();
+        if (trace_this) {
+            // CPU-side spans: command recording+submits, then the fence wait. The gap between
+            // one graph's wait end and the next graph's record start is host code outside ggml.
+            const std::string gs = "{\"graph\":" + std::to_string(trace_seq) + "}";
+            const uint32_t trace_tid_cpu = trace_tid_gpu + 1;
+            vk_perf_trace.event(trace_tid_cpu, "CPU", "graph_record_submit", trace_t_entry, trace_t_submit - trace_t_entry, gs);
+            vk_perf_trace.event(trace_tid_cpu, "CPU", "graph_wait", trace_t_submit, trace_t_signal - trace_t_submit, gs);
+            vk_perf_trace.flush();
+        }
     }
 
     if (!ctx->device->support_async) {
