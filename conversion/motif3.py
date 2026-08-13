@@ -1,4 +1,3 @@
-@@ -0,0 +1,372 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterable

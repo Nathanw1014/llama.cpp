@@ -1,4 +1,3 @@
-@@ -0,0 +1,907 @@
 #include "models.h"
 
 #include <cmath>
@@ -905,3 +904,4 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
