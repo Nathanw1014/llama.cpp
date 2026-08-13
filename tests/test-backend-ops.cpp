@@ -9907,6 +9907,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
