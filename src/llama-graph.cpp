@@ -3031,6 +3031,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // MLA cache on non SWA subcache. The SWA sub-cache never uses MLA storage. See llama_kv_cache_iswa.
+    // INVARIANT: this must match how llama_kv_cache_iswa sized the two subcaches -- it suppresses MLA
+    // for the SWA one by zeroing n_embd_head_k/v_mla_impl in its hparams_swa copy. Diverging here writes
+    // latent-width K into a cache sized for full GQA, with nothing asserting the mismatch.
     const bool is_mla = hparams.is_mla() && !is_swa;
 
     // optionally store to KV cache

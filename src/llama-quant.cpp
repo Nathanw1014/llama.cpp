@@ -307,12 +307,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
 
-    // do not quantize Motif-3 PolyNorm activation coefficients and
-    // hyper-connection gate tensors
-    quantize &= name.find("ffn_poly")           == std::string::npos;
-    quantize &= name.find("mhc_")               == std::string::npos;
-    quantize &= name.find("attn_lambda.weight") == std::string::npos;
     if (arch == LLM_ARCH_MOTIF3) {
+        // PolyNorm activation coefficients and hyper-connection gates: tiny, and
+        // the graph reads them as f32 scalars
+        quantize &= name.find("ffn_poly")             == std::string::npos;
+        quantize &= name.find("mhc_")                 == std::string::npos;
+        quantize &= name.find("attn_lambda.weight")   == std::string::npos;
         quantize &= name.find("attn_gate.weight")     == std::string::npos; //This is overly strict, relax these later
         quantize &= name.find("attn_q_a.weight")      == std::string::npos;
         quantize &= name.find("attn_q_b.weight")      == std::string::npos;

@@ -283,7 +283,9 @@ void llama_model_motif3::graph::build_mhc_gates(
         ggml_tensor * base = ggml_concat(ctx0, pre_b, post_b, 0);
         base = ggml_concat(ctx0, base, ggml_reshape_1d(ctx0, res_b, hc*hc), 0); // [(2 + hc)*hc]
 
-        m = ggml_dsv4_hc_comb(ctx0, mixes, alpha, base, /*eps =*/ 0.0f, (int32_t) hparams.motif_mhc_iters);
+        // eps floors the Sinkhorn row/column sums, matching the reference
+        // _sinkhorn_knopp_batch() which clamps each divisor to min 1e-8
+        m = ggml_dsv4_hc_comb(ctx0, mixes, alpha, base, /*eps =*/ 1e-8f, (int32_t) hparams.motif_mhc_iters);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, m, il});
     } else {
         ggml_tensor * res_aff = ggml_mul(ctx0, res_lin, alpha_res);
@@ -825,6 +827,14 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
             x = build_mhc_combine(x, cur, h_post, h_res, il);
             cb(x, "mhc_attn_out", il);
 
+            if (il == n_layer - 1 && inp_out_ids) {
+                // gather here so the FFN sublayer runs at n_outputs width
+                // x is contiguous [n_embd, hc, nt], so the lanes fold into the row
+                x = ggml_reshape_2d(ctx0, x, n_embd*hc, x->ne[2]);
+                x = ggml_get_rows(ctx0, x, inp_out_ids);
+                x = ggml_reshape_3d(ctx0, x, n_embd, hc, x->ne[1]);
+            }
+
             build_mhc_gates(x,
                     layer.mhc_ffn_norm,
                     layer.mhc_ffn_pre,  layer.mhc_ffn_pre_b,
@@ -861,6 +871,10 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
             cb(ffn_inp, "ffn_inp", il);
 
+            if (il == n_layer - 1 && inp_out_ids) {
+                ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
+            }
+
             cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
@@ -879,20 +893,17 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     // reduce the mHC lanes
+    // ne[2] rather than n_tokens: the last layer already gathered the output rows
     if (hc > 0) {
         ggml_tensor * acc = nullptr;
         for (int64_t ih = 0; ih < hc; ++ih) {
-            ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, n_tokens, x->nb[2], ih*x->nb[1]);
+            ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, x->ne[2], x->nb[2], ih*x->nb[1]);
             acc = acc ? ggml_add(ctx0, acc, xh) : xh;
         }
         cur = ggml_scale(ctx0, acc, 1.0f / float(hc));
         cb(cur, "mhc_mean", -1);
     } else {
         cur = x;
-    }
-
-    if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
