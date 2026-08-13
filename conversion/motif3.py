@@ -17,8 +17,20 @@ class Motif3Model(TextModel):
 
     model_arch = gguf.MODEL_ARCH.MOTIF3
 
+    @staticmethod
+    def is_motif3(hparams: dict) -> bool:
+        # "MotifForCausalLM" is also the architectures string of the dense Motif-2 line
+        # (Motif-2.6B, Motif-2-12.7B), which has no mHC and no GDLA latent projections.
+        return bool(hparams.get("mhc_enabled")) and "kv_lora_rank" in hparams
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if not self.is_motif3(self.hparams):
+            raise NotImplementedError(
+                "this checkpoint declares MotifForCausalLM but is not Motif-3: "
+                "no mhc_enabled/kv_lora_rank in config.json. The dense Motif-2 line "
+                "(Motif-2.6B, Motif-2-12.7B) is a different architecture and is not supported."
+            )
         # collect alpha_{pre,post,res} scalars into a single [3] tensor per mHC block
         self._mhc_alpha: dict[str, dict[str, Tensor]] = {}
 
