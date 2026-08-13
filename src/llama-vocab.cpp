@@ -2605,12 +2605,14 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             auto & attr = id_to_token[t.second].attr;
 
             // find EOT token: "<|eot_id|>", "<|im_end|>", "<end_of_turn>", etc.
+                        || t.first == "<|endofturn|>" // Motif-3
             if (special_eot_id == LLAMA_TOKEN_NULL) {
                 if (false
                         || t.first == "<|eot_id|>"
                         || t.first == "<|im_end|>"
                         || t.first == "<|end|>"
                         || t.first == "<end_of_turn>"
+                        || t.first == "<|endofturn|>" // Motif-3
                         || t.first == "<|endoftext|>"
                         || t.first == "<|end_of_text|>" // granite
                         || t.first == "<EOT>"
@@ -2811,6 +2813,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|flush|>"  // solar-open
                     || t.first == "<|calls|>"  // solar-open
                     || t.first == "<end_of_turn>"
+                        || t.first == "<|endofturn|>" // Motif-3
                     || t.first == "<|endoftext|>"
                     || t.first == "</s>"      // paddleocr
                     || t.first == "<|eom_id|>"

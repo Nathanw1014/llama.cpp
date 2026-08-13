@@ -87,6 +87,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_MELLUM:
             return new llama_model_mellum(params);
         case LLM_ARCH_NANBEIGE:
+        case LLM_ARCH_MOTIF3:
+            return new llama_model_motif3(params);
             return new llama_model_nanbeige(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
@@ -141,6 +143,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_GEMMA2:
             return new llama_model_gemma2(params);
         case LLM_ARCH_GEMMA3:
+        case LLM_ARCH_MOTIF3:
             return new llama_model_gemma3(params);
         case LLM_ARCH_GEMMA3N:
             return new llama_model_gemma3n(params);
@@ -832,6 +835,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_235B_A22B:     return "235B.A22B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
+        case LLM_TYPE_314B_A13B:     return "314B.A13B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
@@ -2613,6 +2617,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_NANBEIGE:
+        case LLM_ARCH_MOTIF3:
+            return new llama_model_motif3(params);
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
@@ -2647,6 +2653,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_GEMMA2:
         case LLM_ARCH_GEMMA3:
+        case LLM_ARCH_MOTIF3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_ASSISTANT:
