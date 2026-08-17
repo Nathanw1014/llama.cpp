@@ -7179,12 +7179,15 @@ struct test_flash_attn_ext_top_k : public test_case {
     const int64_t n_kv_raw; // dense prefix always attended
     const int64_t n_top_k;  // selected keys per query token
     const bool    sinks;
+    const int64_t ns;       // sequences (ne3); >1 exercises the split-K stream stride
+    const int64_t ov;       // % of each token's picks shared with its neighbours (dedup-union realism)
+    const ggml_type type_K; // K/V cache type; V is the same tensor, so one type covers both
 
     static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
     static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
 
     std::string vars() override {
-        return VARS_TO_STR5(kv, nb, n_kv_raw, n_top_k, sinks);
+        return VARS_TO_STR8(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K);
     }
 
     double max_nmse_err() override {
@@ -7195,27 +7198,28 @@ struct test_flash_attn_ext_top_k : public test_case {
         GGML_UNUSED(t);
         // only the active keys contribute compute on a sparse backend; count those so
         // perf mode reports the useful-work rate
-        return 2 * nh * nb * (hs + hs) * (n_kv_raw + n_top_k);
+        return 2 * nh * nb * ns * (hs + hs) * (n_kv_raw + n_top_k);
     }
 
-    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks) {}
+    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0,
+                              ggml_type type_K = GGML_TYPE_F16)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, ns);
         ggml_set_name(k, "k");
 
         // V4 CSA attends over the K latent itself: V is the same cache tensor
-        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, 1, k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, ns, k->nb[1], k->nb[2], k->nb[3], 0);
         ggml_set_name(v, "v");
 
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
         ggml_set_name(m, "m");
 
-        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, 1);
+        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, ns);
         ggml_set_name(t, "top_k");
 
         ggml_tensor * s = nullptr;
@@ -7250,23 +7254,32 @@ struct test_flash_attn_ext_top_k : public test_case {
         // build a consistent (top_k, mask) pair: a deterministic per-token selection,
         // strided so adjacent tokens select overlapping-but-different keys, with one
         // deliberately invalid index (-1) whose mask slot stays -inf
-        std::vector<int32_t> top(n_top_k * nb);
-        std::vector<ggml_fp16_t> mask(kv * nb);
+        std::vector<int32_t> top(n_top_k * nb * ns);
+        std::vector<ggml_fp16_t> mask(kv * nb * ns);
         const ggml_fp16_t minus_inf = ggml_fp32_to_fp16(-INFINITY);
         const ggml_fp16_t zero      = ggml_fp32_to_fp16(0.0f);
 
-        for (int64_t b = 0; b < nb; ++b) {
-            for (int64_t i = 0; i < kv; ++i) {
-                mask[b * kv + i] = i < n_kv_raw ? zero : minus_inf;
-            }
-            for (int64_t j = 0; j < n_top_k; ++j) {
-                int32_t idx = (int32_t) ((j * range) / n_top_k + b) % (int32_t) range;
-                if (j == n_top_k - 1 && b == 0) {
-                    idx = -1; // exercise the ignore-invalid-index path
-                } else {
-                    mask[b * kv + n_kv_raw + idx] = zero;
+        for (int64_t s = 0; s < ns; ++s) {
+            for (int64_t b = 0; b < nb; ++b) {
+                const int64_t mrow = (s * nb + b) * kv;
+                const int64_t trow = (s * nb + b) * n_top_k;
+                for (int64_t i = 0; i < kv; ++i) {
+                    mask[mrow + i] = i < n_kv_raw ? zero : minus_inf;
                 }
-                top[b * n_top_k + j] = idx;
+                for (int64_t j = 0; j < n_top_k; ++j) {
+                    // offset the selection by the stream too, so a dropped stream stride
+                    // reads another sequence's keys and shows up as a mismatch
+                    const bool shared = (int64_t) j * 100 < n_top_k * ov;
+                    int32_t idx = shared
+                        ? (int32_t) ((j * range) / n_top_k + s * 7) % (int32_t) range
+                        : (int32_t) ((j * range) / n_top_k + b + s * 7) % (int32_t) range;
+                    if (j == n_top_k - 1 && b == 0 && s == 0) {
+                        idx = -1; // exercise the ignore-invalid-index path
+                    } else {
+                        mask[mrow + n_kv_raw + idx] = zero;
+                    }
+                    top[trow + j] = idx;
+                }
             }
         }
 
@@ -10191,12 +10204,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
+    // ns > 1: the split-K partial-output path indexes O and L/M by stream, so these cover
+    // the stream stride in both regions (single tile and multi-tile).
+    // small-batch decode (speculative drafts): each token gets its own gathered top-k block,
+    // so cross-token rows must be masked out or the softmax double counts. kv must be large
+    // enough that compaction is worth it (the gather gates on kv >= 2*kv_c).
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   2, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   3, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   8, 1024, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 16, 2304, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(65536, 63, 2304, 512, false));
+    // overlapping selections at the shapes where the compaction gate is tightest: with a
+    // deduplicated union these are admitted on the estimated union size rather than the
+    // worst case, so they cover the estimator's gate as well as the union itself.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
+    // quantised K/V: the gather relocates rows verbatim, so it should serve any type whose row
+    // is a whole number of 4-byte words. These are the shapes a DSv4 decode with -ctk q8_0 hits,
+    // which took the dense fallback entirely before the gather learned to address rows as bytes.
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 1,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   1, 1024, 512, false, 1,  0, tk));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 300, 256, 512, false, 3));
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+    for (int kv : { 127, 128, 129 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
     }
 
     return test_cases;
@@ -10626,6 +10674,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // DSV4 PP2048 indexer rows after filling source contexts from 8k through 512k.
+    // The zero-depth kv=512 shape is covered above.
+    for (int kv : { 2560, 4608, 8704, 16896, 33280, 66048, 131584 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 2048, 1, 1, GGML_TYPE_F16));
+    }
 
     // sparse top-k FA at V4 decode/prefill shapes — the A/B instrument for the
     // gather-to-compact work (n_active = n_kv_raw + n_top_k stays fixed as kv grows).
@@ -10635,6 +10688,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 8192, 32768, 65536 }) {
         for (int nb : { 1, 8, 64, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
+        }
+    }
+    // PP2048 compressed-K rows for source context depths 32k through 512k.
+    for (int kv : { 11008, 19200, 35584, 68352, 133888 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 2048, 2304, 512, false));
+    }
+    // small-batch decode at depth: the speculative-draft regime (batch 2-8), where the old
+    // path fell through to dense attention over the whole compressed KV.
+    for (int kv : { 11008, 35584, 133888 }) {
+        for (int nb : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false));
+        }
+    }
+    // Same shapes with realistic adjacent-token overlap. Measured on DeepSeek-V4-Flash the
+    // real overlap is 60% over 4 adjacent tokens and 76% over 8; the default generator is
+    // near 0%, which would make a deduplicated union look worthless by construction.
+    // kv=11008 (~32k source) and nb=16 are where the compaction gate is tightest: the
+    // worst-case compact set 2304 + nb*512 crosses kv/2 at nb=6, so those cells measure
+    // whether the gate can be opened by the union rather than by the worst case.
+    for (int kv : { 11008, 35584, 133888 }) {
+        for (int nb : { 2, 4, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false, 1, 60));
+        }
+    }
+    // ov is a per-token share, not the union/selected ratio the model was measured by: at nb
+    // tokens it gives a union of (ov + (1-ov)*nb)/nb of the selections, so ov=60 is 0.475 at
+    // nb=8 where the model measured 0.243. ov=86 is the setting that reproduces the model, and
+    // at kv=11008 it is the difference between a union that fits under the gate and one that
+    // does not.
+    for (int nb : { 8, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 86));
+    }
+    // q8_0 K/V at the same shapes: DSv4 with -ctk q8_0 took the dense fallback before the
+    // gather became type-agnostic, so this is the cell that says whether it now pays there.
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int nb : { 2, 4, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 60, tk));
         }
     }
 
