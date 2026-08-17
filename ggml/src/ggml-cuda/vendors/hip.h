@@ -62,6 +62,8 @@
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDisableTiming hipEventDisableTiming
+#define cudaEventDefault hipEventDefault
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t

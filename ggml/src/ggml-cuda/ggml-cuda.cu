@@ -73,6 +73,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -2532,6 +2533,192 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// GGML_CUDA_PERF_TRACE=<file>: one Chrome trace event per executed graph node, viewable in
+// ui.perfetto.dev. Event names, args and thread ids match the Vulkan backend's
+// GGML_VK_PERF_TRACE so tools/vktrace.py reads and diffs traces from either backend.
+// Timing uses events on the compute stream, so kernels are NOT serialized and the node
+// durations sum to wall clock - unlike Vulkan per-op mode, which barriers between ops.
+// CUDA graphs are forced off while tracing: a replayed graph skips the event records.
+// GGML_CUDA_PERF_TRACE_SKIP=N / _COUNT=N bound the capture window in graph evaluations.
+static bool     cuda_perf_trace_enabled = false;
+static uint32_t cuda_perf_trace_skip    = 0;
+static uint32_t cuda_perf_trace_count   = UINT32_MAX;
+
+struct cuda_perf_trace_writer {
+    FILE *            f {};
+    std::mutex        mutex;
+    int64_t           t0_ns {};
+    uint32_t          graph_seq {};
+    std::vector<bool> tid_named;
+
+    static int64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // mutex must be held
+    void open_once() {
+        if (f) {
+            return;
+        }
+        const char * path = getenv("GGML_CUDA_PERF_TRACE");
+        f = fopen(path, "w");
+        if (!f) {
+            GGML_LOG_ERROR("%s: failed to open GGML_CUDA_PERF_TRACE file %s\n", __func__, path);
+            cuda_perf_trace_enabled = false;
+            return;
+        }
+        // a trace event array may stay unterminated, so the file is valid even after a crash
+        fputs("[\n", f);
+        t0_ns = now_ns();
+    }
+
+    static void escape(std::string & out, const char * s) {
+        for (; *s; s++) {
+            const char c = *s;
+            if (c == '"' || c == '\\') {
+                out += '\\';
+                out += c;
+            } else if ((unsigned char) c < 0x20) {
+                out += ' ';
+            } else {
+                out += c;
+            }
+        }
+    }
+
+    // returns true when this graph is inside the SKIP/COUNT capture window
+    bool begin_graph(int64_t * t_entry, uint32_t * seq) {
+        std::lock_guard<std::mutex> guard(mutex);
+        const uint32_t s = graph_seq++;
+        if (s < cuda_perf_trace_skip || s - cuda_perf_trace_skip >= cuda_perf_trace_count) {
+            return false;
+        }
+        open_once();
+        if (!f) {
+            return false;
+        }
+        *t_entry = now_ns();
+        *seq     = s;
+        return true;
+    }
+
+    void event(uint32_t tid, const char * tid_name, const char * name, int64_t ts_ns, int64_t dur_ns, const std::string & args_json) {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!f) {
+            return;
+        }
+        if (tid >= tid_named.size()) {
+            tid_named.resize(tid + 1, false);
+        }
+        if (!tid_named[tid]) {
+            tid_named[tid] = true;
+            fprintf(f, "{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":0,\"tid\":%u,\"args\":{\"name\":\"%s\"}},\n", tid, tid_name);
+        }
+        std::string esc;
+        escape(esc, name);
+        fprintf(f, "{\"ph\":\"X\",\"name\":\"%s\",\"pid\":0,\"tid\":%u,\"ts\":%.3f,\"dur\":%.3f%s%s},\n",
+                esc.c_str(), tid, (ts_ns - t0_ns) / 1e3, dur_ns / 1e3,
+                args_json.empty() ? "" : ",\"args\":", args_json.c_str());
+    }
+
+    ~cuda_perf_trace_writer() {
+        if (f) {
+            fclose(f);
+        }
+    }
+};
+static cuda_perf_trace_writer cuda_perf_trace;
+
+static const bool cuda_perf_trace_init = [] {
+    cuda_perf_trace_enabled = getenv("GGML_CUDA_PERF_TRACE") != nullptr;
+    const char * skip  = getenv("GGML_CUDA_PERF_TRACE_SKIP");
+    const char * count = getenv("GGML_CUDA_PERF_TRACE_COUNT");
+    if (skip) {
+        cuda_perf_trace_skip = (uint32_t) std::stoul(skip);
+    }
+    if (count) {
+        cuda_perf_trace_count = (uint32_t) std::stoul(count);
+    }
+    return true;
+}();
+
+static uint64_t ggml_cuda_perf_node_flops(const ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const uint64_t m     = node->ne[0];
+        const uint64_t n     = node->ne[1];
+        const uint64_t k     = node->src[1]->ne[0];
+        const uint64_t batch = node->ne[2] * node->ne[3];
+        return m * n * (k + (k - 1)) * batch;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * k = node->src[1];
+        const ggml_tensor * v = node->src[2];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+    }
+    return 0;
+}
+
+static uint64_t ggml_cuda_perf_node_bytes(const ggml_tensor * node) {
+    uint64_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i]) {
+            bytes += ggml_nbytes(node->src[i]);
+        }
+    }
+    return bytes;
+}
+
+static std::string ggml_cuda_perf_node_ne(const ggml_tensor * t) {
+    if (!t) {
+        return "(0,0,0,0)";
+    }
+    return "(" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+           std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + ")";
+}
+
+// Mirrors vk_perf_logger::get_node_fusion_name so bucket names are comparable across backends.
+// The _VEC suffix uses the Vulkan classifier threshold, not this backend's dispatch decision.
+static std::string ggml_cuda_perf_node_name(const ggml_tensor * node, uint64_t * n_flops) {
+    static constexpr int64_t mul_mat_vec_max_cols = 8;
+    *n_flops = ggml_cuda_perf_node_flops(node);
+    if (node->op == GGML_OP_UNARY) {
+        return ggml_unary_op_name(ggml_get_unary_op(node));
+    }
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const int64_t m     = node->ne[0];
+        const int64_t n     = node->ne[1];
+        const int64_t k     = node->src[1]->ne[0];
+        const int64_t batch = node->ne[2] * node->ne[3];
+        std::string   name  = ggml_op_name(node->op);
+        if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+            (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
+            name += "_VEC";
+        }
+        name += " ";
+        name += ggml_type_name(node->src[0]->type);
+        name += " m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k);
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            name += " n_expert=" + std::to_string(node->src[0]->ne[2]);
+        }
+        if (batch > 1) {
+            name += " batch=" + std::to_string(batch);
+        }
+        return name;
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        return std::string(ggml_op_name(node->op)) + ggml_cuda_perf_node_ne(node);
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return std::string(ggml_op_name(node->op)) +
+               " dst" + ggml_cuda_perf_node_ne(node) + ",  q" + ggml_cuda_perf_node_ne(node->src[0]) +
+               ",  k" + ggml_cuda_perf_node_ne(node->src[1]) + ",  v" + ggml_cuda_perf_node_ne(node->src[2]) +
+               ",  m" + ggml_cuda_perf_node_ne(node->src[3]);
+    }
+    return ggml_op_name(node->op);
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -4033,6 +4220,43 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+    // GGML_CUDA_PERF_TRACE state: one stream event per executed node or fusion group
+    bool     trace_this    = false;
+    uint32_t trace_seq     = 0;
+    int64_t  trace_t_entry = 0;
+    static std::vector<cudaEvent_t>  trace_events;
+    std::vector<const ggml_tensor *> trace_nodes;
+    std::vector<int>                 trace_n_ops;
+    if (cuda_perf_trace_enabled) {
+        trace_this = cuda_perf_trace.begin_graph(&trace_t_entry, &trace_seq);
+    }
+    const auto trace_mark = [&](const ggml_tensor * node, int n_ops) {
+        if (!trace_this) {
+            return;
+        }
+        const size_t idx = trace_nodes.size() + 1;
+        while (trace_events.size() <= idx) {
+            cudaEvent_t ev;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
+            trace_events.push_back(ev);
+        }
+        CUDA_CHECK(cudaEventRecord(trace_events[idx], cuda_ctx->stream()));
+        trace_nodes.push_back(node);
+        trace_n_ops.push_back(n_ops);
+    };
+    if (trace_this) {
+        if (stream_ctx.concurrent_events.size() > 0) {
+            GGML_LOG_WARN("%s: GGML_CUDA_PERF_TRACE with multi-stream concurrent events, "
+                          "node times may misattribute\n", __func__);
+        }
+        if (trace_events.empty()) {
+            cudaEvent_t ev;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
+            trace_events.push_back(ev);
+        }
+        CUDA_CHECK(cudaEventRecord(trace_events[0], cuda_ctx->stream()));
+    }
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -4178,6 +4402,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    // fused group already launched inside ggml_cuda_try_fuse, billed to its first node
+                    trace_mark(node, nodes_to_skip + 1);
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4203,6 +4429,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                trace_mark(node, 1);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4249,6 +4477,62 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    if (trace_this && !trace_nodes.empty()) {
+        const size_t n = trace_nodes.size();
+        const int64_t t_launch_done = cuda_perf_trace_writer::now_ns();
+        // Sync the STREAM, not the last event: the event pool is reused across graphs, and
+        // synchronizing a just-re-recorded event can return on its previous completion state,
+        // which reads back the prior graph's elapsed times.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        // sample the CPU clock at the last event to place GPU timestamps on the CPU timeline
+        const int64_t t_signal = cuda_perf_trace_writer::now_ns();
+
+        // offsets from the first event, so rounding does not accumulate across the graph
+        std::vector<double> off_ms(n + 1, 0.0);
+        for (size_t k = 1; k <= n; k++) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, trace_events[0], trace_events[k]));
+            off_ms[k] = ms;
+        }
+        const int64_t t_gpu0 = t_signal - (int64_t) (off_ms[n] * 1e6);
+
+        const uint32_t tid_gpu = (uint32_t) (2 * cuda_ctx->device);
+        const uint32_t tid_cpu = tid_gpu + 1;
+        for (size_t k = 1; k <= n; k++) {
+            const ggml_tensor * node = trace_nodes[k - 1];
+            const int64_t dur_ns = (int64_t) ((off_ms[k] - off_ms[k - 1]) * 1e6);
+            const int64_t ts_ns  = t_gpu0 + (int64_t) (off_ms[k - 1] * 1e6);
+            uint64_t n_flops = 0;
+            const std::string ev = ggml_cuda_perf_node_name(node, &n_flops);
+            std::string args = "{\"op\":\"";
+            args += ggml_op_name(node->op);
+            args += "\",\"tensor\":\"";
+            cuda_perf_trace_writer::escape(args, node->name);
+            args += "\",\"graph\":" + std::to_string(trace_seq);
+            args += ",\"n_ops\":" + std::to_string(trace_n_ops[k - 1]);
+            if (dur_ns > 0) {
+                char rate[64];
+                if (n_flops > 0) {
+                    snprintf(rate, sizeof(rate), ",\"gflops\":%.1f", double(n_flops) / double(dur_ns));
+                    args += rate;
+                }
+                snprintf(rate, sizeof(rate), ",\"gbps\":%.2f", double(ggml_cuda_perf_node_bytes(node)) / double(dur_ns));
+                args += rate;
+            }
+            args += "}";
+            cuda_perf_trace.event(tid_gpu, "GPU", ev.c_str(), ts_ns, dur_ns, args);
+        }
+
+        // CPU spans: kernel launches, then the wait. n_nodes vs n_exec gives the op count that
+        // the graph carries against the count this backend actually dispatches.
+        const std::string gargs = "{\"graph\":" + std::to_string(trace_seq) +
+                                  ",\"n_nodes\":" + std::to_string(cgraph->n_nodes) +
+                                  ",\"n_exec\":" + std::to_string(n) + "}";
+        cuda_perf_trace.event(tid_cpu, "CPU", "graph_record_submit", trace_t_entry, t_launch_done - trace_t_entry, gargs);
+        cuda_perf_trace.event(tid_cpu, "CPU", "graph_wait", t_launch_done, t_signal - t_launch_done,
+                              "{\"graph\":" + std::to_string(trace_seq) + "}");
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4283,7 +4567,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    // GGML_CUDA_PERF_TRACE needs every evaluation to run the node loop: a replayed graph skips
+    // it, so only the capture passes would ever be traced.
+    if (graph->is_enabled() && !cuda_perf_trace_enabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
