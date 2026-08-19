@@ -2978,6 +2978,14 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
 
+int32_t llama_model_dflash2_top_k(const struct llama_model * model) {
+    // must match build_arch_graph: the DSV4 decode graph does not build the selector lattice
+    if (model->dflash_selector_hidden == nullptr || model->hparams.dsv4_hc_mult > 0) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_selector_top_k;
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;

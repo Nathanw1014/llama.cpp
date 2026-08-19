@@ -125,6 +125,9 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
+// returns the DFlash2 selector top-k, or 0 when the model's decode graph does not build the selector lattice
+LLAMA_API int32_t llama_model_dflash2_top_k(const struct llama_model * model);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

@@ -967,9 +967,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
-            if (llama_model_meta_val_str(model_dft, "dflash.selector_top_k", buf, sizeof(buf)) >= 0) {
-                selector_top_k = std::atoi(buf);
-                is_dflash2 = selector_top_k > 0;
+            selector_top_k = llama_model_dflash2_top_k(model_dft);
+            is_dflash2 = selector_top_k > 0;
+            if (!is_dflash2 && llama_model_meta_val_str(model_dft, "dflash.selector_top_k", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0) {
+                LOG_WRN("%s: draft model has DFlash2 selector metadata but its decode graph does not build the selector lattice, using the DFlash draft path\n", __func__);
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
