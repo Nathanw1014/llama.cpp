@@ -198,6 +198,8 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
           if (tmpl.src.find("Bailing V3 chat template") != std::string::npos) {
               analysis.tools.arguments.value_suffix = trim_whitespace(analysis.tools.arguments.value_suffix);
               analysis.tools.arguments.tolerate_intertag_whitespace = true;
+              // Ling 3.0 can start a tool call without closing the think block (ggml-org/llama.cpp#27462)
+              analysis.reasoning.extra_ends.push_back("<tool_call>");
               LOG_DBG(ANSI_ORANGE "[Patch: Bailing V3]\n" ANSI_RESET);
           }
       },

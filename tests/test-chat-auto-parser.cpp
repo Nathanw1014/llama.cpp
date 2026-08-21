@@ -2092,6 +2092,12 @@ static void test_bailing_v3_tool_format(testing & t) {
         {{- '<role>HUMAN</role>' + message.content + '<|role_end|>' }}
     {%- elif message.role == "assistant" %}
         {{- '<role>ASSISTANT</role>' }}
+        {%- if message.reasoning_content %}
+            {{- '<think>' + message.reasoning_content + '</think>' }}
+        {%- endif %}
+        {%- if message.content %}
+            {{- message.content }}
+        {%- endif %}
         {%- if message.tool_calls %}
             {%- for tool_call in message.tool_calls %}
                 {%- set tc = tool_call.function %}
@@ -2143,6 +2149,35 @@ static void test_bailing_v3_tool_format(testing & t) {
         "</tool_call>";
     common_peg_parse_context ctx(output, COMMON_PEG_PARSE_FLAG_LENIENT);
     t.assert_true("multi-argument tool call", parser.parse(ctx).success());
+
+    // Ling 3.0 can start a tool call without closing the think block (ggml-org/llama.cpp#27462)
+    t.assert_equal("reasoning end", "</think>", analysis.reasoning.end);
+    t.assert_equal("extra reasoning end count", 1u, analysis.reasoning.extra_ends.size());
+
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    auto think_parser = analysis.build_parser(inputs, "");
+
+    const std::string tool_call_output =
+        "<tool_call>test_function_name\n"
+        "<arg_key>param1</arg_key>\n"
+        "<arg_value>value1</arg_value>\n"
+        "</tool_call>";
+
+    for (const std::string think_prefix : { "<think>plan the call", "<think>plan the call</think>" }) {
+        common_peg_parse_context think_ctx(think_prefix + tool_call_output, COMMON_PEG_PARSE_FLAG_LENIENT);
+        auto think_result = think_parser.parse(think_ctx);
+        if (!t.assert_true("tool call after reasoning", think_result.success())) {
+            continue;
+        }
+        common_chat_msg msg;
+        common_chat_peg_mapper mapper(msg);
+        mapper.from_ast(think_ctx.ast, think_result);
+        t.assert_equal("reasoning content", "plan the call", msg.reasoning_content);
+        t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
+        if (!msg.tool_calls.empty()) {
+            t.assert_equal("tool name", "test_function_name", msg.tool_calls[0].name);
+        }
+    }
 }
 
 // Test that reproduces the Seed-OSS template issue with embedded quotes

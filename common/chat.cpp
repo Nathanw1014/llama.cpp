@@ -3729,6 +3729,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             auto end_tag = trim_whitespace(autoparser.reasoning.end);
             if (!end_tag.empty()) {
                 auto_params.thinking_end_tags = {std::move(end_tag)};
+                auto_params.thinking_end_tags.insert(auto_params.thinking_end_tags.end(),
+                    autoparser.reasoning.extra_ends.begin(), autoparser.reasoning.extra_ends.end());
             }
         }
         common_peg_arena arena;
