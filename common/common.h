@@ -986,6 +986,8 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // draft caches keep one row per token, so with mtmd (M-RoPE) their boundary is the token count, not the target position - pass it as p0_dft
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p0_dft) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

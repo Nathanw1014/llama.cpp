@@ -1090,6 +1090,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // Multimodal targets use M-RoPE: batch_in.pos holds position tuples and image spans repeat the
+        // temporal component, which the 1-D draft cache rejects. The draft keeps one row per target token,
+        // so number injected rows densely from the draft cache tail instead of copying target positions.
+        // For text-only batches the target positions are already dense and this is a no-op.
+        std::vector<llama_pos> pos_next(n_seq, -1);
+
         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
         for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
             const int32_t n_chunk = std::min(n_ubatch, n_tokens - offset);
@@ -1133,7 +1139,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(batch_in.n_seq_id[j] == 1);
                 const llama_seq_id seq_id = batch_in.seq_id[j][0];
                 GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
-                batch_inject.pos[i]       = batch_in.pos[j];
+                if (pos_next[seq_id] < 0) {
+                    pos_next[seq_id] = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) + 1;
+                }
+                batch_inject.pos[i]       = pos_next[seq_id]++;
                 batch_inject.n_seq_id[i]  = 1;
                 batch_inject.seq_id[i][0] = seq_id;
                 batch_inject.logits[i]    = false;
