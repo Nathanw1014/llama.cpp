@@ -4217,6 +4217,42 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 // block_a_cache / block_b_cache layouts (see mul_mmq_shmem_types.glsl) rather
 // than the float load buffers checked by ggml_vk_matmul_shmem_support.
 // Sizes follow std430 rules. Returns false for types without a q8_1 pipeline.
+// GGML_VK_MMQ_INT_K / GGML_VK_MMQ_INT / GGML_VK_MMQ_CM =
+//   "L:wg,bm,bn,bk,wm,wn,wniter,tm,tn,tk,warp;M:...;S:..."
+// Probe override for the dense mmq tile families (integer-dot K-quants, integer-dot
+// non-K quants, coopmat quant dequant path respectively). Invariants enforced by
+// the shaders: NUM_WARPS == (BM/WM)*(BN/WN), (WM*WN) == WARP*TM*TN*WMITER*WNITER
+// with WNITER integral, WM >= TM*WMITER, WN >= TN*WNITER. wg_denoms are kept in
+// sync with BM/BN so the tile-choice and split-k heuristics see the real tile.
+static void ggml_vk_apply_mmq_tile_env(const char * env, std::vector<uint32_t> & l_w, std::vector<uint32_t> & m_w, std::vector<uint32_t> & s_w,
+                                 std::array<uint32_t, 3> & l_d, std::array<uint32_t, 3> & m_d, std::array<uint32_t, 3> & s_d, const char * tag) {
+    for (const char * cls : {"L", "M", "S"}) {
+        char pat[4] = { ',', cls[0], ':', 0 };
+        const char * p = strstr(env, pat + 1);
+        if (!p && env[0] == cls[0] && env[1] == ':') p = env;
+        if (!p || p[1] != ':') continue;
+        std::vector<uint32_t> t;
+        const char * q = p + 2;
+        while (q && *q && *q != ';') {
+            char * end = nullptr;
+            const unsigned long v = strtoul(q, &end, 10);
+            if (end == q) break;
+            t.push_back((uint32_t)v);
+            q = (*end == ',') ? end + 1 : nullptr;
+        }
+        if (t.size() != 11) {
+            fprintf(stderr, "ggml_vulkan: %s: ignoring %c group (%zu values, need 11)\n", tag, cls[0], t.size());
+            continue;
+        }
+        std::vector<uint32_t> & w = cls[0] == 'L' ? l_w : cls[0] == 'M' ? m_w : s_w;
+        std::array<uint32_t, 3> & d = cls[0] == 'L' ? l_d : cls[0] == 'M' ? m_d : s_d;
+        w = t;
+        d = { t[1], t[2], 1 };
+        fprintf(stderr, "ggml_vulkan: %s %c tile override wg=%u bm=%u bn=%u wm=%u wn=%u wniter=%u tm=%u tn=%u warp=%u\n",
+                tag, cls[0], t[0], t[1], t[2], t[4], t[5], t[6], t[7], t[8], t[10]);
+    }
+}
+
 static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
@@ -4542,6 +4578,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         s_warptile_mmqid_int_k = { mul_mat_subgroup_size_32, 32,  32, 32, s_warptile_wm,                32, 1, 2, 1, 1, mul_mat_subgroup_size_16 };
 
         // chip specific tuning
+        bool gfx1151_mmq_k_tile = false;
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
@@ -4550,6 +4587,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
+
+            // gfx1151-class (RDNA3 iGPU, e.g. Radeon 8060S): double the K-quant int-mmq
+            // large tile's N span and thread count. Same per-thread register tiling (TM/TN/
+            // WMITER unchanged), so only the tile geometry moves: 128x256 @ 512 threads.
+            // Rationale: at prefill batch sizes (n=512..2048 per ubatch) the 128x128 tile
+            // underfills the 40 CUs on the M dimension's tail waves and re-reads the A
+            // weights once per 128-token slab; BN=256 halves the A re-reads per token.
+            // Measured on Qwen3.8-27B UD-Q5_K_XL-v2 (pp4096, -ub 2048, bundled RADV):
+            // ~2x prompt processing, tg128 unchanged (decode uses the vec/small tiles),
+            // greedy outputs byte-identical. Tile-area probes beyond this (BM=256, BN=384,
+            // 1024 threads, TM/TN/WMITER reshapings) were all neutral; the coopmat quant
+            // family (iq4_xs path) measurably dislikes the doubled tile and stays stock.
+            if (const char * diag = getenv("GGML_VK_TILE_DIAG")) {
+                (void)diag;
+                fprintf(stderr, "ggml_vulkan: tile diag arch=%d rdna3=%d deviceType=%d integrated=%d subgroup=%u\n",
+                        (int)device->architecture, (int)vk_device_architecture::AMD_RDNA3,
+                        (int)device->properties.deviceType, (int)vk::PhysicalDeviceType::eIntegratedGpu, device->subgroup_size);
+            }
+            if (device->architecture == AMD_RDNA3 &&
+                device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
+                l_warptile_mmq_int_k = { 512, 128, 256, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
+                gfx1151_mmq_k_tile = true;
+            }
 
             // EXPERIMENT (GGML_VK_MMID_WG256=1): the dense large tile above runs 256 threads on a
             // 128x128 tile, but the mul_mat_id variants still run 128. Give MoE the same thread
@@ -4576,6 +4636,38 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+
+        // The gfx1151 K-quant int-mmq tile is 128x256: keep the dispatch denoms in
+        // sync (set after the defaults above so they are not clobbered).
+        if (gfx1151_mmq_k_tile) {
+            l_mmq_wg_denoms = { 128, 256, 1 };
+        }
+
+        // Probe override for the dense mmq tiles via env (see ggml_vk_apply_mmq_tile_env).
+        auto apply_tile_env = ggml_vk_apply_mmq_tile_env;
+        if (const char * mmq_k_env = getenv("GGML_VK_MMQ_INT_K")) {
+            fprintf(stderr, "ggml_vulkan: MMQ_INT_K defaults K l=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u m=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u s=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u | nonK l=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u m=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u s=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                    l_warptile_mmq_int_k[0],l_warptile_mmq_int_k[1],l_warptile_mmq_int_k[2],l_warptile_mmq_int_k[3],l_warptile_mmq_int_k[4],l_warptile_mmq_int_k[5],l_warptile_mmq_int_k[6],l_warptile_mmq_int_k[7],l_warptile_mmq_int_k[8],l_warptile_mmq_int_k[9],l_warptile_mmq_int_k[10],
+                    m_warptile_mmq_int_k[0],m_warptile_mmq_int_k[1],m_warptile_mmq_int_k[2],m_warptile_mmq_int_k[3],m_warptile_mmq_int_k[4],m_warptile_mmq_int_k[5],m_warptile_mmq_int_k[6],m_warptile_mmq_int_k[7],m_warptile_mmq_int_k[8],m_warptile_mmq_int_k[9],m_warptile_mmq_int_k[10],
+                    s_warptile_mmq_int_k[0],s_warptile_mmq_int_k[1],s_warptile_mmq_int_k[2],s_warptile_mmq_int_k[3],s_warptile_mmq_int_k[4],s_warptile_mmq_int_k[5],s_warptile_mmq_int_k[6],s_warptile_mmq_int_k[7],s_warptile_mmq_int_k[8],s_warptile_mmq_int_k[9],s_warptile_mmq_int_k[10],
+                    l_warptile_mmq_int[0],l_warptile_mmq_int[1],l_warptile_mmq_int[2],l_warptile_mmq_int[3],l_warptile_mmq_int[4],l_warptile_mmq_int[5],l_warptile_mmq_int[6],l_warptile_mmq_int[7],l_warptile_mmq_int[8],l_warptile_mmq_int[9],l_warptile_mmq_int[10],
+                    m_warptile_mmq_int[0],m_warptile_mmq_int[1],m_warptile_mmq_int[2],m_warptile_mmq_int[3],m_warptile_mmq_int[4],m_warptile_mmq_int[5],m_warptile_mmq_int[6],m_warptile_mmq_int[7],m_warptile_mmq_int[8],m_warptile_mmq_int[9],m_warptile_mmq_int[10],
+                    s_warptile_mmq_int[0],s_warptile_mmq_int[1],s_warptile_mmq_int[2],s_warptile_mmq_int[3],s_warptile_mmq_int[4],s_warptile_mmq_int[5],s_warptile_mmq_int[6],s_warptile_mmq_int[7],s_warptile_mmq_int[8],s_warptile_mmq_int[9],s_warptile_mmq_int[10]);
+            apply_tile_env(mmq_k_env, l_warptile_mmq_int_k, m_warptile_mmq_int_k, s_warptile_mmq_int_k,
+                           l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms, "MMQ_INT_K");
+            // Same probe for the non-K int family (iq4_xs/nl, q4_0, q8_0, mxfp4, ...).
+            // GGML_VK_MMQ_INT unset or "=" mirrors the K override into the non-K tiles.
+            const char * mmq_int_env = getenv("GGML_VK_MMQ_INT");
+            if (!mmq_int_env || mmq_int_env[0] == '=' || mmq_int_env[0] == '\0') {
+                l_warptile_mmq_int = l_warptile_mmq_int_k;
+                m_warptile_mmq_int = m_warptile_mmq_int_k;
+                s_warptile_mmq_int = s_warptile_mmq_int_k;
+                fprintf(stderr, "ggml_vulkan: MMQ_INT non-K tiles mirror the K override\n");
+            } else {
+                apply_tile_env(mmq_int_env, l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
+                               l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms, "MMQ_INT");
+            }
+        }
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -5045,6 +5137,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(m_warptile);
                 wave32_tile(s_warptile);
             }
+        }
+
+        // GGML_VK_MMQ_CM: probe override for the dense coopmat quant tiles
+        // (mul_mm.comp path: iq4_xs/nl, i-quants when no q8_1 variant exists).
+        // Same format and invariants as GGML_VK_MMQ_INT_K, applied after the
+        // wave32 retile so probes see the final tile.
+        if (const char * mmq_cm_env = getenv("GGML_VK_MMQ_CM")) {
+            ggml_vk_apply_mmq_tile_env(mmq_cm_env, l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
+                           l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms, "MMQ_CM");
         }
 
         // WARP -> required subgroup size, or 0 where the device cannot honor one.
