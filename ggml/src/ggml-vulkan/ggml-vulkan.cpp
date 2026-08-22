@@ -4599,12 +4599,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // greedy outputs byte-identical. Tile-area probes beyond this (BM=256, BN=384,
             // 1024 threads, TM/TN/WMITER reshapings) were all neutral; the coopmat quant
             // family (iq4_xs path) measurably dislikes the doubled tile and stays stock.
-            if (const char * diag = getenv("GGML_VK_TILE_DIAG")) {
-                (void)diag;
-                fprintf(stderr, "ggml_vulkan: tile diag arch=%d rdna3=%d deviceType=%d integrated=%d subgroup=%u\n",
-                        (int)device->architecture, (int)vk_device_architecture::AMD_RDNA3,
-                        (int)device->properties.deviceType, (int)vk::PhysicalDeviceType::eIntegratedGpu, device->subgroup_size);
-            }
             if (device->architecture == AMD_RDNA3 &&
                 device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
                 l_warptile_mmq_int_k = { 512, 128, 256, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
