@@ -1615,9 +1615,10 @@ static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, lla
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
 
-void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
-    this->ctx_tgt = ctx_tgt;
-    this->ctx_dft = ctx_dft;
+void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft, bool dft_dense_rows) {
+    this->ctx_tgt         = ctx_tgt;
+    this->ctx_dft         = ctx_dft;
+    this->dft_dense_rows  = dft_dense_rows;
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -1627,7 +1628,10 @@ void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) cons
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p0_dft) const {
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0_dft, p1);
+        // dense-row drafts (dflash family) are indexed by token count; drafts that share the
+        // target's M-RoPE position space must be trimmed at the target position, or the draft
+        // trails the target by the draft depth and the batch fails its consecutive-position check
+        common_context_seq_rm(ctx_dft, seq_id, dft_dense_rows ? p0_dft : p0, p1);
     }
 }
 

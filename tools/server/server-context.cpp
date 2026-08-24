@@ -1246,13 +1246,23 @@ private:
             model_dft = nullptr;
         }
 
+        // the dflash family (dflash/dflash2/dspark) injects dense per-token draft rows, so its
+        // cache is indexed by token count; draft-mtp and eagle3 share the target's position space
+        const bool spec_dft_dense_rows = std::any_of(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                [](enum common_speculative_type t) {
+                    return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                           t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                });
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
+            slot.mem.init(ctx_tgt, ctx_dft, spec_dft_dense_rows);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
@@ -2973,8 +2983,9 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                 }
 
-                // the draft cache keeps one row per token; with mtmd its boundary is the token count, not the target pos_max
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, (llama_pos) ckpt.n_tokens, -1)) {
+                // dense-row drafts are bounded by token count; position-sharing drafts by target pos_max
+                const llama_pos p0_dft_ckpt = slot.mem.dft_dense_rows ? (llama_pos) ckpt.n_tokens : ckpt.pos_max + 1;
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, p0_dft_ckpt, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }

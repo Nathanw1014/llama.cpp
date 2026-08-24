@@ -982,11 +982,15 @@ struct common_memory {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
-    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+    // true when the draft cache keeps one row per token (dflash family injects dense rows).
+    // false when the draft shares the target's position space (draft-mtp, eagle3).
+    bool dft_dense_rows = false;
+
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr, bool dft_dense_rows = false);
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
-    // draft caches keep one row per token, so with mtmd (M-RoPE) their boundary is the token count, not the target position - pass it as p0_dft
+    // p0_dft is the token-count boundary; it is used only when the draft cache is dense-row indexed
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p0_dft) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
