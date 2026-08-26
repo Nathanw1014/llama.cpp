@@ -55,6 +55,29 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 return [int(x) for x in t.tolist()]
         raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
 
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        # the PLE table is far too large to quantize in python (whole-array numpy
+        # intermediates); keep it F16 here and let llama-quantize handle it, which
+        # the upstream PR taught to size its work buffer exactly for this tensor
+        if new_name.startswith(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]):
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def _ple_fp8_scale(self) -> float:
+        """Per-tensor scale for an FP8-quantized PLE table (FP8 checkpoints only).
+
+        The FP8 repo stores the shards as F8_E4M3 with ONE scalar
+        `ngram_embedding.weight_scale` at the fused name, which pairs with no
+        `.weight` and so is untouched by the generic dequant. 1.0 for bf16 repos.
+        """
+        if getattr(self, "_ple_scale_cached", None) is None:
+            self._ple_scale_cached = 1.0
+            for name, gen in self.model_tensors.items():
+                if name.endswith("ngram_embedding.weight_scale"):
+                    self._ple_scale_cached = float(gen().to(torch.float32).item())
+                    break
+        return self._ple_scale_cached
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hp = self.hparams
@@ -130,6 +153,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
+        if name.endswith("ngram_embedding.weight_scale"):
+            return []  # scalar FP8 table scale; consumed lazily in _write_ple_shard
+
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
@@ -184,7 +210,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_rows_per_shard = rows
             self._ple_path = self.fname_out.parent / f".{self.fname_out.stem}.ple.tmp"
             self._ple_map = np.memmap(
-                self._ple_path, dtype=np.float32, mode="w+",
+                self._ple_path, dtype=np.float16, mode="w+",
                 shape=(n_parts * rows, row_dim))
 
         for i, held in list(self._ple_pending.items()):
@@ -215,7 +241,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # is that exactly one shard is resident at a time
         from .base import LazyTorchTensor
 
-        eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
+        # NB base.py upcasts F8_E4M3 shards to f32 BEFORE modify_tensors sees them,
+        # so the dtype is gone by now - gate on the checkpoint scale instead
+        # (_ple_fp8_scale() is 1.0 for bf16 checkpoints, where no weight_scale exists)
+        eager = LazyTorchTensor.to_eager(shard).to(torch.float32)
+        scale = self._ple_fp8_scale()
+        if scale != 1.0:
+            eager = eager * scale
+        eager = eager.contiguous()
         self._ple_map[start:start + rows] = eager.numpy()
         del eager
 
@@ -226,14 +259,28 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_map = None
 
         # trim the tail if the last shard came up short of a full stride
-        want = total_rows * self._ple_row_dim * 4
+        want = total_rows * self._ple_row_dim * 2
         if self._ple_path.stat().st_size != want:
             with open(self._ple_path, "r+b") as f:
                 f.truncate(want)
 
-        raw = np.memmap(self._ple_path, dtype=np.float32, mode="r+",
+        raw = np.memmap(self._ple_path, dtype=np.float16, mode="r",
                         shape=(total_rows, self._ple_row_dim))
-        return torch.from_numpy(np.asarray(raw))
+        arr = np.asarray(raw)
+        # the staging file is ~102 GB and the output write needs the space back the
+        # moment this tensor is flushed, not at the end of write(): unlink when the
+        # writer drops its last reference. write()'s finally covers a crash before then.
+        import weakref
+        weakref.finalize(arr.base if arr.base is not None else arr, self._unlink_ple_tmp, str(self._ple_path))
+        return torch.from_numpy(arr)
+
+    @staticmethod
+    def _unlink_ple_tmp(path: str) -> None:
+        import os
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     def prepare_tensors(self):
         super().prepare_tensors()
