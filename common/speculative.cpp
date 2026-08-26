@@ -16,6 +16,7 @@
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -152,6 +153,53 @@ struct common_speculative_impl {
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
 
+    // Adaptive draft sizing (--spec-draft-adaptive): per-seq EMA of accepted tokens per
+    // draft. Censoring-aware: a fully-accepted draft only proves acceptance >= n_drafted,
+    // never how much further it would have gone, so averaging it would ratchet the draft
+    // length down and strand it. Full accept -> additive probe upward; partial accept ->
+    // EMA of the exact stopping point.
+    std::vector<float>   acc_ema;      // per-seq EMA of accepted tokens per draft
+    std::vector<int32_t> n_last_draft; // per-seq size of the draft just issued
+    bool adaptive_n = false;           // enabled by --spec-draft-adaptive
+
+    static constexpr float acc_ema_alpha  = 0.25f; // ~4-step memory
+    static constexpr float acc_ema_probe  = 1.0f;  // additive growth on a clean draft
+    static constexpr float acc_ema_init   = 2.0f;
+
+    void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return;
+        }
+        const int32_t n_drafted = n_last_draft[seq_id];
+        if (n_drafted > 0 && (int32_t) n_accepted >= n_drafted) {
+            acc_ema[seq_id] += acc_ema_probe;   // censored: lower bound, probe up
+        } else {
+            acc_ema[seq_id] = (1.0f - acc_ema_alpha) * acc_ema[seq_id] + acc_ema_alpha * (float) n_accepted;
+        }
+        n_last_draft[seq_id] = 0;
+    }
+
+    // reset on a new prompt / reused server slot; never mid-generation, since
+    // tracking content drift within a response is the point of the EMA
+    void reset_acc_ema(llama_seq_id seq_id) {
+        if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
+            acc_ema[seq_id]      = acc_ema_init;
+            n_last_draft[seq_id] = 0;
+        }
+    }
+
+    // effective draft length for this step, never above the configured n_max
+    int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
+        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return n_cfg;
+        }
+        const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
+        const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
+        acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
+        n_last_draft[seq_id] = n;
+        return n;
+    }
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -159,7 +207,11 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {
+        // start optimistic so a predictable prefix is not throttled from step one
+        acc_ema.assign(n_seq, acc_ema_init);
+        n_last_draft.assign(n_seq, 0);
+    }
 
     virtual ~common_speculative_impl() = default;
 
@@ -945,6 +997,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
+        adaptive_n = this->params.adaptive;
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "DFlash requires ctx_tgt and ctx_dft to be set");
@@ -1181,7 +1235,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1376,6 +1430,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
     {
+        adaptive_n = this->params.adaptive;
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
@@ -1676,6 +1732,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                // MTP drafts sequentially, so a shorter draft saves draft passes
+                // as well as target verification work.
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
@@ -1705,7 +1765,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2655,6 +2715,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
+        impl->reset_acc_ema(seq_id);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
@@ -2779,6 +2840,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        impl->update_acc_ema(seq_id, n_accepted);
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }
