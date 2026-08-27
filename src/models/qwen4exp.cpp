@@ -399,6 +399,8 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
+    bool can_reuse(const llm_graph_params & params) override;
+
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
@@ -412,6 +414,43 @@ public:
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
 };
+
+// Without this the base class returns false and the whole graph is rebuilt every token.
+// n_kv, n_stream and n_tokens pin every shape here: n_blocks is ceil(n_kv/ratio), the top-k width
+// is min(n_kv, indexer_top_k + ratio - 1), and ratio is fixed per layer. blk_bias is pinned too --
+// it turns on the kq_mask matching those same three, and causal_attn / use_alibi are fixed for the
+// context. n_kv is padded, so this holds between padding steps. set_input still runs on the reuse
+// path, so only topology is certified here.
+bool llm_graph_input_qsa::can_reuse(const llm_graph_params & params) {
+    const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+    this->mctx = m;
+
+    const llama_kv_cache_context * midx = m->get_idx();
+    if (midx == nullptr) {
+        return false;
+    }
+
+    const int64_t n_kv     = midx->get_n_kv();
+    const int64_t n_stream = m->get_n_stream();
+    const int64_t n_tokens = params.ubatch.n_tokens;
+
+    if (n_stream <= 0 || n_tokens % n_stream != 0) {
+        return false;
+    }
+
+    const int64_t n_blocks = (n_kv + (int64_t) ratio - 1)/(int64_t) ratio;
+
+    bool res = true;
+    res &= k_idxs   != nullptr && k_idxs->buffer   != nullptr && k_idxs->ne[0]   == n_tokens;
+    res &= cell_blk != nullptr && cell_blk->buffer != nullptr && cell_blk->ne[0] == n_kv;
+    res &= cell_blk != nullptr && cell_blk->ne[1] == n_stream;
+    res &= bias     != nullptr && bias->buffer     != nullptr;
+    res &= bias     != nullptr && bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+    res &= bias     != nullptr && bias->ne[1] == n_tokens/n_stream;
+
+    return res;
+}
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -907,7 +946,11 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // LLAMA_PLE_HOST_GATHER=0 restores the in-graph gather for A/B.
+    ggml_tensor * emb  = nullptr;  // F32 [ple_head_dim * ple_n_heads, n_tokens], host gather
+    ggml_tensor * rows = nullptr;  // I32 [ple_n_heads * n_tokens], in-graph get_rows
 
     const llama_model_qwen4exp & pmodel;
 
@@ -917,6 +960,42 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
 };
+
+// The table is a CPU tensor far too big to offload, so ggml_get_rows on it puts a CPU node in
+// the middle of the graph: the scheduler splits there and every token pays a GPU->CPU->GPU
+// round trip inside this layer. prefetch_rows already queues the faults; doing the gather
+// here as well removes the split, and the hash it depends on is host-side anyway.
+// LLAMA_PLE_HOST_GATHER=0 restores the in-graph gather.
+static bool ple_host_gather() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_PLE_HOST_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// Topology is fixed by the token count alone: table, head count and hash constants never
+// change. set_input still refreshes the values on the reuse path.
+bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
+    const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+    // set_input reads the predecessor tokens out of the attention cells through this pointer, and
+    // the memory context is rebuilt for every decode. A reused graph keeps the input object alive
+    // across those rebuilds, so re-point it at the live context or set_input dereferences a freed
+    // one -- which segfaults once the allocator hands that memory out again.
+    this->mctx = m->get_attn();
+
+    const int64_t n_tokens = params.ubatch.n_tokens;
+
+    if (emb != nullptr) {
+        return emb->buffer != nullptr && emb->ne[1] == n_tokens;
+    }
+    if (rows != nullptr) {
+        return rows->buffer != nullptr &&
+               rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * n_tokens;
+    }
+    return false;
+}
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -986,7 +1065,33 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // faults happen one at a time; queued here they are in flight before the graph even runs.
     pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (rows) {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        return;
+    }
+
+    // Gather host-side. Head varies fastest within a token, the layout ggml_get_rows produced for
+    // the same index vector, so the flattened [head_dim * n_heads] row per token is unchanged.
+    const ggml_tensor * tbl      = pmodel.per_layer_tok_embd;
+    const int64_t       head_dim = tbl->ne[0];
+    const size_t        row_sz   = ggml_row_size(tbl->type, head_dim);
+    const char *        base     = (const char *) tbl->data;
+
+    // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical
+    std::vector<float> vals((size_t) head_dim * idx.size());
+    if (tbl->type == GGML_TYPE_F32) {
+        for (size_t k = 0; k < idx.size(); ++k) {
+            memcpy(vals.data() + k*head_dim, base + (size_t) idx[k]*row_sz, head_dim*sizeof(float));
+        }
+    } else {
+        const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
+        GGML_ASSERT(traits->to_float && "PLE table type has no to_float");
+        for (size_t k = 0; k < idx.size(); ++k) {
+            traits->to_float(base + (size_t) idx[k]*row_sz, vals.data() + k*head_dim, head_dim);
+        }
+    }
+
+    ggml_backend_tensor_set(emb, vals.data(), 0, vals.size()*sizeof(float));
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1052,14 +1157,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    // heads lie slowest within a token either way, as the reference does
+    ggml_tensor * emb = nullptr;
+    if (ple_host_gather()) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
     cb(emb, "ple_embd", il);
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
