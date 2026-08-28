@@ -371,6 +371,10 @@ struct cmd_params {
     std::vector<int>                 n_cpu_moe;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
+    // NSDMI, not just an entry in cmd_params_defaults: parse_cmd_params() starts from a
+    // fresh cmd_params and only restores the VECTOR fields from defaults when empty, so a
+    // scalar without an initialiser silently arrives as 0 (= OFF).
+    llama_tensor_read_lazy           tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -415,6 +419,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
+    /* tensor_read_lazy     */ LLAMA_TENSOR_READ_LAZY_AUTO,
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -490,6 +495,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  -trl, --tensor-read-lazy <on|auto|off>            (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -784,6 +790,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.split_mode.insert(params.split_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "-trl" || arg == "--tensor-read-lazy") {
+                if (++i >= argc) { invalid_param = true; break; }
+                const std::string v = argv[i];
+                /**/ if (v == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
+                else if (v == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
+                else if (v == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+                else { invalid_param = true; break; }
             } else if (arg == "-lm" || arg == "--load-mode") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1233,6 +1246,7 @@ struct cmd_params_instance {
     int                n_cpu_moe;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
+    llama_tensor_read_lazy tensor_read_lazy;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1254,6 +1268,7 @@ struct cmd_params_instance {
         }
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
+        mparams.tensor_read_lazy = tensor_read_lazy;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1301,7 +1316,8 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
+               load_mode == other.load_mode && tensor_read_lazy == other.tensor_read_lazy &&
+               devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1374,6 +1390,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .tensor_read_lazy      = */ params.tensor_read_lazy,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1410,6 +1427,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .tensor_read_lazy      = */ params.tensor_read_lazy,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1446,6 +1464,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .tensor_read_lazy      = */ params.tensor_read_lazy,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
