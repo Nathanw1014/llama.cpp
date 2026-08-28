@@ -136,8 +136,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
         const int64_t ple_rows = ple_w->tensor->ne[1];
+        // the PLE/engram table is gathered 16 random rows per token and never read densely, so
+        // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, 0);
+                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {

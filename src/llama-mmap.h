@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <utility>
 #include <cstdio>
@@ -42,24 +43,18 @@ private:
 };
 
 struct llama_mmap {
+    // list of [first, last) byte ranges within a file
+    using ranges = std::vector<std::pair<size_t, size_t>>;
+
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+               const ranges & lazy_ranges = {});
     ~llama_mmap();
 
     size_t size() const;
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
-
-    // opt-in, see llama_mmap_random_mode(). marks one byte range as randomly accessed, which is
-    // only correct once loading is done: until then the loader streams the file sequentially.
-    // offsets are into the file, which is also the offset into the mapping - the whole file is
-    // always mapped from zero. the range is rounded out to whole pages, since madvise needs that.
-    void advise_random_range(size_t offset, size_t len, bool drop);
-
-    // eager pull-in for everything outside the given ranges, used in place of the constructor's
-    // whole-file one when part of the file must not be read ahead. ranges must be sorted.
-    void prefetch_except(const std::vector<std::pair<size_t, size_t>> & skip);
 
     // true if [ptr, ptr + len) lies inside this mapping
     bool contains(const void * ptr, size_t len) const;
@@ -76,21 +71,6 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
-// how the model file mappings should be advised, from the LLAMA_MMAP_RANDOM environment variable.
-// off unless the user asks: the random hints cost a large cold-prefill slowdown on models whose
-// host-resident tensors are read sequentially, so this cannot be a default.
-enum llama_mmap_random_mode {
-    LLAMA_MMAP_RANDOM_OFF  = 0, // upstream behaviour
-    LLAMA_MMAP_RANDOM_ON   = 1, // advise the gather tables random after load, do not pull them in
-    LLAMA_MMAP_RANDOM_DROP = 2, // additionally drop what the load pulled in
-};
-
-llama_mmap_random_mode llama_mmap_random_mode_get();
-
-// batched readahead ahead of a sparse gather. not separately switchable: MADV_RANDOM suppresses
-// the kernel's own readahead, so without this the gather takes a synchronous fault per row and
-// runs 2.6x slower than leaving the mapping alone
-bool llama_mmap_random_prefetch_enabled();
 
 struct llama_mlock {
     llama_mlock();
