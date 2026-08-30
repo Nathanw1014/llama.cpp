@@ -214,26 +214,27 @@ uint8_t get_scale(uint ib, uint iqs) {
     return data_a[ib_k].scales[iqs_k / 4];
 }
 
+// Four integer dots per call, matching every other quant in this file. The min
+// term is (scale >> 4) * sum(activation bytes); `cache_b_sum` carries that sum,
+// computed once per column in iter() rather than once per (row, column) here.
+// Both factorings below are exact identities on wrapping int32:
+//   sum_d: (a+b+c+d)*s  ==  a*s + b*s + c*s + d*s   (one scale per 16 weights)
+//   sum_m: c*sum(b)     ==  dot(c*ones, b) summed
+// Magnitudes stay far from overflow: |sum_d| <= 4*4*3*128*15 and
+// |sum_m| <= 16*128*15.
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
-    int32_t sum_d = 0;
-    int32_t sum_m = 0;
-
     const i32vec4 qs_a = repack4(ib_a, iqs * 4);
     const uint8_t scale = get_scale(ib_a, iqs * 4);
     const vec2 dm = vec2(get_dm(ib_a));
-    const int32_t scale_m = int32_t(scale >> 4) * 0x01010101; // Duplicate 8-bit value across 32-bits.
 
-    sum_d += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]) * (scale & 0xF);
-    sum_m += dotPacked4x8EXT(scale_m, cache_b_qs[0]);
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
+    q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
+    q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
 
-    sum_d += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]) * (scale & 0xF);
-    sum_m += dotPacked4x8EXT(scale_m, cache_b_qs[1]);
-
-    sum_d += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]) * (scale & 0xF);
-    sum_m += dotPacked4x8EXT(scale_m, cache_b_qs[2]);
-
-    sum_d += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]) * (scale & 0xF);
-    sum_m += dotPacked4x8EXT(scale_m, cache_b_qs[3]);
+    const int32_t sum_d = q_sum       * int32_t(scale & 0xF);
+    const int32_t sum_m = cache_b_sum * int32_t(scale >> 4);
 
     return FLOAT_TYPE(float(cache_b_ds.x) * (float(dm.x) * float(sum_d) - float(dm.y) * float(sum_m)));
 }

@@ -39,6 +39,22 @@ uint a_offset, b_offset, d_offset;
 int32_t cache_b_qs[K_PER_ITER / 4];
 vec2 cache_b_ds;
 
+#if defined(DATA_A_Q2_K)
+// Sum of the K_PER_ITER activation bytes cached above, i.e.
+// dot(i8vec4(1,1,1,1), cache_b_qs[k]) summed over k.
+//
+// Q2_K is the only type here whose dot product needs a per-block MIN as well as
+// a scale, and whose scale granularity (16 weights) is finer than the q8_1
+// block (32), so unlike Q4_K/Q5_K it cannot take the min term from the
+// precomputed block sum in cache_b_ds.y. It used to recover the activation sum
+// with four extra dotPacked4x8EXT per (row, column) -- doubling this kernel's
+// integer-dot issue rate against every other quant. The sum depends only on the
+// activation block, so it is hoisted out of the row loop and computed once per
+// column instead. Exact, not an approximation: the old inner dots were against
+// a byte broadcast four ways, and dot(c*ones, b) == c * dot(ones, b).
+int32_t cache_b_sum;
+#endif
+
 #include "mul_mat_vecq_funcs.glsl"
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
@@ -74,6 +90,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #else
 #error unimplemented
 #endif
+#endif
+
+#if defined(DATA_A_Q2_K)
+        cache_b_sum = dotPacked4x8EXT(0x01010101, cache_b_qs[0])
+                    + dotPacked4x8EXT(0x01010101, cache_b_qs[1])
+                    + dotPacked4x8EXT(0x01010101, cache_b_qs[2])
+                    + dotPacked4x8EXT(0x01010101, cache_b_qs[3]);
 #endif
 
         uint ibi = first_row*p.ncols;
