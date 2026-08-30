@@ -10143,6 +10143,18 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
     // using MMVQ is only a win on Intel.
     bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
+    // ...and on RDNA3, from two columns up.  The alignment problem is real and is
+    // not fixed here: the 210-byte Q6_K block has no 4-byte-aligned view, so the
+    // integer-dot mat-vec kernel reads A through data_a_packed16 and spends
+    // sixteen 16-bit loads where Q4_K/Q5_K spend four 32-bit ones.  But Q3_K's
+    // 110-byte block has exactly the same problem, uses exactly the same load
+    // pattern, and is already allowed through here -- on this architecture the
+    // integer-dot path wins by more than the split loads cost.  At one column it
+    // does not, hence the n > 1.
+    const bool rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
+    if (rdna3 && n > 1) {
+        mmvq_q6 = true;
+    }
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
