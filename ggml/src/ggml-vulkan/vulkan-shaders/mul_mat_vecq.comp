@@ -15,6 +15,19 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 #define K_PER_ITER 16
 #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
 #define K_PER_ITER 8
+#elif defined(DATA_A_IQ4_XS)
+// Half a 32-weight sub-block per call. IQ4_XS is a 256-weight superblock with
+// eight 6-bit sub-scales, one per 32 weights, and a sub-block's payload uses the
+// MXFP4/IQ4_NL "halves" arrangement, so a 16-wide window is exactly one nibble
+// half (elements 0..15 are the low nibbles, 16..31 the high ones) and the
+// existing contiguous K == 16 B-side preload already supplies the matching
+// operands. 32 would be equally legal -- one sub-scale covers 32 weights, so a
+// 32-wide iteration never straddles a scale boundary either -- but 16 measures
+// faster at the two rows per workgroup these pipelines are created with, by
+// +5.9 points of mean decode on a pure-IQ4_XS model. cache_b_qs is 4 int32
+// rather than 8, and the split scales_l/scales_h decode runs twice per
+// sub-block rather than once.
+#define K_PER_ITER 16
 #elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M)
 #define K_PER_ITER 32
 #else

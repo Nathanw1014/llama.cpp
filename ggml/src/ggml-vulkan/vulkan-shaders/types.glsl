@@ -1812,12 +1812,25 @@ const int8_t kvalues_iq4nl_const[16] = {
 
 shared FLOAT_TYPE kvalues_iq4nl[16];
 
+#if defined(MMQ) && defined(DATA_A_IQ4_XS)
+// The integer-dot mat-vec path needs the codebook as int8 so four looked-up
+// values can be pack32'd straight into a dotPacked4x8EXT operand. Kept as a
+// separate array (rather than retyping kvalues_iq4nl) so every other shader
+// that includes this header is bit-identical. Guarded on DATA_A_IQ4_XS rather
+// than IQ4_NL: the flash-attention variants force DATA_A_IQ4_NL on and some of
+// them also define MMQ, so an IQ4_NL guard would leak this array into FA.
+shared int8_t kvalues_iq4nl_i8[16];
+#endif
+
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize)
 {
     // copy the table into shared memory and sync
     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
         kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
+#if defined(MMQ) && defined(DATA_A_IQ4_XS)
+        kvalues_iq4nl_i8[i] = kvalues_iq4nl_const[i];
+#endif
     }
     barrier();
 }

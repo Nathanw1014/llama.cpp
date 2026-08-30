@@ -562,3 +562,67 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     return sum;
 }
 #endif
+
+#if defined(DATA_A_IQ4_XS)
+// Sub-block scale: a 6-bit value split across scales_l (low nibble) and
+// scales_h (2 high bits), biased by -32, times the superblock's fp16 d. This is
+// Q4_K's get_dm_scale shape minus the min/zero-point term. In packed32 scales_l
+// is a single dword whose nibble ib32 is exactly the low half, so the scalar
+// layout's byte/nibble indexing collapses to one shift.
+float get_d_scale(uint ib) {
+    const uint ib_k = ib / 8;
+    const uint ib32 = ib % 8;
+
+    const uint sl = (data_a_packed32[ib_k].scales_l >> (4 * ib32)) & 0xF;
+    const uint sh = (uint(data_a_packed32[ib_k].scales_h) >> (2 * ib32)) & 3;
+
+    return float(data_a_packed32[ib_k].d) * float(int(sl | (sh << 4)) - 32);
+}
+
+// 4-byte loads for IQ4_XS superblocks (136 bytes; packed32 gives dword-aligned
+// access, unlike IQ4_NL's 18-byte blocks which are only 2-byte aligned).
+//
+// `ib` is a 32-weight SUB-block index: compute_outputs() pre-scales a_offset by
+// QUANT_K/QUANT_K_Q8_1 = 8, so the superblock is ib/8 and the sub-block within
+// it is ib%8. Within a sub-block the 16 payload bytes hold element j in the low
+// nibble and element j+16 in the high nibble -- the same "halves" arrangement
+// MXFP4/IQ4_NL use, even though IQ4_XS declares QUANT_R 1 (that 1 describes the
+// 256-weight superblock, whose eight sub-blocks are laid out consecutively).
+//
+// packed32 dword (4*ib32 + k) covers bytes 16*ib32+4k .. +3, hence:
+//   low  nibbles -> A elements 4k..4k+3
+//   high nibbles -> A elements 16+4k..16+4k+3
+// At K_PER_ITER 16 a single call covers exactly one of those two nibble halves,
+// so repack_half() below unpacks only the half this invocation needs; there is
+// no need for a full 32-wide repack returning both.
+//
+// One nibble half of dword `iqs` of sub-block `ib`: `hi_nib` 0 = low nibbles
+// (A elements 4*iqs..+3), 1 = high nibbles (A elements 16+4*iqs..+3).
+// Half the codebook lookups a 32-wide repack would do, which is all K=16 needs.
+int32_t repack_half(uint ib, uint iqs, uint hi_nib) {
+    const uint ib_k = ib / 8;
+    const uint ib32 = ib % 8;
+
+    const uint32_t vui = data_a_packed32[ib_k].qs[ib32 * 4 + iqs];
+    const u8vec4 i_a = unpack8(((hi_nib == 0u) ? vui : (vui >> 4)) & 0x0F0F0F0F);
+
+    return pack32(i8vec4(kvalues_iq4nl_i8[i_a.x], kvalues_iq4nl_i8[i_a.y],
+                         kvalues_iq4nl_i8[i_a.z], kvalues_iq4nl_i8[i_a.w]));
+}
+
+// K_PER_ITER is 16: one call consumes HALF a 32-weight sub-block, and for
+// IQ4_XS a half is exactly one nibble half. `iqs` (= b_qs_idx) is 0 or 1 and
+// selects which. cache_b_qs[k] holds B elements 16*iqs + 4k .. +3, straight
+// from the existing contiguous K == 16 preload.
+// Max |q_sum| = 16 * 127 * 127 = 258064, comfortably inside int32.
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        q_sum += dotPacked4x8EXT(repack_half(ib_a, k, iqs), cache_b_qs[k]);
+    }
+
+    // affine-free: no min/zero-point term, so cache_b_ds.y is unused
+    return FLOAT_TYPE(float(cache_b_ds.x) * get_d_scale(ib_a) * float(q_sum));
+}
+#endif
