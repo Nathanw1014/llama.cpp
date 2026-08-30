@@ -5765,7 +5765,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // only the column gate is not.  Q8_0 is the one type that needs a later gate:
     // it regresses 2.6-3.9% between two and four columns and only pays from seven,
     // while every other type is already ahead by four.
-    const bool rm_abs = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
+    // UMA only: measured on gfx1151; discrete RDNA3 (N31/N32) was never tested.
+    const bool rm_abs = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && device->uma;
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i, uint32_t min_i = 3) { return (rm_abs && i >= min_i) ? 4u : rows; };
     // mul_mat_vec_id has no column dimension to gate on -- these pipelines are
     // created once, not once per column count -- so a single row count must serve
@@ -10143,16 +10144,18 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
     // using MMVQ is only a win on Intel.
     bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
-    // ...and on RDNA3, from two columns up.  The alignment problem is real and is
+    // ...and on RDNA3, from four columns up.  The alignment problem is real and is
     // not fixed here: the 210-byte Q6_K block has no 4-byte-aligned view, so the
     // integer-dot mat-vec kernel reads A through data_a_packed16 and spends
     // sixteen 16-bit loads where Q4_K/Q5_K spend four 32-bit ones.  But Q3_K's
     // 110-byte block has exactly the same problem, uses exactly the same load
     // pattern, and is already allowed through here -- on this architecture the
-    // integer-dot path wins by more than the split loads cost.  At one column it
-    // does not, hence the n > 1.
-    const bool rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    if (rdna3 && n > 1) {
+    // integer-dot path wins by more than the split loads cost, from four columns.
+    // Four and not two because rm_int_n only gives Q6_K four rows at i >= 3: at
+    // n=2-3 one output row amortizes sixteen half-word loads and the gain is flat.
+    // MoE expert mat-vec runs at those batch sizes and loses there.  UMA as above.
+    const bool rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && device->uma;
+    if (rdna3 && n >= 4) {
         mmvq_q6 = true;
     }
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
