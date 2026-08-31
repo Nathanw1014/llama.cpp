@@ -347,31 +347,69 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
-int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
+// compares blobs rather than generated text: a partially restored cell still decodes to plausible tokens
+static bool test_state_roundtrip(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
-    common_params params;
-    params.prompt = "";
-    params.n_batch = 100;
-    params.out_file = "dump_state.bin";
-    params.sampling.seed = 1234;
+    LOG("\n=== Test 6: state blob round-trip ===\n");
 
-    common_init();
-
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
-        return 1;
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
     }
 
-    if (params.n_parallel == 1) {
-        LOG_TRC("%s: n_parallel == 1, enabling unified kv cache\n", __func__);
-        params.kv_unified = true;
+    std::vector<uint8_t> blob_a(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_a = llama_state_seq_get_data(ctx.get(), blob_a.data(), blob_a.size(), 0);
+    if (n_a != blob_a.size()) {
+        LOG_ERR("\n%s: saved %zu bytes, expected %zu\n", __func__, n_a, blob_a.size());
+        return false;
     }
 
-    if (params.n_predict < 0) {
-        params.n_predict = 16;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("\n%s: failed to erase seq 0\n", __func__);
+        return false;
     }
 
-    ggml_backend_load_all();
+    if (llama_state_seq_set_data(ctx.get(), blob_a.data(), blob_a.size(), 0) != blob_a.size()) {
+        LOG_ERR("\n%s: failed to restore seq 0\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_b(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_b = llama_state_seq_get_data(ctx.get(), blob_b.data(), blob_b.size(), 0);
+    if (n_b != n_a) {
+        LOG_ERR("\n%s: re-saved %zu bytes, expected %zu\n", __func__, n_b, n_a);
+        return false;
+    }
+
+    size_t n_diff = 0;
+    size_t i_diff = 0;
+    for (size_t i = 0; i < n_a; i++) {
+        if (blob_a[i] != blob_b[i]) {
+            if (n_diff == 0) {
+                i_diff = i;
+            }
+            n_diff++;
+        }
+    }
+
+    if (n_diff > 0) {
+        LOG_ERR("\n%s: state changed across a restore: %zu of %zu bytes differ, first at offset %zu\n",
+                __func__, n_diff, n_a, i_diff);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-6) for a single model.
+// Returns true if all tests pass, false otherwise.
+static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
+    struct common_params params = base_params;
+    params.model.path = model_path;
 
     auto llama_init = common_init_from_params(params, true);
     auto * model = llama_init->model();
@@ -431,6 +469,57 @@ int main(int argc, char ** argv) {
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return false;
+    }
+
+    // Test 6: state blob round-trip
+    if (!test_state_roundtrip(model, params, tokens)) {
+        return false;
+    }
+
+    LOG("\nAll tests passed.\n");
+
+    return true;
+}
+
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    common_params params;
+    params.prompt = "";
+    params.n_batch = 100;
+    params.out_file = "dump_state.bin";
+    params.sampling.seed = 1234;
+
+    common_init();
+
+    // extract our own --models DIR option before handing the rest to the common arg parser
+    std::string models_dir;
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--models") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("%s: --models requires a directory argument\n", __func__);
+                return 1;
+            }
+            models_dir = argv[i + 1];
+            i++;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    filtered_argv.push_back(nullptr);
+    const int fargc = (int)filtered_argv.size() - 1;
+
+    // in --models mode there is no single model; set a placeholder so the common parser's
+    // "--model is required" check passes (each model is set individually inside the loop)
+    if (!models_dir.empty()) {
+        params.model.path = models_dir;
+    }
+
+    if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
