@@ -339,6 +339,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // the wide residual starts as hc identical copies of the embedding
+    // set when the last layer gathered everything down to the output rows; the
+    // post-stack gather and the h_nextn mask must then not gather a second time
+    bool trimmed = false;
+
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
             n_embd, hc, n_tokens, 1);
@@ -367,7 +371,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
             // everything from here on is per token, so drop the rows that produce no output.
             // the reference port (upstream 6c84c7d5d) gathers here too; without it the last
             // layer's hc-combine/mix and MoE run over every ubatch row, and the output of a
@@ -378,6 +383,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+            trimmed = true;
         }
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
@@ -404,7 +410,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // naked view and the extraction then hits GGML_ASSERT(backend_h). Contiguous
         // [n_embd, hc, T] has the same memory layout as the flat rows the reader expects.
         ggml_tensor * h_nextn = res_hc;
-        if (cparams.embeddings_nextn_masked && inp_out_ids) {
+        if (!trimmed && cparams.embeddings_nextn_masked && inp_out_ids) {
             ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
             h_nextn = ggml_get_rows(ctx0, flat, inp_out_ids);
         }
@@ -418,7 +424,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
 
-    if (inp_out_ids) {
+    if (inp_out_ids && !trimmed) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
