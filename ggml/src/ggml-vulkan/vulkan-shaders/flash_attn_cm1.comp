@@ -65,6 +65,13 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// Determinism fix: per-KV-column visibility bits for the current block (bit set =
+// column visible to at least one in-bounds query row). A fully-masked column has
+// P == +0 exactly, but P*V inherits V's sign, and the gfx11 WMMA accumulator is
+// not exact for x + (-0.0), so stale V content in masked-out cache cells leaks
+// ULP-level differences into valid rows. V for such columns must be zeroed.
+shared uint colvis[(Bc + 31) / 32];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -160,6 +167,14 @@ void main() {
             mask_cache[idx] = f16vec4(0);
         }
 
+        // default: every column visible (no mask, or mask block known all-zero)
+        if (tid == 0) {
+            [[unroll]] for (uint32_t w = 0; w < (Bc + 31) / 32; ++w) {
+                colvis[w] = 0xFFFFFFFFu;
+            }
+        }
+        barrier();
+
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -172,6 +187,12 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+                if (tid == 0) {
+                    [[unroll]] for (uint32_t w = 0; w < (Bc + 31) / 32; ++w) {
+                        colvis[w] = 0u;
+                    }
+                }
+                barrier();
                 bool nem1_bounds_check = !(gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -186,25 +207,33 @@ void main() {
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
-                                max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
+                                float grp_max = max(max(max(float(m[0]), float(m[1])), float(m[2])), float(m[3]));
+                                max_mask = max(max_mask, grp_max);
+                                if (grp_max > NEG_FLT_MAX_OVER_2) atomicOr(colvis[c / 32], 1u << (c % 32));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
                                             0.0);
-                                max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
+                                float grp_max = max(max(float(m[0]), float(m[1])), float(m[2]));
+                                max_mask = max(max_mask, grp_max);
+                                if (grp_max > NEG_FLT_MAX_OVER_2) atomicOr(colvis[c / 32], 1u << (c % 32));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             0.0,
                                             0.0);
-                                max_mask = max(max(max_mask, float(m[0])), float(m[1]));
+                                float grp_max = max(float(m[0]), float(m[1]));
+                                max_mask = max(max_mask, grp_max);
+                                if (grp_max > NEG_FLT_MAX_OVER_2) atomicOr(colvis[c / 32], 1u << (c % 32));
                             } else if (i * Br + r * 4 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             0.0,
                                             0.0,
                                             0.0);
-                                max_mask = max(max_mask, float(m[0]));
+                                float grp_max = float(m[0]);
+                                max_mask = max(max_mask, grp_max);
+                                if (grp_max > NEG_FLT_MAX_OVER_2) atomicOr(colvis[c / 32], 1u << (c % 32));
                             } else {
                                 m = f16vec4(0.0);
                             }
@@ -225,6 +254,16 @@ void main() {
                 if (max_mask <= NEG_FLT_MAX_OVER_2) {
                     continue;
                 }
+            }
+        }
+
+        // Workgroup-uniform: does this block contain any fully-masked column (< KV)?
+        // Such columns' V must not reach the PV coopmat (see colvis declaration).
+        bool block_fully_visible = true;
+        if (MASK_ENABLE) {
+            [[unroll]] for (uint32_t w = 0; w < (Bc + 31) / 32; ++w) {
+                const uint validbits = (Bc >= (w + 1) * 32) ? 0xFFFFFFFFu : ((1u << (Bc - w * 32)) - 1u);
+                block_fully_visible = block_fully_visible && ((colvis[w] & validbits) == validbits);
             }
         }
 
@@ -421,6 +460,9 @@ void main() {
                             V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
                         }
                     }
+                    if (MASK_ENABLE && (colvis[c / 32] & (1u << (c % 32))) == 0u) {
+                        V_Tf = FLOAT_TYPEV4(0);
+                    }
 
                     kvsh[c * kvsh_stride + d] = V_Tf;
                 }
@@ -455,7 +497,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || (MASK_ENABLE && !block_fully_visible);
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -469,7 +511,8 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    const bool col_visible = !MASK_ENABLE || (colvis[row / 32] & (1u << (row % 32))) != 0u;
+                    if ((!KV_bounds_check || (v_row < KV && v_col < HSV)) && col_visible) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -491,7 +534,7 @@ void main() {
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!USE_DECODE_V && !KV_bounds_check && (!MASK_ENABLE || block_fully_visible)) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
