@@ -4456,6 +4456,7 @@ static int ggml_vk_dense_f16b_mode() {
         const char * e = getenv("GGML_VK_DENSE_F16B");
         if (e == nullptr) return 0;
         if (e[0] == 'a') return 2;
+        if (e[0] == 't') return 3;
         return atoi(e) != 0 ? 1 : 0;
     }();
     return mode;
@@ -9923,8 +9924,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
     // auto mode restricts to ne10 == 5120: the only width measured to gain. Narrow on purpose,
     // so widths measured as losses (3584 dense, 2048 MoE) cannot trigger it.
+    // mode 3 (=type): gate on weight quant. At matched m/k/n, q6_K and q8_0 gain while q4_K
+    // loses, so the type is what separates the models, not their dimensions.
+    const bool f16b_type_ok = src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0;
+    const int  f16b_mode    = ggml_vk_dense_f16b_mode();
     const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
-                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
+                            (f16b_mode == 1 || (f16b_mode == 2 && ne10 == 5120) ||
+                             (f16b_mode == 3 && f16b_type_ok)) &&
                             ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                             ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                             !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
@@ -11603,6 +11609,51 @@ static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
     }
 }
 
+// The dequant/contiguize shaders (dequant_*_transpose, dequant_f16_transpose) read the source
+// as a FLAT run of nel elements from the tensor's offset and remap it assuming the physical
+// order is [HS][NH][KV][NS] -- heads packed immediately inside the KV stride.
+//
+// ggml_is_contiguously_allocated() must NOT be used to stand in for that. It compares
+// ggml_nbytes() (a span) against nelements*type_size, and a span is permutation-INVARIANT, so
+// every dense permutation passes it. Two dense-but-wrongly-ordered K/V reach FA in practice:
+// a heads-outer [HS][KV][NH] tensor, and MiniMax-M3's MSA batch view
+// (src/models/minimax-m3.cpp, kfa = ggml_permute(k_s, 0, 3, 1, 2)) whose stream dim is
+// physically inner. Both were admitted by the old check and silently remapped from the wrong
+// rows. Pin the order explicitly instead.
+//
+// A condition on a dimension is vacuous when its ne == 1, because the shader never uses that
+// dimension's stride; that is what keeps the ordinary KV-cache view (ne[3] == 1) and the
+// ne[2] == 1 MQA/MSA shapes eligible. The "ne[3] == 1 ||" form matches ggml_vk_dim01_contiguous().
+// Density is implied by these conditions, so no separate contiguity check is needed.
+// GGML_VK_FA_SRCORDER=0 restores the old permutation-blind check, so both arms live in one
+// binary (same shader cache, same everything) for A/B. Default is the pinned order.
+static bool ggml_vk_fa_srcorder_off() {
+    static const int off = []() {
+        const char * e = getenv("GGML_VK_FA_SRCORDER");
+        return e && e[0] == '0' ? 1 : 0;
+    }();
+    return off != 0;
+}
+
+static bool ggml_vk_fa_dequant_src_order(const ggml_tensor * t) {
+    if (ggml_vk_fa_srcorder_off()) {
+        // historical check: proves DENSITY only, and density is permutation-invariant
+        return t->nb[0] == ggml_type_size(t->type) && ggml_is_contiguously_allocated(t);
+    }
+    if (t->ne[0] % ggml_blck_size(t->type) != 0) {
+        // a quant block would straddle the HS boundary; the ib*32 -> b_idx remap assumes it does not
+        return false;
+    }
+    const uint64_t rs = (uint64_t) ggml_row_size(t->type, t->ne[0]);
+    return t->nb[0] == ggml_type_size(t->type) &&
+           // heads packed immediately inside the KV stride
+           (t->ne[2] == 1 || (uint64_t) t->nb[2] == rs) &&
+           // one KV step spans the whole head block
+           (t->ne[1] == 1 || (uint64_t) t->nb[1] == rs * t->ne[2]) &&
+           // one stream step spans the whole [HS, NH, KV] block
+           (t->ne[3] == 1 || (uint64_t) t->nb[3] == rs * t->ne[2] * t->ne[1]);
+}
+
 // Capacity gate for the dequant-once f16 K/V scratch. On discrete devices the scratch can push the
 // working set past free VRAM, and the driver then silently pages device-local memory (~15x prefill
 // regression measured on an 8 GB card at long context). UMA has no separate pool to overflow.
@@ -12532,8 +12583,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                 // dequant/contiguize pass must not run on top of it
                                 !fa_compact.active &&
                                 ((k_quant && v_quant) || kv_needs_dequant || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
-                                k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-                                ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
+                                ggml_vk_fa_dequant_src_order(k) && ggml_vk_fa_dequant_src_order(v) &&
                                 kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                 ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
@@ -20435,8 +20485,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         op->src[0]->ne[1] < 64 ||
                         device->pipeline_dequant_transpose[k->type] == nullptr ||
                         device->pipeline_dequant_transpose[v->type] == nullptr ||
-                        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) ||
-                        !ggml_is_contiguously_allocated(k) || !ggml_is_contiguously_allocated(v) ||
+                        !ggml_vk_fa_dequant_src_order(k) || !ggml_vk_fa_dequant_src_order(v) ||
                         kv_f16_sz > device->properties.limits.maxStorageBufferRange) {
                         return false;
                     }

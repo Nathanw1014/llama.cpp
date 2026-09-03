@@ -10130,6 +10130,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {4, 1}, 113, 75, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_F16,    {0, 2, 1, 3}, false));
 
+    // --- AUDIT (local, not for upstream): FA dequant-once source-order exposure -------------
+    // The dequant_*_transpose shaders read K/V as a FLAT run of nel elements and remap assuming
+    // the source physical order is [HS][NH][KV][NS] (heads INNER, i.e. nb[2]==row_size(HS) and
+    // nb[1]==nb[2]*ne[2]). The dispatch gate only checks nb[0]==type_size plus
+    // ggml_is_contiguously_allocated(), which is span-based and therefore permutation-INVARIANT:
+    // a dense heads-OUTER K/V (nb[1]==row_size(HS), nb[2]==nb[1]*ne[1]) passes the gate and is
+    // then mis-transposed. permute={0,1,2,3} + kv_view=false builds exactly that layout.
+    // EXPECTED TO FAIL on the loose guard, PASS once the guard pins the source order.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0,   GGML_TYPE_Q4_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 1, 2, 3}, false));
+    // CONTROLS, all must PASS both before and after the fix, and each isolates one reason:
+    //  (a) heads-INNER, same shape/type: the supported layout -> path engages and is correct.
+    //  (b) nh==1: the (KV,NH) transpose degenerates to the identity, so order cannot matter.
+    //  (c) nb=2 < the neq1>=64 prefill gate: same bad layout, path never engages.
+    //  (d) f16 heads-outer: kv_f16_strided requires nb[1]!=HS*2, which a dense heads-outer
+    //      layout does not satisfy, so the contiguize path self-excludes.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,    GGML_TYPE_F16,    {0, 1, 2, 3}, false));
+    // MiniMax-M3 MSA batch geometry (src/models/minimax-m3.cpp:512, kfa = ggml_permute(k_s,0,3,1,2)):
+    // ne=[D, n_kv, 1, HKV] with nb=[ts, D*HKV*ts, -, D*ts], i.e. the STREAM dim is physically
+    // INNER, sitting where the shader expects heads. permute={0,3,2,1} is the involution that
+    // builds exactly that. Dense, so ggml_is_contiguously_allocated() passes it; the flat remap
+    // then reads the wrong rows whenever ne[3] > 1 and ne[1] > 1.
+    // q8_0 engages via (k_quant && v_quant); f16 engages via (fa_kv_contig && kv_f16_strided),
+    // which is ON BY DEFAULT and is satisfied here because nb[1] != HS*sizeof(f16).
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 8}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 3, 2, 1}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 8}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 3, 2, 1}, false));
+    // CONTROL (e): same layout with a single stream -> the stream dim vanishes, order is legal.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 3, 2, 1}, false));
+    // --- end AUDIT ---------------------------------------------------------------------------
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -10380,6 +10414,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // SHAPE SWEEP (local, GGML_VK_DENSE_F16B predicate). REAL shapes taken from a perf-logger
+    // census of each model, with the quant type each actually uses, plus a few synthetic points.
+    {
+        const ggml_type Q6 = GGML_TYPE_Q6_K, Q4 = GGML_TYPE_Q4_K, Q8 = GGML_TYPE_Q8_0, F32 = GGML_TYPE_F32;
+        struct S { ggml_type t; int64_t m, k; };
+        const S real[] = {
+            // MATCHED SHAPES across quant types: same m/k, only type_a varies, so type and
+            // shape are separated. q4_K/q6_K/q8_0 at four sizes spanning 12.8M to 89.1M.
+            {Q4, 10240, 5120}, {Q6, 10240, 5120}, {Q8, 10240, 5120},
+            {Q4, 17408, 5120}, {Q6, 17408, 5120}, {Q8, 17408, 5120},
+            {Q4, 3584, 18944}, {Q6, 3584, 18944}, {Q8, 3584, 18944},
+            {Q4, 18944, 3584}, {Q6, 18944, 3584}, {Q8, 18944, 3584},
+            {Q4, 3584, 3584},  {Q6, 3584, 3584},  {Q8, 3584, 3584},
+        };
+        for (const S & c : real) {
+            for (int64_t n : {256, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(c.t, F32, c.m, n, c.k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // SHAPE_SWEEP_ONLY=1: return just the cases above, so the sweep does not drag the whole
+    // perf suite (which contains far larger cases) along with it.
+    if (getenv("SHAPE_SWEEP_ONLY")) { return test_cases; }
 
     for (ggml_type type_a : { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS }) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
