@@ -310,7 +310,7 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
-#if MMID_QK_SCACHE
+#ifdef MMID_QK_SCACHE
         // refill all 8 sub-block (d, m) pairs per row at each superblock boundary
         if ((block & 255) == 0) {
             for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) {
