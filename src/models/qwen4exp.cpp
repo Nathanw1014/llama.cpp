@@ -739,8 +739,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                         members->nb[2], members->nb[3], i*members->nb[1]);
         fresh = fresh ? ggml_add(ctx0, fresh, slice) : slice;
     }
-    fresh = ggml_scale(ctx0, fresh, 1.0f/(float) r);
-    cb(fresh, "indexer_k_pooled", il);
+    // no ggml_scale by 1/r here: the only consumer is the RMS norm below, and RMS norm is
+    // scale invariant. rms(x*s) = x*s / sqrt(mean(x^2)*s^2 + eps) = x / sqrt(mean(x^2) + eps/s^2),
+    // so dropping the divide only moves the epsilon from eps to r^2*eps -- 1e-6 to 1.6e-5 against
+    // a mean square of order 1. the scale was a full read and write of [idx_dim, n_blocks] f32 per
+    // layer per ubatch: 2.25 ms of a 97 ms decode step at 131k context.
+    cb(fresh, "indexer_k_sum", il);
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
     fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, n_recomp*n_stream, 1);
