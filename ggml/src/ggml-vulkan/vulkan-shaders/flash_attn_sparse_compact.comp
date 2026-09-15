@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout (binding = 0) readonly buffer M {float16_t data_m[];};
+layout (binding = 1) writeonly buffer I {int32_t data_i[];};
+
+layout (push_constant) uniform parameter {
+    uint KV;
+    uint nem1;
+    uint nem2;
+    uint nbm1;
+    uint nbm2;
+    uint nbm3;
+    uint n_kv_max;
+} p;
+
+shared uint count;
+shared uint chunk_base;
+shared uint sub_tot[32]; // one slot per subgroup: 1024 threads / 32 lanes max = 32
+
+// One workgroup per mask row: compact finite-mask KV positions into a per-row index list of
+// length n_kv_max, -1 padded. The list must be in ascending position order (it is the FA's
+// accumulation order and the run-to-run contract), so the compaction is a deterministic
+// ballot scan: per BLOCK_SIZE chunk, each subgroup ballots its finite lanes, and the output
+// slots are assigned by subgroup rank and lane rank within the subgroup. No atomics: the
+// slot order cannot vary run to run.
+void main() {
+    const uint i1 = gl_WorkGroupID.x;
+    const uint i2 = gl_WorkGroupID.y;
+    const uint i3 = gl_WorkGroupID.z;
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wave = gl_SubgroupID;
+    const uint nwave = gl_NumSubgroups;
+
+    if (tid == 0) {
+        count = 0;
+    }
+    barrier();
+
+    const uint m_base   = i3 * p.nbm3 + i2 * p.nbm2 + i1 * p.nbm1;
+    const uint out_base = ((i3 * p.nem2 + i2) * p.nem1 + i1) * p.n_kv_max;
+
+    for (uint base = 0; base < p.KV; base += BLOCK_SIZE) {
+        const uint k = base + tid;
+        bool fin = false;
+        if (k < p.KV) {
+            const float v = float(data_m[m_base + k]);
+            fin = !isinf(v) && !isnan(v);
+        }
+        const uvec4 ballot = subgroupBallot(fin);
+        const uvec4 masked = ballot & gl_SubgroupLtMask;
+        const uint local  = bitCount(masked.x) + bitCount(masked.y) + bitCount(masked.z) + bitCount(masked.w);
+        if (lane == 0) {
+            sub_tot[wave] = bitCount(ballot.x) + bitCount(ballot.y) + bitCount(ballot.z) + bitCount(ballot.w);
+        }
+        barrier();
+        if (tid == 0) {
+            uint tot = 0;
+            for (uint w = 0; w < nwave; ++w) {
+                tot += sub_tot[w];
+            }
+            chunk_base = count;
+            count += tot;
+        }
+        barrier();
+        uint wave_prefix = 0;
+        for (uint w = 0; w < wave; ++w) {
+            wave_prefix += sub_tot[w];
+        }
+        const uint slot = chunk_base + wave_prefix + local;
+        if (fin && slot < p.n_kv_max) {
+            data_i[out_base + slot] = int32_t(k);
+        }
+        barrier();
+    }
+
+    const uint c = min(count, p.n_kv_max);
+    for (uint s = c + tid; s < p.n_kv_max; s += gl_WorkGroupSize.x) {
+        data_i[out_base + s] = int32_t(-1);
+    }
+}

@@ -2427,30 +2427,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.n_layer_nextn > 0 &&
                                 params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            // A hybrid memory with an empty recurrent layer set fails its buffer
-                            // allocation, so the MTP context gets a PLAIN attention cache over
-                            // the nextn layer(s), dense - the deepseek32 MTP pattern.
-                            llama_kv_cache::layer_filter_cb filter_mtp =
-                                [&](uint32_t il) { return il >= hparams.n_layer(); };
-
-                            res = new llama_kv_cache(
-                                    *this,
-                                    hparams,
-                                    params.type_k,
-                                    params.type_v,
-                                    !cparams.flash_attn,
-                                    cparams.offload_kqv,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    1,
-                                    hparams.n_swa,
-                                    hparams.swa_type,
-                                    nullptr,
-                                    filter_mtp,
-                                    nullptr,
-                                    nullptr);
-                            break;
+                            // The NextN/MTP block is a full-attention QSA layer, so the draft
+                            // gets the same hybrid-idx memory as the trunk with the filters
+                            // inverted: attention + indexer over the nextn layer(s) only, and
+                            // no recurrent layers at all. An all-false recurrent filter leaves
+                            // the recurrent cache without tensors and without buffers, which is
+                            // exactly what the draft needs (no PLE, no GDN in the MTP block).
+                            filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter_recr = [&](uint32_t)    { return false; };
+                            if (hparams.indexer_head_size > 0 &&
+                                    hparams.dsv4_compress_ratios[hparams.n_layer()] > 0) {
+                                filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            }
                         }
 
                     }

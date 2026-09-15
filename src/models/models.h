@@ -2360,7 +2360,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool  qsa_allow = true);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(

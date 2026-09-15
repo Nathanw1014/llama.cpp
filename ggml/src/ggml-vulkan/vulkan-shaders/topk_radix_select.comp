@@ -4,11 +4,13 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 #include "types.glsl"
 
 layout(constant_id = 0) const int BLOCK_SIZE = 1024;
-layout(constant_id = 1) const int QSA = 0; // 1: fuse the qwen4 QSA indexer gather + f16 mask
+layout(constant_id = 1) const int QSA = 0;    // 1: fuse the qwen4 QSA indexer gather + f16 mask
+layout(constant_id = 2) const int EMIT_W = 8; // emit elements per invocation per round; 1 = ballot fallback
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -16,7 +18,7 @@ layout (binding = 0) readonly buffer A  {float     data_a[];};   // input values
 layout (binding = 1) writeonly buffer D {int       data_d[];};   // [k, ...]
 layout (binding = 2) readonly buffer CB {int       cell_blk[];}; // QSA: cell->block map [n_kv, n_stream]
 layout (binding = 3) readonly buffer M  {float16_t mask[];};     // QSA: raw f16 kq_mask [n_kv, n_tps, n_stream]
-layout (binding = 4) buffer S           {float     scratch[];};  // QSA: [nrows, n_kv] gathered inputs
+layout (binding = 4) buffer S           {float     scratch[];};  // QSA: [nrows, n_kv] materialized inputs
 
 layout (push_constant) uniform parameter {
     uint ncols;
@@ -27,13 +29,19 @@ layout (push_constant) uniform parameter {
     uint n_stream; // QSA only
 } p;
 
-#define RADIX_BITS 8
+// 11 + 11 + 10 bits: three passes over the row instead of four, which is one full row of
+// traffic less per token. Any digit width is exact for radix select.
+#define RADIX_BITS 11
 #define RADIX_SIZE (1 << RADIX_BITS)
+#define RADIX_PASSES 3
 
 shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
-shared uint sg_cnt[64];  // per-subgroup hit counts for the slot scan
+shared uint sg_cnt_gt[64]; // per-subgroup strictly-above counts for the slot scan
+shared uint sg_cnt_eq[64]; // per-subgroup tie counts for the slot scan
+
+#define NEG_INF (uintBitsToFloat(0xFF800000u))
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -47,21 +55,27 @@ uint f2ui(float x) {
 }
 
 // QSA element i of row (t,s): score[cell_blk[i,s], t, s] + mask[i,t,s]
+// the score is read in its native block-major layout, so consecutive cells of a block (which
+// is what cell_blk yields in runs) walk consecutive addresses
 float gather(uint row, uint i) {
     const uint t = row % p.n_tps;
     const uint s = row / p.n_tps;
-    const uint block = uint(cell_blk[s * p.ncols + i]);
-    const float a = data_a[(s * p.n_blocks + block) * p.n_tps + t];
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
-    return a + m;
+    // a masked cell sums to exactly -inf whatever the block index is, so the score read and
+    // the block lookup can be skipped: the block may not cover this cell at all
+    if (m == NEG_INF) {
+        return NEG_INF;
+    }
+    const uint block = uint(cell_blk[s * p.ncols + i]);
+    return data_a[(s * p.n_tps + t) * p.n_blocks + block] + m;
 }
 
 float load(uint row, uint i, bool first) {
     if (QSA == 0) {
         return data_a[row * p.ncols + i];
     }
-    // materialize the scattered gather on the first pass and reuse it after; each
-    // invocation only touches its own scratch entries, so no barrier is needed
+    // materialize the scattered gather on the first pass and reuse it after; each invocation
+    // only touches its own scratch entries, so no barrier is needed
     const uint off = row * p.ncols + i;
     if (first) {
         const float v = gather(row, i);
@@ -71,28 +85,158 @@ float load(uint row, uint i, bool first) {
     return scratch[off];
 }
 
+// single emit scan over the row. Values strictly above the threshold fill the slots
+// [0, n_above) and the ties at the threshold fill [n_above, k). Each class keeps ascending
+// element order, so the result equals the two-pass (above, then ties) output exactly while
+// the row is read once.
+//
+// Slots come from a deterministic exclusive scan, so the output does not depend on
+// scheduling. The class split cannot be merged into one ">= threshold" pass: ties must land
+// after all strictly larger values or the sparse attention summation order changes.
+void emit_rows(const uint row, const uint threshold, const uint n_above) {
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint ncols   = p.ncols;
+    const uint row_out = row * p.k;
+
+    uint base_gt = 0;
+    uint base_eq = n_above;
+
+    for (uint rb = 0; rb < ncols; rb += BLOCK_SIZE * EMIT_W) {
+        const uint e0 = rb + tid * uint(EMIT_W);
+        uint m_gt = 0u;
+        uint m_eq = 0u;
+        if (e0 < ncols) {
+            [[unroll]] for (uint b = 0; b < EMIT_W; ++b) {
+                const uint i = e0 + b;
+                if (i < ncols) {
+                    const uint key = f2ui(load(row, i, false));
+                    m_gt |= (key > threshold) ? (1u << b) : 0u;
+                    m_eq |= (key == threshold) ? (1u << b) : 0u;
+                }
+            }
+        }
+
+        uint rank_gt = 0;
+        uint rank_eq = 0;
+        uint cnt_gt  = 0;
+        uint cnt_eq  = 0;
+
+        if (EMIT_W == 1) {
+            // fallback without subgroup shuffle: one BLOCK_SIZE chunk per round, one ballot
+            // per class. This is the historical chunked scan, kept bit for bit.
+            const uvec4 ballot_gt = subgroupBallot(m_gt != 0u);
+            const uvec4 ballot_eq = subgroupBallot(m_eq != 0u);
+            rank_gt = subgroupBallotExclusiveBitCount(ballot_gt);
+            rank_eq = subgroupBallotExclusiveBitCount(ballot_eq);
+            cnt_gt  = subgroupBallotBitCount(ballot_gt);
+            cnt_eq  = subgroupBallotBitCount(ballot_eq);
+        } else {
+            // exclusive prefix over the subgroup lanes. The shuffle index is clamped to the
+            // own lane so that every shuffle reads an executing invocation even in a partial
+            // last subgroup, and the mask keeps the value only where a lower lane exists.
+            uvec2 v = uvec2(bitCount(m_gt), bitCount(m_eq));
+            [[unroll]] for (uint d = 1; d < gl_SubgroupSize; d <<= 1) {
+                const uint  id  = gl_SubgroupInvocationID;
+                const uint  src = (id >= d) ? (id - d) : id;
+                const uvec2 n   = subgroupShuffle(v, src);
+                v += (id >= d) ? n : uvec2(0u);
+            }
+            const uvec2 own = uvec2(bitCount(m_gt), bitCount(m_eq));
+            rank_gt = (v - own).x;
+            rank_eq = (v - own).y;
+            // the inclusive sum sits on the highest active lane
+            const uint  act = subgroupBallotBitCount(subgroupBallot(true));
+            const uvec2 sg  = subgroupShuffle(v, act - 1u);
+            cnt_gt = sg.x;
+            cnt_eq = sg.y;
+        }
+
+        if (subgroupElect()) {
+            sg_cnt_gt[gl_SubgroupID] = cnt_gt;
+            sg_cnt_eq[gl_SubgroupID] = cnt_eq;
+        }
+        barrier();
+
+        uint sg_gt = 0;
+        uint sg_eq = 0;
+        uint tot_gt = 0;
+        uint tot_eq = 0;
+        for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+            const uint a = sg_cnt_gt[sg];
+            const uint b = sg_cnt_eq[sg];
+            if (sg < gl_SubgroupID) {
+                sg_gt += a;
+                sg_eq += b;
+            }
+            tot_gt += a;
+            tot_eq += b;
+        }
+        const uint slot_gt0 = base_gt + sg_gt + rank_gt;
+        const uint slot_eq0 = base_eq + sg_eq + rank_eq;
+
+        if (EMIT_W == 1) {
+            if ((m_gt != 0u) && (slot_gt0 < p.k)) {
+                data_d[row_out + slot_gt0] = int(e0);
+            }
+            if ((m_eq != 0u) && (slot_eq0 < p.k)) {
+                data_d[row_out + slot_eq0] = int(e0);
+            }
+        } else {
+            if (m_gt != 0u) {
+                [[unroll]] for (uint b = 0; b < EMIT_W; ++b) {
+                    if ((m_gt & (1u << b)) != 0u) {
+                        const uint slot = slot_gt0 + bitCount(m_gt & ((1u << b) - 1u));
+                        if (slot < p.k) {
+                            data_d[row_out + slot] = int(e0 + b);
+                        }
+                    }
+                }
+            }
+            if (m_eq != 0u) {
+                [[unroll]] for (uint b = 0; b < EMIT_W; ++b) {
+                    if ((m_eq & (1u << b)) != 0u) {
+                        const uint slot = slot_eq0 + bitCount(m_eq & ((1u << b) - 1u));
+                        if (slot < p.k) {
+                            data_d[row_out + slot] = int(e0 + b);
+                        }
+                    }
+                }
+            }
+        }
+
+        base_gt += tot_gt;
+        base_eq += tot_eq;
+        barrier();
+    }
+}
+
 // one workgroup per row: radix-select the K-th largest, then compact it plus enough ties
 void topk(const uint row) {
     const uint tid = gl_LocalInvocationID.x;
     const uint ncols = p.ncols;
-    const uint row_out = row * p.k;
 
     uint prefix  = 0;     // fixed high bits of the threshold key
     uint desired = p.k;   // count still needed from the candidate range
 
-    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
-        for (uint i = tid; i < RADIX_SIZE; i += BLOCK_SIZE) {
+    for (int pass = 0; pass < RADIX_PASSES; ++pass) {
+        // digits cover bits [shift, shift + dbits): 11 + 11 + 10 = 32, no overlap
+        const int  shift     = (pass == 2) ? 0 : (21 - 11 * pass);
+        const int  dbits     = (pass == 2) ? 10 : 11;
+        const uint nbuck     = 1u << uint(dbits);
+        const uint bmask     = nbuck - 1u;
+        const uint hi_mask   = ((shift + dbits) >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + dbits));
+        const uint prefix_hi = prefix & hi_mask;
+        const bool first     = (pass == 0);
+
+        for (uint i = tid; i < nbuck; i += BLOCK_SIZE) {
             histo[i] = 0;
         }
         barrier();
 
-        const bool first     = (shift == 32 - RADIX_BITS);
-        const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
-        const uint prefix_hi = prefix & hi_mask;
         for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
             const uint key = f2ui(load(row, i, first));
             if ((key & hi_mask) == prefix_hi) {
-                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1)], 1u);
+                atomicAdd(histo[(key >> uint(shift)) & bmask], 1u);
             }
         }
         barrier();
@@ -101,7 +245,7 @@ void topk(const uint row) {
         if (tid == 0) {
             uint acc = 0;
             uint b   = 0;
-            for (int bb = RADIX_SIZE - 1; bb >= 0; --bb) {
+            for (int bb = int(nbuck) - 1; bb >= 0; --bb) {
                 const uint c = histo[bb];
                 if (acc + c >= desired) { b = uint(bb); break; }
                 acc += c;
@@ -116,46 +260,8 @@ void topk(const uint row) {
         barrier();
     }
 
-
-    // Emit everything above the threshold, then fill the rest from ties. Slots come from
-    // an exclusive scan over the candidate flags, one BLOCK_SIZE chunk at a time in ascending
-    // index order, so the output is identical on every run. The previous atomicAdd slot
-    // counter made the ORDER scheduling-dependent, and at the tie boundary the SET as well:
-    // the QSA width is top_k + ratio - 1, so the boundary block's ratio tied cells race for
-    // ratio - 1 slots and a different cell lost each run (non-repeatable output at depth).
-    // With the scan the lowest-indexed tied cells win.
-    const uint threshold = prefix;
-    uint base = 0;
-    [[dont_unroll]] for (uint pass = 0; pass < 2; ++pass) {
-        for (uint c = 0; c < ncols; c += BLOCK_SIZE) {
-            const uint i   = c + tid;
-            bool hit = false;
-            if (i < ncols) {
-                const uint key = f2ui(load(row, i, false));
-                hit = (pass == 0) ? (key > threshold) : (key == threshold);
-            }
-            const uvec4 ballot  = subgroupBallot(hit);
-            const uint  rank_sg = subgroupBallotExclusiveBitCount(ballot);
-            const uint  cnt_sg  = subgroupBallotBitCount(ballot);
-            if (subgroupElect()) {
-                sg_cnt[gl_SubgroupID] = cnt_sg;
-            }
-            barrier();
-            uint sg_base = 0;
-            uint total   = 0;
-            for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
-                const uint v = sg_cnt[sg];
-                sg_base += (sg < gl_SubgroupID) ? v : 0;
-                total   += v;
-            }
-            const uint slot = base + sg_base + rank_sg;
-            if (hit && slot < p.k) {
-                data_d[row_out + slot] = int(i);
-            }
-            base += total;
-            barrier();
-        }
-    }
+    // wanted = K - (number of strictly larger values), so the larger ones take the low slots
+    emit_rows(row, prefix, p.k - desired);
 }
 
 void main() {

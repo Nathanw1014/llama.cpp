@@ -89,6 +89,31 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
+    // The NextN/MTP block is a full-attention QSA layer like every other full-attention
+    // layer and ships its own trained indexer tensors. A sidecar written through
+    // llama-model-saver pads compress_ratios to n_layer_all from the trunk's array, whose
+    // tail stays zero, so a zero there is a padding artifact, not "the draft runs dense".
+    // Restore the ratio from the trunk's QSA layers when the MTP block has an indexer.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] > 0) {
+            continue;
+        }
+        const std::string probe = "blk." + std::to_string(il) + ".indexer.q_proj.weight";
+        if (ml.get_weight(probe.c_str()) == nullptr) {
+            continue;
+        }
+        for (uint32_t t = 0; t < hparams.n_layer(); ++t) {
+            if (hparams.dsv4_compress_ratios[t] > 0) {
+                hparams.dsv4_compress_ratios[il] = hparams.dsv4_compress_ratios[t];
+                break;
+            }
+        }
+        if (hparams.dsv4_compress_ratios[il] == 0) {
+            LLAMA_LOG_WARN("%s: MTP layer %u has indexer tensors but the trunk has no QSA ratio, the draft stays dense\n",
+                           __func__, il);
+        }
+    }
+
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
@@ -903,9 +928,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // the backend attend over the whole cache and merely discard what it read, which is O(n_kv)
     // per token; with top_k attached, a backend that can compact the active set (the Vulkan
     // gather-compact path) costs O(n_top_k) instead. n_kv_raw is 0: unlike DeepSeek V4 this
-    // cache has no dense prefix, every attended cell comes from the selection. Backends without
-    // that path ignore the extra argument and read the same mask they do today.
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il, top_k, 0);
+    // cache has no dense prefix, every attended cell comes from the selection. n_kv_max bounds
+    // the finite mask entries per row (the selection width) and drives the mask-compaction
+    // sparse path for prefill batches, which the fork's gather-compact path declines (N >= 64).
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il, top_k, 0);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -922,12 +948,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        bool                      qsa_allow) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    const auto * mctx_idx = mctx_hyb ? mctx_hyb->get_idx() : nullptr;
+    const bool qsa = mctx_idx != nullptr && hparams.dsv4_compress_ratios[il] > 0 && qsa_allow;
+
+    if (mctx_idx != nullptr && !qsa && model.layers[il].index_k_proj != nullptr) {
+        // the sparse path is declined for this ubatch, but the pooled-key cache recomputes
+        // any block above its watermark from the stored indexer keys, so the keys still have
+        // to be written or a later sparse ubatch pools over garbage. The index cache shares
+        // the attention cache's slot layout cell for cell, so the k indices are the same.
+        ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+        k_raw = ggml_reshape_3d(ctx0, k_raw, hparams.indexer_head_size, 1, n_tokens);
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->get_k_idxs(), il));
+    }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
@@ -1562,10 +1600,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // the MTP context holds a plain attention cache over the nextn layer(s) only, the
-    // deepseek32 pattern: the draft runs dense (no indexer cache, no recurrent state)
-    auto * inp_attn = build_attn_inp_kv();
-    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    // the MTP block is a full-attention QSA layer like every trunk full-attention layer, so
+    // the draft context carries the same hybrid-idx memory as the trunk: attention + indexer
+    // over the nextn layer(s), and an empty recurrent set (no PLE, no GDN in the draft block)
+    auto * inp = build_inp_mem_hybrid();
+    auto * inp_attn = inp->get_attn();
+    // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+    if (mctx_hyb->get_idx()) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+    }
 
     // hnorm is the same grouped RMSNorm as every HC norm: rms over one stream, flat gamma
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
@@ -1591,7 +1636,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     ggml_build_forward_expand(gf, cur);
 
-    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+    // The draft's sparse path only pays on prefill-sized batches: a decode or verify batch
+    // of 1-4 rows spends more on the indexer pipeline and its O(n_kv) host scan than the
+    // sparse FA saves, so those run dense while keeping the indexer keys written.
+    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il, n_tokens >= 16);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur = build_hc_mix(res_hc,

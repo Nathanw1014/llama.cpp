@@ -46,6 +46,7 @@ layout(push_constant) uniform Parameters {
     uint max_words;   // capacity of the shared bitmap, host-checked
     uint pad_to;
     uint count_only;  // 1: produce the count, write no index list
+    uint batch_off;   // first top-k row of this group (grouped prefill); 0 otherwise
 } p;
 
 // 12288 words = 393216 compressed rows, ~48 KiB of shared memory.
@@ -77,7 +78,7 @@ void main() {
     for (uint c = tid; c < n_cand; c += gl_WorkGroupSize.x) {
         const uint  t   = c / p.n_top_k;
         const uint  j   = c - t * p.n_top_k;
-        const int   idx = data_top[t * p.nbt1 + j];
+        const int   idx = data_top[(t + p.batch_off) * p.nbt1 + j];
         if (idx >= 0 && uint(idx) < R) {
             atomicOr(bitmap[uint(idx) >> 5], 1u << (uint(idx) & 31u));
         }
