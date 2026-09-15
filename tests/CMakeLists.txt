@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-verify-batch-invariance.cpp)
+llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe/qwen4exp model with an MTP head: -m MODEL
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
