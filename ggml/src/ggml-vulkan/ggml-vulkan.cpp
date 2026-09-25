@@ -1126,6 +1126,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16[LI_NH_COUNT];
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
+    // multi-token gathered prefill FA (flash_attn_gather_multi.comp), one per head size 64/128/192/256
+    vk_pipeline pipeline_flash_attn_gather_multi[4];
+    vk_pipeline pipeline_flash_attn_union_groups;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_flash_attn_union_f16;
@@ -2017,6 +2020,14 @@ struct vk_op_dsv4_hc_mix_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_mix_push_constants) <= 128);
 
+struct vk_op_flash_attn_union_groups_push_constants {
+    uint32_t n_kv, n_kv_raw, n_tokens, n_top_k, nbt1, T, slot_stride, max_words;
+};
+struct vk_op_flash_attn_gather_multi_push_constants {
+    uint32_t N, n_head, gqa, T, q_tok, q_head, k_row, k_head, v_row, v_head, m_row, n_kv_raw, slot_stride, n_kv;
+    float scale;
+    uint32_t n_head_kv;
+};
 struct vk_op_flash_attn_union_push_constants {
     uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
 };
@@ -6776,6 +6787,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
                 sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
                 device->subgroup_size);
+            if (device->coopmat_support_16x16x16_f32acc) {
+                for (uint32_t hi = 0; hi < 4; ++hi) {
+                    ggml_vk_create_pipeline2(device, device->pipeline_flash_attn_gather_multi[hi],
+                        "flash_attn_gather_multi_f16_hs" + std::to_string(64 * (hi + 1)),
+                        flash_attn_gather_multi_f16_len, flash_attn_gather_multi_f16_data, "main", 6,
+                        sizeof(vk_op_flash_attn_gather_multi_push_constants), {1, 1, 1}, {64 * (hi + 1)}, 1, true, true,
+                        device->subgroup_size);
+                }
+                ggml_vk_create_pipeline(device, device->pipeline_flash_attn_union_groups,
+                    "flash_attn_union_groups_f16", flash_attn_union_groups_f16_len, flash_attn_union_groups_f16_data, "main", 2,
+                    sizeof(vk_op_flash_attn_union_groups_push_constants), {1, 1, 1}, {}, 1, true, true,
+                    device->subgroup_size);
+            }
         }
 #endif
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
@@ -12482,6 +12506,141 @@ static uint32_t ggml_vk_fa_union_estimate(ggml_backend_vk_context * ctx, uint32_
 // the source mask carries the selection, and the gathered mask preserves it.
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
 
+// Multi-token gathered sparse prefill (GGML_VK_FA_PREFILL_MULTI=T, default 0 = off; after Gufo's
+// WmmaCausalAttentionKernel<4,16,true>): one workgroup per (T consecutive tokens, KV head) streams
+// the UNION of the T tokens' top-k rows once for all T x gqa rows (3 WMMA row fragments, 48 rows),
+// and every row applies its own token's mask row, so each query sees exactly its own selection.
+// The per-group unions are built on the device first (flash_attn_union_groups.comp, one workgroup
+// per group, ascending rows). Census on Flash-Next REAP-320 wikitext (GGML_VK_FA_PREFILL_STATS_G0=1)
+// at n_kv 10k-31k: a token reads 2051 rows, a 4-token union 3100-3350 = 2.45-2.65x fewer rows per
+// token (T=2 1.56-1.63x, T=8 3.8-4.3x; gqa 12 caps T at 4). Op level (test-backend-ops perf, FN shape,
+// 2048 tokens, ov 80 = the same 2.5x): 14.5 vs 22.0 ms at kv 32k, 14.2 vs 21.2 at 16k; T=2 20.7 ms.
+// In the model the win is much smaller than the op test says: REAP-320 pp2048 @ d32768, perf logger,
+// FLASH_ATTN_EXT 258-267 vs 301-302 ms per ubatch (-12..-14%), e2e ABBA 679/677 vs 656/670 t/s at 16k, 655/635
+// vs 642/645 at 32k (+2% / 0%, inside the launch spread). Real selections overlap much less ACROSS
+// groups than the test's globally shared 80%, and the per-token kernel already gets that neighbour
+// reuse from L2 (it reads ~2.5x the rows at ~344 GB/s effective). Hence default off.
+// Numerics (c8192 x2 vs the per-token path): PPL 3.5587 vs 3.5611, KLD 0.0077, top-1 97.8%; the
+// per-token path's own -ub 1024 vs 2048 difference is PPL 3.5533, KLD 0.0110, top-1 96.5%, so the
+// change is inside the ubatch-order band. The op tests' disjoint-selection cases are what prove no
+// row reads another token's selection (GGML_VK_FA_MULTI_DEBUG=2 control: 21/21 engaged cases fail).
+// See flash_attn_gather_multi.comp for the tile structure. GGML_VK_FA_MULTI_DEBUG=1 logs engagement.
+static bool ggml_vk_flash_attn_prefill_gather_multi(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
+        const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const uint32_t env_T = [] {
+        const char * e = getenv("GGML_VK_FA_PREFILL_MULTI");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 0u;
+    }();
+    // GGML_VK_FA_MULTI_DEBUG=1 logs every engaged call; =2 is a POSITIVE CONTROL that makes every
+    // row read the group's first token's mask row (the op tests must then fail wherever neighbouring
+    // selections differ, proving they reach this kernel and check per-row masking)
+    static const int dbg = [] {
+        const char * e = getenv("GGML_VK_FA_MULTI_DEBUG");
+        return e ? atoi(e) : 0;
+    }();
+    if (env_T < 2) {
+        return false;
+    }
+    const ggml_tensor * top_k = dst->src[5];
+    if (!top_k || top_k->type != GGML_TYPE_I32 || !mask || mask->type != GGML_TYPE_F16 || sinks) {
+        return false;
+    }
+    const uint32_t HS = (uint32_t) q->ne[0];
+    const uint32_t hi = HS / 64 - 1;
+    if (HS % 64 != 0 || HS > 256 || k->ne[0] != HS || v->ne[0] != HS || !ctx->device->pipeline_flash_attn_gather_multi[hi] ||
+        !ctx->device->pipeline_flash_attn_union_groups) {
+        return false;
+    }
+    const uint32_t n_head_kv = (uint32_t) k->ne[2];
+    if (n_head_kv == 0 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        q->ne[1] < 64 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[2] % n_head_kv != 0 || k->ne[2] != v->ne[2] || k->ne[1] != v->ne[1] ||
+        q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0 ||
+        k->nb[1] % 8 != 0 || k->nb[2] % 8 != 0 || v->nb[1] % 8 != 0 || v->nb[2] % 8 != 0 ||
+        top_k->ne[1] != q->ne[1] || top_k->ne[2] != 1 || top_k->ne[3] != 1 || top_k->nb[0] != sizeof(int32_t) ||
+        mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+        mask->nb[0] != sizeof(ggml_fp16_t) ||
+        ctx->device->driver_id != vk::DriverId::eMesaRadv || ctx->device->architecture != vk_device_architecture::AMD_RDNA3 ||
+        ctx->device->subgroup_size != 64) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f, scale = 1.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    const uint32_t gqa = (uint32_t) (q->ne[2] / n_head_kv);
+    const uint32_t T   = std::min({ env_T, 48u / std::max(1u, gqa), 16u });
+    if (T < 2) {
+        return false;
+    }
+    const int32_t  n_kv_raw = ggml_get_op_params_i32(dst, 4);
+    const uint32_t n_kv     = (uint32_t) k->ne[1];
+    const uint32_t n_top_k  = (uint32_t) top_k->ne[0];
+    if (n_kv_raw < 0 || (uint32_t) n_kv_raw > n_kv || n_top_k > n_kv - n_kv_raw) {
+        return false;
+    }
+    const uint32_t R = n_kv - (uint32_t) n_kv_raw;
+    const uint32_t max_words = 12288;   // shared bitmap capacity in flash_attn_union_groups.comp
+    if ((R + 31) / 32 > max_words) {
+        return false;
+    }
+    // same depth gate as the per-token gather: shallow contexts go dense
+    if (n_kv < 4096 || (uint64_t) R < 3ull * n_top_k) {
+        return false;
+    }
+
+    const uint32_t N        = (uint32_t) q->ne[1];
+    const uint32_t n_groups = (N + T - 1) / T;
+    const uint32_t cap      = std::min<uint32_t>(T * n_top_k, R);
+    const uint32_t slot_stride = 4 + GGML_PAD(cap, 4u);
+    const size_t   need     = (size_t) n_groups * slot_stride * sizeof(uint32_t);
+    if (ctx->prealloc_size_y < need) {
+        const size_t step = size_t{ 64 } << 20;
+        ctx->prealloc_size_y = ((need + step - 1) / step) * step;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    // orders this op's slots against the previous reader/writer of prealloc_y
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk_subbuffer slots = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+
+    vk_pipeline upipe = ctx->device->pipeline_flash_attn_union_groups;
+    vk_pipeline fpipe = ctx->device->pipeline_flash_attn_gather_multi[hi];
+    ggml_pipeline_request_descriptor_sets(ctx, upipe, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, fpipe, 1);
+
+    const vk_op_flash_attn_union_groups_push_constants upc = {
+        n_kv, (uint32_t) n_kv_raw, N, n_top_k, (uint32_t) (top_k->nb[1] / sizeof(int32_t)), T, slot_stride, max_words,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, upipe, { ggml_vk_tensor_subbuffer(ctx, top_k), slots }, upc, { n_groups, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_flash_attn_gather_multi_push_constants fpc = {
+        N, (uint32_t) q->ne[2], gqa, T,
+        (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
+        (uint32_t) (k->nb[1] / 8), (uint32_t) (k->nb[2] / 8),
+        (uint32_t) (v->nb[1] / 8), (uint32_t) (v->nb[2] / 8),
+        dbg == 2 ? 0u : (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) n_kv_raw, slot_stride, n_kv, scale,
+        n_head_kv,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, fpipe,
+        { ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, v),
+          ggml_vk_tensor_subbuffer(ctx, mask), slots, ggml_vk_tensor_subbuffer(ctx, dst) },
+        fpc, { n_groups * n_head_kv, 1, 1 });
+    ctx->prealloc_y_need_sync = true;
+
+    if (dbg) {
+        static uint64_t calls = 0;
+        fprintf(stderr, "[fa-multi] engaged call=%llu N=%u T=%u gqa=%u groups=%u n_kv=%u n_kv_raw=%d top_k=%u hs=%u heads_kv=%u\n",
+                (unsigned long long) ++calls, N, T, gqa, n_groups, n_kv, n_kv_raw, n_top_k, HS, n_head_kv);
+    }
+    return true;
+}
+
 // Per-token gathered sparse prefill (GGML_VK_FA_PREFILL_GATHER=0 disables; default ON since 2026-09-14):
 // every (token, KV head) workgroup attends the token's own top-k rows, read from the cache by index
 // inside the FA kernel under the GQA fold (the group's query heads are the tile rows). No union, no
@@ -13030,7 +13189,11 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
         if (!sane) {
             fprintf(stderr, "  skipped (top-k memory not a valid selection yet)\n");
         }
-        for (uint32_t g = 16; sane && g <= 128; g *= 2) {
+        // GGML_VK_FA_PREFILL_STATS_G0=1 starts the census at single queries (g1 = the per-token
+        // gather's own work) so the small-group unions a multi-token gather would read are visible.
+        static const char * g0_env = getenv("GGML_VK_FA_PREFILL_STATS_G0");
+        const uint32_t g_first = g0_env ? std::max(1, atoi(g0_env)) : 16u;
+        for (uint32_t g = g_first; sane && g <= 128; g *= 2) {
             uint64_t uni_total = 0, valid_total = 0;
             std::vector<uint8_t> seen((size_t) range);
             for (uint32_t t0 = 0; t0 < N; t0 += g) {
@@ -13268,6 +13431,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+    if (!ctx->fa_forced_compact && !ctx->fa_forced_gather && ggml_vk_flash_attn_prefill_gather_multi(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
     if (!ctx->fa_forced_compact && !ctx->fa_forced_gather && ggml_vk_flash_attn_prefill_gather(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }

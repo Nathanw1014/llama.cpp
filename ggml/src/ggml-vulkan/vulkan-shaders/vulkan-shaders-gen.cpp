@@ -825,9 +825,11 @@ void process_shaders() {
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_top_k_cm_f16", "flash_attn_top_k_cm.comp", {});
+    string_to_spv("flash_attn_gather_multi_f16", "flash_attn_gather_multi.comp", {});
 #endif
     string_to_spv("flash_attn_gather_f16", "flash_attn_gather.comp", {});
     string_to_spv("flash_attn_union_f16", "flash_attn_union.comp", {});
+    string_to_spv("flash_attn_union_groups_f16", "flash_attn_union_groups.comp", {});
     string_to_spv("flash_attn_gather_union_f16", "flash_attn_gather_union.comp", {});
     // one decoder per quantised K type flash-attention supports natively; f16/bf16/f32 need no
     // decode and take the verbatim gather

@@ -1,0 +1,111 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Per-group selection union for the multi-token gathered prefill FA (flash_attn_gather_multi.comp).
+// One workgroup per group of T consecutive query tokens: mark the group's top-k entries in a
+// shared bitmap, then compact the set bits in ascending row order into the group's slot.
+// Same bitmap-then-word-scan scheme as flash_attn_union.comp (marking is O(T * n_top_k), the
+// compaction touches R/32 words), just one union per group instead of one per dispatch.
+//
+// Slot layout (slot_stride words per group): [0] = union size u, [1..3] unused, [4..4+u) = the
+// selected rows relative to n_kv_raw, as the top-k list stores them. Invalid (-1 / out of range)
+// entries are dropped; the FA applies every token's own mask row, so the union only decides
+// which K/V rows are READ, never which ones a query attends.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer TBuf { int  data_top[]; };
+layout(binding = 1) writeonly buffer UBuf { uint data_u[];   };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint n_tokens;
+    uint n_top_k;
+    uint nbt1;        // top-k list stride in entries
+    uint T;           // tokens per group
+    uint slot_stride; // words per group slot
+    uint max_words;   // bitmap capacity, host-checked
+} p;
+
+const uint MAX_WORDS = 12288;
+
+shared uint bitmap[MAX_WORDS];
+shared uint wave_totals[16];
+shared uint base_sh;
+
+void main() {
+    const uint tid   = gl_LocalInvocationIndex;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint wave  = gl_SubgroupID;
+    const uint nwave = gl_NumSubgroups;
+    const uint g     = gl_WorkGroupID.x;
+    const uint R     = p.n_kv - p.n_kv_raw;
+    const uint words = min((R + 31) / 32, p.max_words);
+    const uint t0    = g * p.T;
+    const uint nt    = min(p.T, p.n_tokens - t0);
+    const uint slot  = g * p.slot_stride;
+    const uint cap   = p.slot_stride - 4;
+
+    for (uint w = tid; w < words; w += gl_WorkGroupSize.x) {
+        bitmap[w] = 0;
+    }
+    if (tid == 0) {
+        base_sh = 0;
+    }
+    barrier();
+
+    const uint n_cand = nt * p.n_top_k;
+    for (uint c = tid; c < n_cand; c += gl_WorkGroupSize.x) {
+        const uint t   = c / p.n_top_k;
+        const uint j   = c - t * p.n_top_k;
+        const int  idx = data_top[(t0 + t) * p.nbt1 + j];
+        if (idx >= 0 && uint(idx) < R && (uint(idx) >> 5) < words) {
+            atomicOr(bitmap[uint(idx) >> 5], 1u << (uint(idx) & 31u));
+        }
+    }
+    barrier();
+
+    for (uint chunk = 0; chunk < words; chunk += gl_WorkGroupSize.x) {
+        const uint w    = chunk + tid;
+        const uint bits = w < words ? bitmap[w] : 0u;
+        const uint cnt  = bitCount(bits);
+
+        const uint wave_off = subgroupExclusiveAdd(cnt);
+        const uint wave_tot = subgroupAdd(cnt);
+        if (lane == 0) {
+            wave_totals[wave] = wave_tot;
+        }
+        barrier();
+
+        uint prefix = 0;
+        uint total  = 0;
+        for (uint i = 0; i < nwave; ++i) {
+            prefix += i < wave ? wave_totals[i] : 0u;
+            total  += wave_totals[i];
+        }
+
+        uint o   = base_sh + prefix + wave_off;
+        uint rem = bits;
+        while (rem != 0) {
+            const uint b = findLSB(rem);
+            rem &= rem - 1;
+            if (o < cap) {
+                data_u[slot + 4 + o] = w * 32 + b;
+            }
+            ++o;
+        }
+        barrier();
+        if (tid == 0) {
+            base_sh += total;
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data_u[slot] = min(base_sh, cap);
+    }
+}

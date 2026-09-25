@@ -10804,6 +10804,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 2048, 0, 2051, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  256, 0,  512, false, 1, 50, GGML_TYPE_F16, 256, 24, 2, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 0, 2051, true,  1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    // 2026-09-25 multi-token gathered prefill (GGML_VK_FA_PREFILL_MULTI=T): T tokens share one workgroup
+    // and stream the union of their selections. Disjoint neighbours (ov 0: the union is T x top_k),
+    // identical ones (ov 100: the union is one list), a token count that leaves a short last group,
+    // a dense prefix, and the gqa 8 / hs 64/128/192 shapes that change T and the fragment split.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(16384,  67,   0, 2051, false, 1,   0, GGML_TYPE_F16, 256, 24, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 130, 256,  512, false, 1, 100, GGML_TYPE_F16, 256, 24, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  96,   0,  512, false, 1,  50, GGML_TYPE_F16, 128, 16, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  64,   0,  512, false, 1,  30, GGML_TYPE_F16,  64,  8, 1, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 100,  64,  700, false, 1,  60, GGML_TYPE_F16, 192, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 512, 512, false, 1, 0, GGML_TYPE_F16, 512, 64, 1, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
     // quantised K/V: the gather relocates rows verbatim, so it should serve any type whose row
@@ -11436,6 +11445,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // says whether the compact gather engages at that shape and what it is worth at depth.
     for (int kv : { 8192, 32768, 65536, 131072 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    }
+    // the prefill ubatch at depth (2048 tokens, interleaved cache): ov 80 makes a 4-token union 2.5x
+    // smaller than the 4 selections, the ratio measured on real Flash-Next selections at 10k-31k
+    for (int kv : { 16384, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 2048, 0, 2051, false, 1, 80, GGML_TYPE_F16, 256, 24, 2, false, true));
     }
     // q8_0 K/V at the same shapes: DSv4 with -ctk q8_0 took the dense fallback before the
     // gather became type-agnostic, so this is the cell that says whether it now pays there.

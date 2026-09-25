@@ -1,0 +1,294 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Multi-token gathered sparse prefill FA (qwen4exp QSA, 2026-09-25, after Gufo's
+// WmmaCausalAttentionKernel<4,16,true>). One workgroup = T consecutive query tokens x the gqa
+// query heads of one KV head, packed token-major into ROWS = 48 rows (3 WMMA row fragments;
+// T = 4 at gqa 12 fills all 48). The K/V rows streamed are the UNION of the T tokens' top-k
+// selections (flash_attn_union_groups.comp, ascending), and every row applies its own token's
+// mask row, which carries that token's selection and causality: the result per query is exactly
+// the per-token gather's, only the rows read are shared.
+//
+// Layout per 16-key tile: the 4 wave64 subgroups split the head dim for S (subgroup s owns the
+// 16-wide d chunks s, s+4, ...; its Q fragments live in registers for the whole sweep), the four
+// partial S^T tiles are summed in the softmax, and for P x V subgroup s owns the output hd tiles
+// s, s+4, ... of all three row fragments (O stays in f32 accumulators). The next tile's K/V rows,
+// mask values and list entries are loaded into registers while the current one computes, so a
+// tile costs 4 barriers instead of the ~40 of the Br16 per-token kernel's d-chunked staging.
+// The O rescale indexes accumulator elements by the gfx11 wave64 layout (lane L holds column
+// L%16, rows L/16 + 4i), so the host enables this path on RADV RDNA3 wave64 only.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint HS = 256;   // HSK == HSV, a multiple of 64, <= 256
+
+const uint NSG  = 4;       // subgroups (wave64)
+const uint RF   = 3;       // row fragments
+const uint ROWS = RF * 16;
+const uint BC   = 16;      // keys per tile
+const uint HS4  = HS / 4;
+const uint NDC  = HS / 16 / NSG;   // d chunks per subgroup (S) == hd tiles per subgroup (PV)
+const uint NKL  = BC * HS4 / 256;  // f16vec4 K (and V) loads per thread per tile
+const uint KSTR = HS4 + 2;         // LDS row stride in f16vec4 (16 B pad)
+const uint PSTR = BC / 4 + 2;      // P row stride in f16vec4
+
+layout(push_constant) uniform parameter {
+    uint N;          // query tokens
+    uint n_head;     // query heads (dst ne1)
+    uint gqa;        // query heads per KV head
+    uint T;          // tokens per workgroup (T * gqa <= ROWS)
+    uint q_tok;      // Q token stride, floats
+    uint q_head;     // Q head stride, floats
+    uint k_row;      // K row stride, f16vec4
+    uint k_head;     // K head stride, f16vec4
+    uint v_row;
+    uint v_head;
+    uint m_row;      // mask row stride (per token), f16
+    uint n_kv_raw;
+    uint slot_stride;
+    uint n_kv;       // cache rows (bound for list entries)
+    float scale;
+    uint n_head_kv;  // KV heads: the fastest-varying workgroup index (see below)
+} p;
+
+layout(binding = 0) readonly buffer Q {vec4 data_q4[];};
+layout(binding = 1) readonly buffer K {f16vec4 data_k4[];};
+layout(binding = 2) readonly buffer V {f16vec4 data_v4[];};
+layout(binding = 3) readonly buffer M {float16_t data_m[];};
+layout(binding = 4) readonly buffer L {uint data_l[];};
+layout(binding = 5) writeonly buffer O {float data_o[];};
+
+shared f16vec4 kvsh[2 * BC * KSTR];      // K tile rows [0, BC), V tile rows [BC, 2 BC); Q staging at start
+shared float   spart[NSG * RF * 256];    // per-subgroup partial S^T tiles [key][row]
+shared f16vec4 psh[ROWS * PSTR];         // P [row][key]
+shared float   msh[16 * BC];            // mask values [token][key], T <= 16
+shared float   scale_sh[ROWS];
+shared float   lsh[ROWS];
+
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
+
+void main() {
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint sg   = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    // the KV heads of one group are adjacent in launch order (as in Gufo's kernel): the heads of a
+    // cache row are adjacent in memory (interleaved cache, nb1 = n_head_kv rows), and the group's
+    // list and mask rows are read by both, so they run together and share lines in L2 (measured
+    // neutral on Flash-Next: FA 265 vs 267 ms per 32k ubatch; kept for the shared list/mask reads)
+    const uint g    = gl_WorkGroupID.x / p.n_head_kv;
+    const uint kvh  = gl_WorkGroupID.x % p.n_head_kv;
+    const uint t0   = g * p.T;
+    const uint rows_used = p.T * p.gqa;
+
+    const uint slot  = g * p.slot_stride;
+    const uint n_raw = p.n_kv_raw;
+    const uint E     = n_raw + data_l[slot];
+    const uint n_tiles = (E + BC - 1) / BC;
+
+    const uint k_base = kvh * p.k_head;
+    const uint v_base = kvh * p.v_head;
+
+    // ---- Q fragments into registers, one row fragment at a time through kvsh ----
+    // (an f16 16x16 B fragment is 8 VGPRs per lane at wave64: 3 x HS/64 of them are 96 VGPRs at hs 256
+    // and the kernel sits at 256. Re-reading Q from a 25 KB LDS copy every tile instead measured
+    // 16.8 vs 14.5 ms at 32k: ACO still spends 256 VGPRs and the LDS halves the resident workgroups.)
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> QMat[RF][NDC];
+    [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+        barrier();
+        [[unroll]] for (uint idx = tid; idx < 16 * HS4; idx += 256) {
+            const uint rr  = idx / HS4;
+            const uint d4  = idx % HS4;
+            const uint row = rf * 16 + rr;
+            const uint tok = t0 + row / p.gqa;
+            const bool ok  = row < rows_used && tok < p.N;
+            const uint tc  = ok ? tok : 0u;
+            const uint head = kvh * p.gqa + (ok ? row % p.gqa : 0u);
+            const vec4 qx  = data_q4[(tc * p.q_tok + head * p.q_head) / 4 + d4];
+            kvsh[rr * KSTR + d4] = ok ? f16vec4(qx * p.scale) : f16vec4(0);
+        }
+        barrier();
+        [[unroll]] for (uint i = 0; i < NDC; ++i) {
+            const uint dc = sg + NSG * i;
+            coopMatLoad(QMat[rf][i], kvsh, dc * 4, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> OAcc[RF][NDC];
+    [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+        [[unroll]] for (uint i = 0; i < NDC; ++i) {
+            OAcc[rf][i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        }
+    }
+
+    // softmax ownership: row = tid / 4 (tid < 192), keys 4 * (tid % 4) .. +3
+    const uint sm_row = tid >> 2;
+    const uint sm_q   = tid & 3;
+    float Mrow = NEG_FLT_MAX_OVER_2;
+    float Lrow = 0.0f;
+
+    // ---- register prefetch of one tile: K/V rows, mask values ----
+    f16vec4 kpre[NKL];
+    f16vec4 vpre[NKL];
+    float   mpre = 0.0f;
+
+    // Every load below is unconditional (clamped index) and nothing consumes a loaded value before
+    // the next tile's LDS write, where the validity select is applied: a load inside a branch makes
+    // ACO wait for it at the join, and a select right after the load waits for it too. Either one
+    // serialised the prefetch (first build: s_waitcnt vmcnt(0) per load, op 22.4 ms at 32k vs 18.2
+    // for the per-token kernel). The list reads go first, all of them, then all K/V/mask reads.
+    uint kok = 0;   // bit n: kpre[n] / vpre[n] hold a real row; bit 31: mpre is a real mask value
+    #define PREFETCH(j) { \
+        uint lv_[NKL + 1]; \
+        uint ec_[NKL + 1]; \
+        [[unroll]] for (uint n = 0; n <= NKL; ++n) { \
+            const uint key = n < NKL ? (tid + n * 256) / HS4 : tid % BC; \
+            const uint e   = (j) * BC + key; \
+            ec_[n] = e < E ? e : 0u; \
+            lv_[n] = data_l[slot + 4 + (ec_[n] >= n_raw ? ec_[n] - n_raw : 0u)]; \
+        } \
+        kok = 0; \
+        [[unroll]] for (uint n = 0; n <= NKL; ++n) { \
+            const uint key = n < NKL ? (tid + n * 256) / HS4 : tid % BC; \
+            const uint e   = (j) * BC + key; \
+            uint r = ec_[n] < n_raw ? ec_[n] : n_raw + lv_[n]; \
+            const bool ok = e < E && r < p.n_kv; \
+            r = ok ? r : 0u; \
+            if (n < NKL) { \
+                const uint d4 = (tid + n * 256) % HS4; \
+                kpre[n] = data_k4[k_base + r * p.k_row + d4]; \
+                vpre[n] = data_v4[v_base + r * p.v_row + d4]; \
+                kok |= ok ? (1u << n) : 0u; \
+            } else { \
+                const uint t   = min(tid / BC, p.T - 1); \
+                const uint tok = min(t0 + t, p.N - 1); \
+                mpre = float(data_m[tok * p.m_row + r]); \
+                kok |= (ok && tid < p.T * BC && t0 + t < p.N) ? (1u << 31) : 0u; \
+            } \
+        } \
+    }
+
+    if (n_tiles > 0) {
+        PREFETCH(0);
+    }
+
+    [[dont_unroll]]
+    for (uint j = 0; j < n_tiles; ++j) {
+        barrier();   // previous tile's S/PV no longer read kvsh / psh / msh
+        [[unroll]] for (uint n = 0; n < NKL; ++n) {
+            const uint idx = tid + n * 256;
+            const uint key = idx / HS4;
+            const uint d4  = idx % HS4;
+            const bool ok = (kok & (1u << n)) != 0;
+            kvsh[key * KSTR + d4]        = ok ? kpre[n] : f16vec4(0);
+            kvsh[(BC + key) * KSTR + d4] = ok ? vpre[n] : f16vec4(0);
+        }
+        if (tid < 16 * BC) {
+            msh[tid] = (kok & (1u << 31)) != 0 ? mpre : uintBitsToFloat(0xFF800000u);
+        }
+        barrier();
+
+        if (j + 1 < n_tiles) {
+            PREFETCH(j + 1);
+        }
+
+        // S^T partials: [16 keys] x [16 rows] per row fragment over this subgroup's d chunks
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> SAcc[RF];
+            [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+                SAcc[rf] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            }
+            [[unroll]] for (uint i = 0; i < NDC; ++i) {
+                const uint dc = sg + NSG * i;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> KMat;
+                coopMatLoad(KMat, kvsh, dc * 4, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+                    SAcc[rf] = coopMatMulAdd(KMat, QMat[rf][i], SAcc[rf]);
+                }
+            }
+            [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+                coopMatStore(SAcc[rf], spart, (sg * RF + rf) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+
+        // online softmax, four lanes per row
+        if (tid < ROWS * 4) {
+            const uint rf  = sm_row / 16;
+            const uint r16 = sm_row % 16;
+            const uint t   = min(sm_row / p.gqa, 15u);
+            vec4 s;
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                const uint key = sm_q * 4 + c;
+                float acc = 0.0f;
+                [[unroll]] for (uint s2 = 0; s2 < NSG; ++s2) {
+                    acc += spart[(s2 * RF + rf) * 256 + key * 16 + r16];
+                }
+                s[c] = acc + msh[t * BC + key];
+            }
+            float mx = max(max(s[0], s[1]), max(s[2], s[3]));
+            mx = subgroupClusteredMax(mx, 4);
+            const float Mnew = max(Mrow, mx + FATTN_KQ_MAX_OFFSET);
+            const float eM   = exp(Mrow - Mnew);
+            // the denominator sums the same f16-rounded P that P x V uses, as the Br16 kernel does
+            const f16vec4 P  = f16vec4(exp(s - vec4(Mnew)));
+            Lrow = Lrow * eM + (float(P[0]) + float(P[1]) + float(P[2]) + float(P[3]));
+            Mrow = Mnew;
+            psh[sm_row * PSTR + sm_q] = P;
+            if (sm_q == 0) {
+                scale_sh[sm_row] = eM;
+            }
+        }
+        barrier();
+
+        // O = diag(eM) O + P V over this subgroup's hd tiles
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> PMat[RF];
+            [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+                coopMatLoad(PMat[rf], psh, rf * 16 * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint i = 0; i < NDC; ++i) {
+                const uint ht = sg + NSG * i;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> VMat;
+                coopMatLoad(VMat, kvsh, BC * KSTR + ht * 4, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+                    [[unroll]] for (uint e = 0; e < OAcc[rf][i].length(); ++e) {
+                        OAcc[rf][i][e] *= scale_sh[rf * 16 + lane / 16 + 4 * e];
+                    }
+                    OAcc[rf][i] = coopMatMulAdd(PMat[rf], VMat, OAcc[rf][i]);
+                }
+            }
+        }
+    }
+
+    if (tid < ROWS * 4) {
+        const float L = subgroupClusteredAdd(Lrow, 4);
+        if (sm_q == 0) {
+            lsh[sm_row] = L;
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint rf = 0; rf < RF; ++rf) {
+        [[unroll]] for (uint i = 0; i < NDC; ++i) {
+            const uint col = (sg + NSG * i) * 16 + lane % 16;
+            [[unroll]] for (uint e = 0; e < OAcc[rf][i].length(); ++e) {
+                const uint row = rf * 16 + lane / 16 + 4 * e;
+                const uint tok = t0 + row / p.gqa;
+                if (row < rows_used && tok < p.N) {
+                    const float L = lsh[row];
+                    const uint head = kvh * p.gqa + row % p.gqa;
+                    data_o[(tok * p.n_head + head) * HS + col] = L == 0.0f ? 0.0f : OAcc[rf][i][e] / L;
+                }
+            }
+        }
+    }
+}
