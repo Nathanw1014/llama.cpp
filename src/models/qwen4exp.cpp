@@ -357,8 +357,8 @@ static bool qwen4exp_hc_xn16() {
 // only some layers keeps f32 everywhere rather than half the graph.
 static bool qwen4exp_takes_f16_b(const llama_model & model) {
     for (const auto & layer : model.layers) {
+        // the QSA indexer projections are not listed: qwen4exp_indexer_in gives a bf16 one an f32 B
         const ggml_tensor * consumers[] = {
-            layer.index_q_proj, layer.index_k_proj,          // QSA indexer projections
             layer.wqkv, layer.wqkv_gate, layer.wq, layer.wk, layer.wv,  // attention / GDN in-projections
             layer.ffn_gate_inp,                              // MoE router
             layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps,
@@ -370,6 +370,12 @@ static bool qwen4exp_takes_f16_b(const llama_model & model) {
         }
     }
     return true;
+}
+
+// Community Flash-Next GGUFs ship the indexer projections in bf16, and no backend takes bf16 x f16. Only
+// those matmuls get an f32 copy of their input, so the rest of the graph keeps the f16 hc chain.
+static ggml_tensor * qwen4exp_indexer_in(ggml_context * ctx, const ggml_tensor * w, ggml_tensor * cur) {
+    return w->type == GGML_TYPE_BF16 && cur->type == GGML_TYPE_F16 ? ggml_cast(ctx, cur, GGML_TYPE_F32) : cur;
 }
 
 // LLAMA_HC_GATE16=0 keeps the hc gate logits in f32 (default: the up-GEMM writes f16 and the mix reads f16;
@@ -955,7 +961,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
-    ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+    ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, qwen4exp_indexer_in(ctx0, model.layers[il].index_k_proj, cur));
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
 
@@ -1027,7 +1033,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return nullptr;
     }
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, qwen4exp_indexer_in(ctx0, model.layers[il].index_q_proj, cur));
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
