@@ -6882,7 +6882,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 1, 8}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -16098,6 +16098,8 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
 // reads coalesce, which the time-contiguous concat output never did) and the ncs state columns from
 // the state tensor; the 84 MB transposing concat (1.25 ms x 36 per graph at ub2048) is never written.
 // The CONCAT node stays in the graph for every other backend; only its consumer chain is replaced.
+// Each thread owns one channel for 8 consecutive tokens and slides the 4-tap window in registers (Gufo's
+// SsmConv4Kernel layout): one x load and one store per token instead of four loads per output.
 static void ggml_vk_ssm_conv_direct(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * concat = cgraph->nodes[node_idx];
     const ggml_tensor * conv   = cgraph->nodes[node_idx + 1];
@@ -20250,11 +20252,14 @@ static bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const
 
 // Match CONCAT(state, transpose(x), dim 0) + SSM_CONV + UNARY(SILU) for the direct conv kernel.
 static bool ggml_vk_can_fuse_ssm_conv_direct(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    // default OFF: measured -3.3% pp2048 at d0 on Flash-Next against the concat + conv pair (2026-09-14);
-    // GGML_VK_SSM_CONV_DIRECT=1 enables for op-level work on the kernel
+    // default on. The 2026-09-14 "-3.3%" verdict that shipped this off was void: the three-node ggml_can_fuse
+    // below demanded CONCAT and SSM_CONV have one shape, so the fusion never matched and both arms ran the
+    // concat. Matching for real (2026-09-25, REAP-320 pp2048 ub2048, serialising logger, two runs): CONCAT
+    // 1.26 ms + SSM_CONV_SILU 0.97 ms per GDN layer -> one 0.84 ms kernel, -50 ms of 1.93 s per ubatch,
+    // logits bit-identical (KLD 0 against the unfused build). GGML_VK_SSM_CONV_DIRECT=0 disables.
     static const bool enabled = [] {
         const char * e = getenv("GGML_VK_SSM_CONV_DIRECT");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     if (!enabled) {
         return false;
@@ -20263,8 +20268,21 @@ static bool ggml_vk_can_fuse_ssm_conv_direct(const ggml_backend_vk_context * ctx
     if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY })) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    auto reject = [&](const char * why) {
+        if (dbg) {
+            fprintf(stderr, "ggml_vulkan: ssm conv direct not matched at node %d (%s): %s\n", node_idx, concat->name, why);
+        }
         return false;
+    };
+    // ggml_can_fuse over all three would demand CONCAT and SSM_CONV have the same shape, which they never do
+    // ([n_t+3, ch] vs [ch, n_t]): the three-node form never matched, so the 2026-09-14 A/B above measured
+    // two identical graphs. The concat needs exactly one use (the conv), then conv+silu is an ordinary pair.
+    if (node_idx + 2 >= cgraph->n_nodes || (concat->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (concat->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        cgraph->nodes[node_idx + 1]->op != GGML_OP_SSM_CONV ||
+        !ggml_can_fuse(cgraph, node_idx + 1, { GGML_OP_SSM_CONV, GGML_OP_UNARY })) {
+        return reject("concat use count / adjacency, or can_fuse(SSM_CONV,UNARY)");
     }
     const ggml_tensor * conv  = cgraph->nodes[node_idx + 1];
     const ggml_tensor * silu  = cgraph->nodes[node_idx + 2];
@@ -20272,26 +20290,26 @@ static bool ggml_vk_can_fuse_ssm_conv_direct(const ggml_backend_vk_context * ctx
     const ggml_tensor * xt    = concat->src[1];
     const ggml_tensor * kern  = conv->src[1];
     if (conv->src[0] != concat || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv) {
-        return false;
+        return reject("conv/silu wiring");
     }
     if (state->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32 || kern->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
-        return false;
+        return reject("types");
     }
     // x^T must be a plain transpose of a row-contiguous x: element stride nb[0] is the token stride,
     // the channel stride nb[1] is one element, and the sequence stride is nb[2]
     if (!ggml_is_contiguous(state) || xt->nb[1] != sizeof(float) || (xt->nb[0] % sizeof(float)) != 0 || (xt->nb[2] % sizeof(float)) != 0 ||
         xt->ne[1] != state->ne[1] || xt->ne[2] != state->ne[2] || state->ne[3] != 1 || xt->ne[3] != 1) {
-        return false;
+        return reject("x^T / state layout");
     }
     // kernel width = state columns + 1 (the concat supplies exactly the conv's history)
-    if (kern->ne[0] != state->ne[0] + 1 || kern->ne[1] != state->ne[1] || !ggml_is_contiguous(kern)) {
-        return false;
+    if (kern->ne[0] != 4 || kern->ne[0] != state->ne[0] + 1 || kern->ne[1] != state->ne[1] || !ggml_is_contiguous(kern)) {
+        return reject("kernel width");
     }
     if (!ggml_is_contiguous(silu)) {
-        return false;
+        return reject("silu layout");
     }
     if (get_misalign_bytes(ctx, xt) != 0 || get_misalign_bytes(ctx, state) != 0 || get_misalign_bytes(ctx, silu) != 0) {
-        return false;
+        return reject("misalign");
     }
     return true;
 }
@@ -21553,7 +21571,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     // RMS_NORM + MUL + MUL (the GDN gated norm, RMS_NORM_MUL_MUL): keep the gate MUL behind the gamma MUL
                     !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
-                      graph->nodes[j]->op == GGML_OP_MUL && (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c]))) {
+                      graph->nodes[j]->op == GGML_OP_MUL && (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c])) &&
+                    // CONCAT(state, x^T) -> SSM_CONV (CONCAT_SSM_CONV_SILU), same hoisting problem
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_CONCAT && graph->nodes[j]->op == GGML_OP_SSM_CONV &&
+                      graph->nodes[j]->src[0] == graph->nodes[c])) {
                     ok = false;
                     break;
                 }

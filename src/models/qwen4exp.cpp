@@ -1328,6 +1328,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+    // the projection stays referenced past the conv: the Vulkan CONCAT_SSM_CONV_SILU fusion reads it directly
+    // while writing the conv output, so the allocator must not hand the output the projection's freed bytes
+    // (the backend's overlap check otherwise disables the fusion on every layer)
+    ggml_build_forward_expand(gf, conv_output_silu);
+    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 1, 0));
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 

@@ -8938,6 +8938,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}));
     test_cases.emplace_back(new test_ssm_conv_direct(100, 33, 2, 4));
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 64, 1, 4));
+    // sliding-window direct conv: fewer tokens than the window, ragged token tiles (8 per thread, 32 per
+    // workgroup), ragged channels, two sequences
+    for (int64_t nt : {1, 2, 3, 8, 9, 31, 33, 300}) {
+        test_cases.emplace_back(new test_ssm_conv_direct(130, nt, 2, 4));
+    }
+    test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 4));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
