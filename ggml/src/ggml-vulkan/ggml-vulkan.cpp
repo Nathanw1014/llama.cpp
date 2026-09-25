@@ -21550,7 +21550,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     // RMS_NORM + MUL + CPY(f16): keep the cast behind the norm's MUL
                     !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
-                      graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c])) {
+                      graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
+                    // RMS_NORM + MUL + MUL (the GDN gated norm, RMS_NORM_MUL_MUL): keep the gate MUL behind the gamma MUL
+                    !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
+                      graph->nodes[j]->op == GGML_OP_MUL && (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c]))) {
                     ok = false;
                     break;
                 }
