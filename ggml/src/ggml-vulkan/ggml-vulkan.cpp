@@ -13294,14 +13294,16 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
-    // GQA fold (GGML_VK_FA_GQA_FOLD=1): with several query tokens (speculative verification) each
+    // GQA fold (default on, GGML_VK_FA_GQA_FOLD=0 disables): with several query tokens (speculative verification) each
     // GQA workgroup above serves one token, so every token re-streams the whole K/V range. Pack as
     // many consecutive tokens as fit in the row block (row r = token r / gqa_ratio, head
-    // r % gqa_ratio) so each K/V tile is read once for all of them. coopmat2 addresses rows through
+    // r % gqa_ratio) so each K/V tile is read once for all of them. Qwen3.8-27B (GQA 6) + DFlash2 on
+    // gfx1151/RADV: verify attention 1.06-2.28x at 8k-64k, tg +15% at 16k/32k; not bit-exact against the
+    // one-token layout (reduction order), ub8 KLD 0.00019, top-1 99.0%. GQA 12 cannot fold at Br 16. coopmat2 addresses rows through
     // tensor layouts the fold does not touch, so it keeps the one-token layout.
     static const bool gqa_fold_env = [] {
         const char * e = getenv("GGML_VK_FA_GQA_FOLD");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     bool gqa_fold = false;
     if (gqa_fold_env && gqa_ratio > 1 && neq1 > 1 && !gather_kv && !fa_compact.active &&
