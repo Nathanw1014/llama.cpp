@@ -209,6 +209,18 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
 
+// The 256x256 XL tier (ggml_vk_mm_xl_ok): 512 threads = 16 wave32 subgroups on one CU, so ACO's budget
+// is 192 VGPRs, and each subgroup's 4x4 f32 accumulators take 128 of them. Both measures below are folded
+// from spec constants; every other tile compiles to the same ISA as before (checked per type).
+// (1) In mm_compute_tile the compiler keeps the four B fragments of a k step live across all four rows
+//     (one LDS read each instead of four): 32 VGPRs, and the tile spilled (q4_K 5, q5_K 9, q6_K 15,
+//     q8_0 7, iq4_xs 6 VGPRs), reloading them from scratch every K step. A subgroup-scope shared-memory
+//     barrier after each row forces the B fragments to be re-read per row: 2.4x the fragment LDS reads,
+//     no spill for any type. Standalone dispatcher, x the l tile at 17408x2048x5120, 5120x2048x17408
+//     and 10240x2048x2560 (2026-09-25): q6_K 1.17-1.32 -> 1.30-1.42, q8_0 1.11-1.15 -> 1.15-1.20,
+//     q5_K 1.15-1.16 -> 1.14-1.16; q4_K 1.07-1.10 (spilling) -> 1.17-1.18.
+// (2) XL_IDX_BASE, in main(): keep only the row-0 tile addressing in registers.
+const bool XL_TILE = BM * BN >= 256 * 256;
 #ifdef COOPMAT
 // coopmat state at file scope so the K loop body can be a function (the register-prefetch loop is
 // unrolled by two and calls it three times; keeping one copy of the fragment loads + WMMAs)
@@ -259,6 +271,8 @@ void mm_compute_tile() {
 
                 cm_sums[cm_col * cm_rows + cm_row] = coopMatMulAdd(cm_a, cm_b, cm_sums[cm_col * cm_rows + cm_row]);
             }
+            // XL: re-read the B fragments for every row (see XL_TILE)
+            if (XL_TILE) { subgroupMemoryBarrierShared(); }
         }
     }
 }
@@ -442,25 +456,44 @@ void main() {
     uint a_lane[NA_RAW];
     uint a_sidx[NA_RAW];
     uint b_sidx[NB_RAW];
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-        a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
-        a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+    // XL tile (see XL_TILE): the per-row arrays hold BM/loadstride_a + BN/loadstride_b live VGPRs (10 at
+    // 256x256) across the K loop. Both indices are linear in the tile row, so only the row-0 base is kept
+    // and the other rows add a constant (the LDS index, folded into the ds_write offset) or a uniform (the
+    // A lane offset). With the per-row B reload: q5_K 1.03-1.06 -> 1.14-1.16, q6_K 1.15-1.34 -> 1.30-1.42,
+    // q8_0 1.05-1.10 -> 1.15-1.20 over the l tile, but q4_K 1.17-1.18 -> 1.04-1.05 (ACO register
+    // shuffles: 455 -> 590 loop instructions), so q4_K keeps the arrays.
+#if defined(DATA_A_Q4_K)
+    const bool XL_IDX_BASE = false;
+#else
+    const bool XL_IDX_BASE = XL_TILE;
+#endif
+    const uint a_lane0 = a_lane_off(loadr_a, loadc_a);
+    const uint a_sidx0 = a_shmem_index(loadc_a, loadr_a * LOAD_VEC_A / 2);
+    const uint b_sidx0 = loadc_b * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+    if (!XL_IDX_BASE) {
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
+            a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+        }
     }
-    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
-        b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
-    }
+#define A_LANE(l) (XL_IDX_BASE ? a_lane0 + a_lane_off(0, (l)) : a_lane[(l) / loadstride_a])
+#define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
+#define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
     const bool prefetch = ALIGNED != 0;
     if (prefetch) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-            fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]);
+            fetch_a(pos_a, loadr_a, loadc_a + l, A_LANE(l), a_raw[l / loadstride_a]);
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
             fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]);
         }
 #if defined(ABL_NO_STORE)
         // ablation: tiles written once so the fragment reads stay defined (and are not folded away)
-        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, a_sidx[l / loadstride_a], a_raw[l / loadstride_a]); }
-        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(b_sidx[l / loadstride_b], b_raw[l / loadstride_b]); }
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
         barrier();
 #endif
     }
@@ -503,18 +536,18 @@ void main() {
 #elif defined(ABL_NO_DEQUANT)
 // raw bits straight into the tile (wrong numbers, right traffic)
 #define PF_STORE() \
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { buf_a[a_sidx[l / loadstride_a]] = TO_BUF(FLOAT_TYPEV2(uintBitsToFloat(abl_first(a_raw[l / loadstride_a])))); } \
-    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(b_sidx[l / loadstride_b], b_raw[l / loadstride_b]); }
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { buf_a[A_SIDX(l)] = TO_BUF(FLOAT_TYPEV2(uintBitsToFloat(abl_first(a_raw[l / loadstride_a])))); } \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
 #else
 #define PF_STORE() \
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, a_sidx[l / loadstride_a], a_raw[l / loadstride_a]); } \
-    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(b_sidx[l / loadstride_b], b_raw[l / loadstride_b]); }
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); } \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
 #endif
 #if defined(ABL_NO_FETCH)
 #define PF_FETCH()
 #else
 #define PF_FETCH() \
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]); } \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, A_LANE(l), a_raw[l / loadstride_a]); } \
     [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
 #endif
     if (prefetch) {

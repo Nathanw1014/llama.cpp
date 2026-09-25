@@ -8912,6 +8912,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 2560));
     }
+    // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged
+    // M/N; GGML_VK_MM_XL=2 routes every large-tile shape above to XL as well
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4200, 500, 1024, {1, 1}, {1, 1}));
+    }
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 4200, 500, 1024));
+    }
     test_cases.emplace_back(new test_multi_add_f16(2560, 10, 64));
     test_cases.emplace_back(new test_multi_add_f16(31, 3, 5));
     test_cases.emplace_back(new test_multi_add_f16(64, 2, 8));
@@ -11049,6 +11058,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // dense prefill GEMMs of Qwen3.8-27B UD-Q4_K_XL and Flash-Next REAP-320 (q8_0), tile-tier crossover
+    // (Vulkan coopmat1 XL tile, 2026-09-25); select with -p "m=(17408|12288|10240|6144|5120|2560|1024|640|512|320),"
+    {
+        struct mm_shape { ggml_type t; int m; int k; };
+        const mm_shape shapes[] = {
+            {GGML_TYPE_Q5_K, 17408, 5120}, {GGML_TYPE_Q5_K, 5120, 17408}, {GGML_TYPE_IQ4_XS, 17408, 5120},
+            {GGML_TYPE_IQ4_XS, 5120, 17408}, {GGML_TYPE_Q4_K, 17408, 5120}, {GGML_TYPE_Q6_K, 5120, 17408},
+            {GGML_TYPE_Q5_K, 5120, 6144}, {GGML_TYPE_Q6_K, 5120, 6144}, {GGML_TYPE_Q5_K, 6144, 5120},
+            {GGML_TYPE_Q4_K, 10240, 5120}, {GGML_TYPE_Q5_K, 12288, 5120}, {GGML_TYPE_Q6_K, 1024, 5120},
+            {GGML_TYPE_Q8_0, 320, 10240}, {GGML_TYPE_Q8_0, 10240, 320}, {GGML_TYPE_Q8_0, 6144, 2560},
+            {GGML_TYPE_Q8_0, 10240, 2560}, {GGML_TYPE_Q8_0, 2560, 6144}, {GGML_TYPE_Q8_0, 12288, 2560},
+            {GGML_TYPE_Q8_0, 640, 2560}, {GGML_TYPE_Q8_0, 2560, 640}, {GGML_TYPE_Q8_0, 512, 2560},
+            {GGML_TYPE_Q8_0, 2560, 2560},
+        };
+        for (int n : {512, 2048}) {
+            for (const auto & s : shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.t, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+        }
+        // Flash-Next feeds its q8_0 attention GEMMs f16 activations (the f16 hc chain)
+        for (int m : {6144, 10240, 12288}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, m, 2048, 2560, {1, 1}, {1, 1}));
         }
     }
 

@@ -254,6 +254,8 @@ static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 struct vk_matmul_pipeline_struct {
     vk_pipeline l, m, s;
     vk_pipeline a_l, a_m, a_s;
+    // aligned-only extra-large tier above l (dense quantized coopmat1 on AMD, see ggml_vk_mm_xl_ok)
+    vk_pipeline a_xl;
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
@@ -912,6 +914,7 @@ struct vk_device_struct {
     bool mul_mat_id_l[GGML_TYPE_COUNT];
     bool mul_mat_id_m[GGML_TYPE_COUNT];
     bool mul_mat_id_s[GGML_TYPE_COUNT];
+    bool mul_mat_xl[GGML_TYPE_COUNT] = {};   // dense quantized XL tier (a_xl), coopmat1 on AMD only
 
     // Separate flags for the q8_1 (integer dot) mmq path, whose shader uses
     // a different shared-memory layout than the float matmul shaders.
@@ -4621,6 +4624,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     uint32_t l_align, m_align, s_align;
 
+    // XL tier (a_xl pipelines): set only for the dense quantized coopmat1 path on AMD (see below);
+    // an empty warptile means no XL pipelines are created for that family.
+    std::vector<uint32_t> xl_warptile, xl_warptile_mmq;
+    std::array<uint32_t, 3> xl_wg_denoms {}, xl_mmq_wg_denoms {};
+
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
     bool has_claimed_task = false;
@@ -5268,7 +5276,34 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             warptile_env("GGML_VK_WARPTILE_MMQ_L", l_warptile_mmq);
             l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
             l_mmq_wg_denoms = { l_warptile_mmq[1], l_warptile_mmq[2], 1 };
+
+            // XL tier for the dense QUANTIZED GEMMs: 256x256 tile, 512 threads, 16 wave32 subgroups
+            // each owning a 64x64 block (4x4 accumulators). The large tile's cost on gfx1151 is
+            // staging, not WMMA: global fetch + dequant + LDS store per BK step is 25-31% of its runtime
+            // while the LDS-fragment + WMMA core already runs at Gufo's whole-kernel rate (ISA audit
+            // 2026-09-25). Doubling BM and BN halves the staged elements per WMMA (32 WMMAs per barrier
+            // pair instead of 16). Aligned pipelines only; selected per shape in ggml_vk_mm_xl_ok. The
+            // 192-VGPR spill this tile had is gone (mul_mm.comp, XL_TILE). In-model, pp2048 -ub 2048
+            // (2026-09-25, interleaved vs the l tile): Qwen3.8-27B UD-Q4_K_XL 431 -> 501 t/s (dense
+            // MUL_MAT GPU time 1.175x, every shape faster, iq4_xs 1.31x, q6_K 1.28-1.39x); Flash-Next
+            // REAP-320 flat (its q8_0 k=2560 GEMMs take XL but run ~1.0x in-model vs 1.11-1.13x op-level).
+            // GGML_VK_MM_XL=0 disables, GGML_VK_WARPTILE_MMQ_XL=<11 values> replaces the tile (probe).
+            static const int mm_xl_env = [] { const char * e = getenv("GGML_VK_MM_XL"); return e ? atoi(e) : 1; }();
+            if (mm_xl_env != 0 && device->coopmat_m == 16 && device->coopmat_n == 16 && device->coopmat_k == 16) {
+                xl_warptile_mmq = { 512, 256, 256, 32, 64, 64, 2, 16, 16, 16, 32 };
+                warptile_env("GGML_VK_WARPTILE_MMQ_XL", xl_warptile_mmq);
+                xl_mmq_wg_denoms = { xl_warptile_mmq[1], xl_warptile_mmq[2], 1 };
+            }
         }
+        for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const ggml_type t = (ggml_type) i;
+            device->mul_mat_xl[i] = !xl_warptile_mmq.empty() && device->mul_mat_l[i] &&
+                                    t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
+                                    ggml_vk_matmul_shmem_support(device, xl_warptile_mmq, false, t);
+        }
+        // only the dense quantized families (warptile_mmq) get XL pipelines; the float and mul_mat_id
+        // expansions see an empty xl_warptile and create none
+        auto xl_ok = [&device](ggml_type t, const std::vector<uint32_t> & w) { return !w.empty() && device->mul_mat_xl[t]; };
 
         // WARP -> required subgroup size, or 0 where the device cannot honor one.
         auto dense_req_sgs = [dense_sgs_scope, &device](const std::vector<uint32_t> & w) -> uint32_t {
@@ -5293,6 +5328,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, dense_req_sgs(m_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
+        if (xl_ok(TYPE, xl_ ## WARPTILE)) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_xl, #NAMELC #F16ACC "_aligned_xl", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), xl_ ## WG_DENOMS, ggml_vk_mul_mm_spec(xl_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(xl_ ## WARPTILE));   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -9727,7 +9764,39 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
-static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+// XL tier gate (a_xl: 256x256 tile, 1 workgroup per CU, vs l: 128x128, 2 per CU). Measured op-level on
+// gfx1151 with the spill-free XL kernel (test-backend-ops perf, 73 dense GEMM shapes of Qwen3.8-27B and
+// Flash-Next, n = 256/512/2048, GGML_VK_MM_XL=0 vs =2, 2 interleaved runs, 2026-09-25). Per tile the
+// XL kernel is 1.07-1.44x faster (q6_K most), so it wins wherever it fills the GPU as well as l does:
+//  - wave quantization: XL runs 40 tiles per wave, l 80. XL only when its wave count is at most half
+//    of l's, i.e. it never idles more of the GPU than l: 6144x512 (48 XL tiles, 2 waves vs 3) is
+//    0.93-0.95x, 640x2048 (1 vs 1) 0.71x, m <= 1024 at n = 512 0.74-0.88x; 5120x512 (1 vs 2)
+//    1.09-1.25x, 17408x256 (2 vs 4) 1.15-1.32x, 17408x2048 1.17-1.44x.
+//  - type: q4_K/q5_K/q6_K/q8_0/iq4_xs. iq4_nl is 0.87-0.90x at every shape; the rest are unmeasured.
+//  - k >= 1024: Flash-Next's hc up-GEMM (10240x2048, k = 320, 10 BK steps) is 0.93-0.98x.
+//  - m >= 1024: the smallest measured winner (q6_K 1024x2048 1.20x); nothing below it was accepted.
+// All 38 grid shapes the gate accepts win (1.07-1.44x); the rejected ones it leaves on l include
+// 6 modest wins (1.06-1.13x) and every loss.
+// GGML_VK_MM_XL=2 skips the gate (every shape that would take l takes XL; probe only).
+static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k) {
+    static const bool force = [] { const char * e = getenv("GGML_VK_MM_XL"); return e && atoi(e) == 2; }();
+    if (force) {
+        return true;
+    }
+    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q8_0 &&
+        type != GGML_TYPE_IQ4_XS) {
+        return false;
+    }
+    if (m < 1024 || k < 1024) {
+        return false;
+    }
+    const uint32_t cu = std::max(ctx->device->shader_core_count, 1u);
+    const uint32_t waves_xl = CEIL_DIV(CEIL_DIV(m, 256u) * CEIL_DIV(n, 256u), cu);
+    const uint32_t waves_l  = CEIL_DIV(CEIL_DIV(m, 128u) * CEIL_DIV(n, 128u), 2 * cu);
+    return 2 * waves_xl <= waves_l;
+}
+
+static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type, uint32_t k = 0) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     // The q8_1 (integer dot) mmq path uses a different shader with its own
@@ -9770,12 +9839,20 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
+    if (aligned && !is_q8_1 && mmp->a_xl && ctx->device->mul_mat_xl[src0_type] && ggml_vk_mm_xl_ok(ctx, src0_type, m, n, k)) {
+        static bool xl_logged = false;
+        if (!xl_logged) {
+            xl_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0_type), m, n, k);
+        }
+        return mmp->a_xl;
+    }
     return aligned ? mmp->a_l : mmp->l;
 }
 
-static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
+static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type, uint32_t k = 0) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
+    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type, k)->align;
 }
 
 static void ggml_vk_matmul(
@@ -10234,10 +10311,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type, ne10));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type, ne10);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
