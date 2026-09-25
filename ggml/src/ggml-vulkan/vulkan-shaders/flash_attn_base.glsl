@@ -190,10 +190,23 @@ bool fa_type_needs_shmem(uint ty) {
 
 
 // Store column zero. This is used to save per-row m and L values for split_k.
+uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
+         q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
+bool partial_output;
+uint32_t gather_list_base;
+// GQA fold: a GQA workgroup carries N / gqa_ratio consecutive tokens (row r = token r / gqa_ratio,
+// head r % gqa_ratio), so multi-token decode reads each K/V tile once for all of them.
+bool gqa_fold;
+uint32_t o_tok_stride, lm_tok_stride;
+
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
         uint32_t offset = iq2 + r;
+        if (gqa_fold) {
+            offset = (r / gqa_ratio) * lm_tok_stride + iq2 + r % gqa_ratio;
+        }
         data_o[o_offset + offset] = D_TYPE(elem);
     }
     return elem;
@@ -220,11 +233,6 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
     return ACC_TYPE(data_s[h]);
 }
 
-uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
-         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
-bool partial_output;
-uint32_t gather_list_base;
 
 // GATHER_KV: cache row for compact column c, or 0xFFFFFFFF when c is past the list or the entry is
 // out of range (the mask column for such a c is -inf and the staged row is zero)
@@ -252,7 +260,9 @@ void init_indices()
 {
     N = p.N;
     gqa_ratio = p.gqa_ratio & 0xffff;
-    split_k_num = p.k_num & 0xffff;
+    // bit 15 of k_num: partition-major split-K order (see ggml_vk_flash_attn)
+    split_k_num = p.k_num & 0x7fff;
+    const bool split_pmajor = (p.k_num & 0x8000) != 0;
     output_k_num = p.k_num >> 16;
     partial_output = output_k_num != 0;
     if (!partial_output) {
@@ -260,15 +270,18 @@ void init_indices()
     }
 
     if (split_k_num > 1) {
+        // batch and split_k share gl_WorkGroupID.x. Row-major (default) puts a row's splits next
+        // to each other; partition-major puts every row of one KV partition next to each other,
+        // so rows that read the same K/V range run together and share it in L2/MALL.
+        const uint32_t n_rows = gl_NumWorkGroups.x / split_k_num;
+        const uint32_t row = split_pmajor ? gl_WorkGroupID.x % n_rows : gl_WorkGroupID.x / split_k_num;
+        split_k_index = split_pmajor ? gl_WorkGroupID.x / n_rows : gl_WorkGroupID.x % split_k_num;
         if (gqa_ratio > 1) {
             i = 0;
-            // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / split_k_num;
-            split_k_index = gl_WorkGroupID.x % split_k_num;
+            gqa_iq1 = row;
         } else {
             gqa_iq1 = 0;
-            split_k_index = gl_WorkGroupID.x % split_k_num;
-            i = gl_WorkGroupID.x / split_k_num;
+            i = row;
         }
     } else if (gqa_ratio > 1) {
         i = 0;
@@ -279,6 +292,16 @@ void init_indices()
         gqa_iq1 = 0;
         split_k_index = 0;
     }
+
+    // GQA fold: gqa_iq1 becomes the first token of this workgroup; the last workgroup may carry
+    // fewer tokens, which shrinks N so every row guard (r < N) masks the missing ones.
+    gqa_fold = gqa_ratio > 1 && N > gqa_ratio;
+    if (gqa_fold) {
+        gqa_iq1 *= N / gqa_ratio;
+        N = min(N, (p.ne2 - gqa_iq1) * gqa_ratio);
+    }
+    o_tok_stride = 0;
+    lm_tok_stride = 0;
 
     // after i: a slotted dispatch reads its own row block's count
     KV = DYNAMIC_KV ? data_kv_dyn[SLOTTED ? i * p.ne3 : 0] : p.KV;
@@ -347,5 +370,18 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    if (gqa_fold) {
+        offset = (r / gqa_ratio) * o_tok_stride + (iq2 + r % gqa_ratio) * HSV / 4 + c;
+    }
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
+}
+
+// Q row offset in elements for tile row rr (i * Br + r).
+uint32_t q_row(const uint32_t rr) {
+    return gqa_fold ? (rr % gqa_ratio) * q_stride + (rr / gqa_ratio) * p.nb01 : rr * q_stride;
+}
+
+// Mask row offset for tile row rr: in GQA mode all heads of a token share its mask row.
+uint32_t m_row(const uint32_t rr) {
+    return gqa_fold ? (rr / gqa_ratio) * m_row_len : rr * m_stride;
 }

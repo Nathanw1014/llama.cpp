@@ -10492,6 +10492,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // speculative-verification shapes (2-8 query tokens over a GQA cache): the Vulkan GQA fold
+    // (GGML_VK_FA_GQA_FOLD) packs several tokens per workgroup here, including ragged last groups
+    for (int hs : { 128, 256 }) {
+        for (int nr2 : { 2, 4, 6, 8 }) {
+            for (int nb : { 2, 3, 5, 8 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    for (bool sinks : { false, true }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, 1024, nb, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    }
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 1024, 5, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 4096, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+
     // dense-permuted K/V (model KV-cache layout, engages the f16 contiguize path at nb>=64)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 8, {4, 1}, 512, 80, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
@@ -11096,6 +11112,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {32, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // hd256 stride probe (35B-class geometry): contiguous vs dense-permuted cache layout
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // speculative verification at depth, Qwen3.8-27B attention geometry (hs 256, 4 KV heads, GQA 6)
+    // and Flash-Next (2 KV heads, GQA 12): nb 1 is plain decode, 2-8 the MTP/DFlash2 verify widths.
+    // A/B instrument for GGML_VK_FA_GQA_FOLD and GGML_VK_FA_SPLIT_PMAJOR.
+    for (int nr2 : { 6, 12 }) {
+        const int nh = nr2 == 6 ? 4 : 2;
+        for (int kv : { 8192, 32768, 65536 }) {
+            for (int nb : { 1, 2, 4, 5, 8 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     // MoE tile-quantisation probes. On the hybrid 35B, ubatch maps to per-expert batch as
     // ub/32 (8 of 256 experts), so ub 1024..2048 sweeps n = 32,40,48,56,64. Model throughput

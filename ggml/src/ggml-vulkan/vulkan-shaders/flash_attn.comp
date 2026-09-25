@@ -115,13 +115,13 @@ void main() {
         const bool is_in_bounds = r < Br && d < HSK / 4 && i * Br + r < N;
 #ifndef MMQ
         if (is_in_bounds) {
-            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row(i * Br + r) / 4 + d] * p.scale);
         }
 #else
         const uint buf_ib = r * qf_stride + d / 8;
         const uint buf_iqs = d % 8;
 
-        FLOAT_TYPEV4 vals = is_in_bounds ? FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale) : FLOAT_TYPEV4(0.0f);
+        FLOAT_TYPEV4 vals = is_in_bounds ? FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row(i * Br + r) / 4 + d] * p.scale) : FLOAT_TYPEV4(0.0f);
         const FLOAT_TYPEV4 abs_vals = abs(vals);
 
         const FLOAT_TYPE thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
@@ -219,7 +219,7 @@ void main() {
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
                         if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + m_row(i * Br + r) + (j * Bc + c)]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -664,6 +664,8 @@ void main() {
         if (gqa_ratio > 1) {
             // note: O and Q have swapped coord 1,2.
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + output_k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+            o_tok_stride = HSV * p.ne1 * output_k_num / 4;
+            lm_tok_stride = p.ne1 * 2 * output_k_num;
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 const uint row = tile_row(r);
@@ -741,6 +743,7 @@ void main() {
     }
 
     uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    o_tok_stride = p.ne1 * HSV / 4;
 
     if (gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {

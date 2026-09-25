@@ -106,7 +106,7 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row(i * Br + r) / 4 + d] * p.scale);
         }
     }
     barrier();
@@ -210,25 +210,25 @@ void main() {
                                 max_mask = max(max_mask, float(mg));
                             } else
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
+                                m = f16vec4(data_m[m_offset + m_row(i * Br + r * 4    ) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 1) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 2) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 3) + (j * Bc + c)]);
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + m_row(i * Br + r * 4    ) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 1) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 2) + (j * Bc + c)],
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + m_row(i * Br + r * 4    ) + (j * Bc + c)],
+                                            data_m[m_offset + m_row(i * Br + r * 4 + 1) + (j * Bc + c)],
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + m_row(i * Br + r * 4    ) + (j * Bc + c)],
                                             0.0,
                                             0.0,
                                             0.0);
@@ -653,6 +653,8 @@ void main() {
         if (gqa_ratio > 1) {
             // note: O and Q have swapped coord 1,2.
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + output_k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+            o_tok_stride = HSV * p.ne1 * output_k_num / 4;
+            lm_tok_stride = p.ne1 * 2 * output_k_num;
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 if (tile_row(r) < N) {
@@ -736,6 +738,7 @@ void main() {
     }
 
     uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    o_tok_stride = p.ne1 * HSV / 4;
 
     if (gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {

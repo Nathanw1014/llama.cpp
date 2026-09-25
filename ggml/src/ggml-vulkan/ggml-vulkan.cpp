@@ -13131,6 +13131,15 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     return true;
 }
 
+// GGML_VK_FA_LOG=1 prints when the split-K partition-major order or the GQA fold engages.
+static bool split_pmajor_log() {
+    static const bool log = [] {
+        const char * e = getenv("GGML_VK_FA_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return log;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -13285,6 +13294,34 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
+    // GQA fold (GGML_VK_FA_GQA_FOLD=1): with several query tokens (speculative verification) each
+    // GQA workgroup above serves one token, so every token re-streams the whole K/V range. Pack as
+    // many consecutive tokens as fit in the row block (row r = token r / gqa_ratio, head
+    // r % gqa_ratio) so each K/V tile is read once for all of them. coopmat2 addresses rows through
+    // tensor layouts the fold does not touch, so it keeps the one-token layout.
+    static const bool gqa_fold_env = [] {
+        const char * e = getenv("GGML_VK_FA_GQA_FOLD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    bool gqa_fold = false;
+    if (gqa_fold_env && gqa_ratio > 1 && neq1 > 1 && !gather_kv && !fa_compact.active &&
+        tuning_params.path != FA_COOPMAT2) {
+        for (uint32_t tpw = std::min<uint32_t>((uint32_t)neq1, 32u / gqa_ratio); tpw >= 2; --tpw) {
+            const vk_fa_tuning_params fold_params = get_fa_tuning_params(ctx->device, HSK, HSV, tpw * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
+            if (fold_params.path != FA_COOPMAT2 && fold_params.block_rows >= tpw * gqa_ratio) {
+                gqa_fold = true;
+                N = tpw * gqa_ratio;
+                workgroups_x = CEIL_DIV((uint32_t)neq1, tpw);
+                tuning_params = fold_params;
+                if (split_pmajor_log()) {
+                    fprintf(stderr, "[gqa-fold] engaged tokens=%u gqa=%u tpw=%u rows=%u Br=%u path=%d wg_x=%u\n",
+                            (uint32_t)neq1, gqa_ratio, tpw, N, fold_params.block_rows, (int)fold_params.path, workgroups_x);
+                }
+                break;
+            }
+        }
+    }
+
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
@@ -13346,7 +13383,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // never on a compact mask: the prepass writes its bitfield at prealloc_y offset 0, which the compact
     // paths use for their own scratch (the QSA prefill tile lists live there), and the compact mask is
     // small by construction
-    bool use_mask_opt = mask && !fa_compact.active && !gather_kv && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !fa_compact.active && !gather_kv && !gqa_fold && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     // V^T for the coopmat1 prefill FA (GGML_VK_FA_VT, default on): transpose f16 V per head into a
     // [HSV][KV] scratch so the P x V B-operand fragments are contiguous per lane. Aligned pipelines only
@@ -13417,6 +13454,21 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
+    }
+
+    // Partition-major split-K order (GGML_VK_FA_SPLIT_PMAJOR=1): dispatch every row of one KV
+    // partition back to back instead of every partition of one row, so multi-row decode
+    // (speculative verification) reads each K/V range once from memory and then from L2/MALL.
+    // The per-workgroup work is unchanged, so results are bit-identical; only the order moves.
+    static const bool split_pmajor_env = [] {
+        const char * e = getenv("GGML_VK_FA_SPLIT_PMAJOR");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    GGML_ASSERT(split_k < 0x8000);
+    const uint32_t split_pmajor_bit = (split_pmajor_env && split_k > 1) ? 0x8000u : 0u;
+    if (split_pmajor_bit && split_pmajor_log()) {
+        fprintf(stderr, "[split-pmajor] engaged N=%u KV=%u gqa=%u split_k=%u split_kv=%u wg=(%u,%u,%u) Tr=%u\n",
+                N, KV, gqa_ratio, split_k, split_kv, workgroups_x, workgroups_y, workgroups_z, Tr);
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -13636,7 +13688,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               v_stride, eff_nbv2, eff_nbv3,
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
-                                              gqa_ratio, split_kv, split_k };
+                                              gqa_ratio, split_kv, split_k | split_pmajor_bit };
 
     if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
