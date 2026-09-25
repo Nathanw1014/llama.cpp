@@ -5052,9 +5052,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t pad = ggml_vk_coopmat_shmem_pad(device, bk);
         const bool intel_slm = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
                                device->driver_id == vk::DriverId::eIntelProprietaryWindows;
-        if (intel_slm || pad != 4) {
+        static const uint32_t raster = [] { const char * e = getenv("GGML_VK_MM_RASTER"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
+        if (intel_slm || pad != 4 || raster > 0) {
             spec.push_back(pad);                    // constantID=12: SHMEM_STRIDE_PAD
             spec.push_back(intel_slm ? 1u : 0u);    // constantID=13: APPLY_SLM_A_RESHAPE
+        }
+        if (raster > 0) {
+            spec.push_back(raster);                 // constantID=14: RASTER_GROUP
         }
         return spec;
     };
@@ -5259,6 +5263,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             warptile_env("GGML_VK_WARPTILE_M", m_warptile);
             warptile_env("GGML_VK_WARPTILE_ID_L", l_warptile_id);
             warptile_env("GGML_VK_WARPTILE_ID_M", m_warptile_id);
+            // The quantized dense path runs l_warptile_mmq; its dispatch denominators must follow
+            // BM/BN or a larger tile leaves most of the output unwritten.
+            warptile_env("GGML_VK_WARPTILE_MMQ_L", l_warptile_mmq);
+            l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
+            l_mmq_wg_denoms = { l_warptile_mmq[1], l_warptile_mmq[2], 1 };
         }
 
         // WARP -> required subgroup size, or 0 where the device cannot honor one.

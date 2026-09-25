@@ -204,6 +204,34 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
     buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
     buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
 }
+#elif LOAD_VEC_A == 8 && defined(DATA_A_IQ4_XS)
+// 136 B superblock: d | scales_h (dword 0), scales_l[4] (dword 1), qs[128] = 8 sub-blocks of 16 B (low
+// nibbles k 0..15, high k 16..31). Every field is dword aligned, so the loads are plain dwords; the
+// 6-bit sub-block scale is decoded at store time, one K step after the loads were issued.
+#define A_PREFETCH 1
+#define A_RAW_T uvec4   // xy: the lane's 8 qs bytes, z: d | scales_h << 16, w: scales_l
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 136 + 8 * (row % 2); }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw) {
+    const uint sb   = (pos_a / 32) * 136 + lane_off - 8 * (row % 2);   // superblock byte offset
+    const uint ib32 = (pos_a / 4) % 8;
+    const uint q    = (sb + 8 + 16 * ib32 + 8 * (row % 2)) / 4;       // row >= 2 are the high nibbles
+    raw = uvec4(data_a_u32[q], data_a_u32[q + 1], data_a_u32[sb / 4], data_a_u32[sb / 4 + 1]);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw) {
+    const uint ib32 = (pos_a / 4) % 8;
+    const uint sl = (raw.w >> (4 * ib32)) & 0xF;
+    const uint sh = (raw.z >> (16 + 2 * ib32)) & 3;
+    const float d = unpackHalf2x16(raw.z).x * float(int(sl | (sh << 4)) - 32);
+    const uint nib = 4 * (row / 2);
+    const uint q0 = (raw.x >> nib) & 0x0F0F0F0F;
+    const uint q1 = (raw.y >> nib) & 0x0F0F0F0F;
+    const vec4 v0 = d * vec4(float(kvalues_iq4nl[q0 & 0xFF]), float(kvalues_iq4nl[(q0 >> 8) & 0xFF]), float(kvalues_iq4nl[(q0 >> 16) & 0xFF]), float(kvalues_iq4nl[q0 >> 24]));
+    const vec4 v1 = d * vec4(float(kvalues_iq4nl[q1 & 0xFF]), float(kvalues_iq4nl[(q1 >> 8) & 0xFF]), float(kvalues_iq4nl[(q1 >> 16) & 0xFF]), float(kvalues_iq4nl[q1 >> 24]));
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
 #endif
 
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
@@ -734,6 +762,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, k_pair + 1, FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
                                                    (sign &   8) != 0 ? -v.w : v.w));
 #elif defined(DATA_A_IQ4_XS)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 64;            // 4 values per idx
@@ -751,6 +784,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+#endif
 #elif defined(DATA_A_IQ4_NL)
 #if LOAD_VEC_A == 8
             A_RAW_T raw;
