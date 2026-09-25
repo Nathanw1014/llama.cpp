@@ -8912,6 +8912,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 2560));
     }
+    // id-only f16-output types (Unsloth UD-Q3_K_XL expert gate/up)
+    for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  256, 64, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 200, 70, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  640, 130, 512));
+    }
     // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged
     // M/N; GGML_VK_MM_XL=2 routes every large-tile shape above to XL as well
     for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {

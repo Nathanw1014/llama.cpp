@@ -5582,6 +5582,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ4_NL], matmul_id_subgroup_iq4_nl_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_IQ3_XXS, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f16_d16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ1_M],   matmul_id_subgroup_iq1_m_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -20745,7 +20747,11 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
     if (!ggml_vk_cpy16_target_ok(last, cpy)) { ggml_vk_cpy16_reject(cgraph, node_idx, "cpy target (src/type/contig/shape)"); return false; }
-    if (!ggml_vk_mm_d16_type_ok(src0->type)) { ggml_vk_cpy16_reject(cgraph, node_idx, "weight type"); return false; }
+    // the weight type must have an f16-output id pipeline (IQ3_XXS / IQ4_XS are id-only, so the dense list does not apply).
+    // Those two were added 2026-09-25 for the Unsloth UD-Q3_K_XL expert gate/up (REAP-320 pp2048 ub2048): the 94 separate
+    // CPY(640,10,2048) casts per ubatch (29.6 ms of 2.11 s) disappear and the matmuls cost the same (464.6 vs 467.1 ms)
+    const vk_matmul_pipeline2 & pd16 = ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16[src0->type];
+    if (pd16.f16acc->is_empty() && pd16.f32acc->is_empty()) { ggml_vk_cpy16_reject(cgraph, node_idx, "weight type"); return false; }
     if (!ggml_is_contiguous(src0) || mmid->type != GGML_TYPE_F32) { ggml_vk_cpy16_reject(cgraph, node_idx, "src0 layout / dst type"); return false; }
     if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_mmid_f16b_enabled()))) {
         ggml_vk_cpy16_reject(cgraph, node_idx, "src1 type"); return false;
