@@ -7882,6 +7882,230 @@ struct test_flash_attn_ext_top_k : public test_case {
     }
 };
 
+struct test_qsa_prefill : public test_case {
+    const int dim, queries, keys, selected, streams, ratio;
+    const bool interleaved, poison;
+    ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
+    test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
+        : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
+        q = ggml_permute(ctx,q,0,2,1,3);
+        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
+        mask = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,keys,queries,1,streams);
+        ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
+        auto * out = ggml_flash_attn_ext(ctx,q,k,v,mask,1.0f/sqrtf(dim),0.0f,0.0f);
+        ggml_flash_attn_ext_add_top_k(out,ids,0);
+        ggml_prec_set_acc(out,GGML_PREC_F32);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE && t!=mask && t!=ids) init_tensor_uniform(t);
+        }
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
+        for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) {
+            for (int j=0;j<selected;++j) {
+                int key=1+(j*37+q*13+stream*7)%(keys-4);
+                if (key==3) key=4;
+                if (j==0) key=selected==1 ? 2 : (poison ? 3 : -1);
+                if (j==1) key=2;
+                picks[(stream*queries+q)*selected+j]=key;
+                if (key>=0 && !(poison && key==3)) masks[(stream*queries+q)*keys+key]=ggml_fp32_to_fp16(0.015625f*(key%5-2));
+            }
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+        ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
+        if (poison) {
+            std::vector<ggml_fp16_t> nan(dim,ggml_fp32_to_fp16(NAN));
+            for (auto * t : {k,v}) for (int stream=0;stream<streams;++stream) for (int head=0;head<2;++head) {
+                ggml_backend_tensor_set(t,nan.data(),stream*t->nb[3]+head*t->nb[2]+3*t->nb[1],dim*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
+struct test_qsa_decode : public test_qsa_prefill {
+    const bool duplicates;
+    test_qsa_decode(int q, int keys, int selected, bool poison=false, int ratio=12, bool duplicates=false)
+        : test_qsa_prefill(q,keys,selected,true,poison,1,ratio), duplicates(duplicates) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_DECODE"; }
+    std::string vars() override { return test_qsa_prefill::vars()+",duplicates="+std::to_string(duplicates); }
+    double err(const float * actual, const float * cpu, size_t n) override {
+        const double agreement=nmse(actual,cpu,n);
+        if (queries>8 || selected>2560) return agreement;
+        const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v), mv=tensor_to_float(mask);
+        std::vector<float> reference(n);
+        for (int query=0;query<queries;++query) {
+            std::vector<int> active;
+            for (int key=0;key<keys;++key) if (mv[size_t(query)*keys+key]!=-INFINITY) active.push_back(key);
+            for (int head=0;head<2*ratio;++head) {
+                std::vector<double> scores(active.size()), values(dim,0.0);
+                double maximum=-INFINITY;
+                for (size_t j=0;j<active.size();++j) {
+                    const int key=active[j];double dot=0;
+                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*head)])*kv[d+size_t(dim)*(key+keys*(head/ratio))];
+                    scores[j]=dot/std::sqrt(double(dim))+mv[size_t(query)*keys+key];
+                    maximum=std::max(maximum,scores[j]);
+                }
+                double sum=0;
+                for (size_t j=0;j<active.size();++j) {
+                    const double weight=std::exp(scores[j]-maximum);sum+=weight;
+                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio))];
+                }
+                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*query)]=sum>0 ? float(values[d]/sum) : 0.0f;
+            }
+        }
+        const double gpu_error=nmse(reference.data(),actual,n), cpu_error=nmse(reference.data(),cpu,n);
+        fprintf(stderr,"QSA_FP64 q=%d keys=%d selected=%d ratio=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,ratio,gpu_error,cpu_error);
+        return std::max(agreement,gpu_error);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_qsa_prefill::initialize_tensors(ctx);
+        if (!duplicates) return;
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
+        for (int q=0;q<queries;++q) for (int j=0;j<selected;++j) {
+            const int key=j<selected/2 ? 2 : 4+(j*13+q*7)%(keys-8);
+            picks[q*selected+j]=key;masks[q*keys+key]=ggml_fp32_to_fp16(0.f);
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+        ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
+    }
+};
+
+// Maskless selected-key prefill: the rows name only the visible cells (-1 elsewhere) and no mask is given, as the
+// complete-block selection graph does. Both the backend and the CPU result are checked against a host FP64 oracle
+// over the listed cells.
+struct test_qsa_prefill_maskless : public test_qsa_prefill {
+    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12)
+        : test_qsa_prefill(queries,keys,selected,true,false,1,ratio) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
+        q = ggml_permute(ctx,q,0,2,1,3);
+        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,2,keys,streams);
+        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,2,keys,streams);
+        k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3);
+        mask = nullptr;
+        ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
+        auto * out = ggml_flash_attn_ext(ctx,q,k,v,nullptr,1.0f/sqrtf(dim),0.0f,0.0f);
+        ggml_flash_attn_ext_add_top_k(out,ids,0);
+        ggml_prec_set_acc(out,GGML_PREC_F32);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE && t!=ids) init_tensor_uniform(t);
+        }
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        for (int q=0;q<queries;++q) {
+            for (int j=0;j<selected;++j) {
+                int key=1+(j*37+q*13)%(keys-4);
+                if (j==0) key=selected==1 ? 2 : -1;      // -1: an invisible block's cell
+                if (j==1) key=2;
+                if (j>selected-3 && selected>4) key=-1;  // tail padding
+                picks[q*selected+j]=key;
+            }
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+    }
+    double err(const float * actual, const float * cpu, size_t n) override {
+        const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v);
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids,picks.data(),0,ggml_nbytes(ids));
+        std::vector<float> reference(n);
+        for (int query=0;query<queries;++query) {
+            std::vector<int> active;
+            for (int j=0;j<selected;++j) { const int key=picks[query*selected+j]; if (key>=0 && key<keys && std::find(active.begin(),active.end(),key)==active.end()) active.push_back(key); }
+            for (int head=0;head<2*ratio;++head) {
+                std::vector<double> scores(active.size()), values(dim,0.0);
+                double maximum=-INFINITY;
+                for (size_t j=0;j<active.size();++j) {
+                    const int key=active[j];double dot=0;
+                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*head)])*kv[d+size_t(dim)*(key+keys*(head/ratio))];
+                    scores[j]=dot/std::sqrt(double(dim));
+                    maximum=std::max(maximum,scores[j]);
+                }
+                double sum=0;
+                for (size_t j=0;j<active.size();++j) {
+                    const double weight=std::exp(scores[j]-maximum);sum+=weight;
+                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio))];
+                }
+                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*query)]=sum>0 ? float(values[d]/sum) : 0.0f;
+            }
+        }
+        const double gpu_error=nmse(reference.data(),actual,n);
+        const double cpu_error=nmse(reference.data(),cpu,n);
+        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
+        return std::max(gpu_error,cpu_error);
+    }
+};
+
+// Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
+// backend fuses the whole subgraph into one kernel; the CPU computes it node by node. Exact integer comparison.
+struct test_qsa_expand : public test_case {
+    const int n_blocks, n_query;
+    ggml_tensor * score = nullptr, * cells = nullptr, * tail = nullptr;
+    test_qsa_expand(int n_blocks, int n_query) : n_blocks(n_blocks), n_query(n_query) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_EXPAND"; }
+    std::string vars() override { return VARS_TO_STR2(n_blocks, n_query); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t r = 4, budget = 512;
+        score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_query, 1);
+        cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, 1);
+        tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r-1, n_query, 1);
+        ggml_tensor * blocks=ggml_cont(ctx,ggml_top_k(ctx,score,budget));
+        ggml_tensor * order=ggml_argsort(ctx,ggml_cast(ctx,blocks,GGML_TYPE_F32),GGML_SORT_ORDER_ASC);
+        ggml_tensor * blocks_view=ggml_view_4d(ctx,blocks,1,budget,n_query,1,blocks->nb[0],blocks->nb[1],blocks->nb[2],0);
+        blocks=ggml_reshape_3d(ctx,ggml_get_rows(ctx,blocks_view,order),budget,n_query,1);
+        ggml_tensor * score_view=ggml_view_4d(ctx,score,1,n_blocks,n_query,1,score->nb[0],score->nb[1],score->nb[2],0);
+        ggml_tensor * picked=ggml_get_rows(ctx,score_view,blocks);
+        ggml_tensor * valid=ggml_step(ctx,ggml_scale_bias(ctx,picked,1.0f,1.0f));
+        ggml_tensor * cells_view=ggml_reshape_3d(ctx,cells,r,n_blocks,1);
+        ggml_tensor * flat=ggml_reshape_2d(ctx,blocks,budget*n_query,1);
+        ggml_tensor * out=ggml_get_rows(ctx,cells_view,flat);
+        out=ggml_reshape_4d(ctx,out,r,budget,n_query,1);
+        out=ggml_scale_bias(ctx,ggml_cast(ctx,out,GGML_TYPE_F32),1.0f,1.0f);
+        out=ggml_mul(ctx,out,valid);
+        out=ggml_cast(ctx,ggml_scale_bias(ctx,out,1.0f,-1.0f),GGML_TYPE_I32);
+        out=ggml_reshape_4d(ctx,out,budget*r,n_query,1,1);
+        return ggml_concat(ctx,out,tail,0);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op!=GGML_OP_NONE) continue;
+            if (t==score) {
+                std::vector<float> v((size_t) n_blocks*n_query);
+                for (int q=0;q<n_query;++q) for (int b=0;b<n_blocks;++b) {
+                    // distinct scores (no ties), the blocks past a per-query limit invisible
+                    const int limit = n_blocks - (q*7)%std::max(1,n_blocks-520);
+                    v[(size_t) q*n_blocks+b] = b < limit ? 0.001f*((b*7919+q*104729)%100003) : -INFINITY;
+                }
+                ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
+            } else if (t==cells) {
+                std::vector<int32_t> v((size_t) 4*n_blocks);
+                for (size_t i=0;i<v.size();++i) v[i]=(int32_t)((i*31+5)%(4*n_blocks));
+                ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
+            } else if (t==tail) {
+                std::vector<int32_t> v((size_t) 3*n_query);
+                for (int q=0;q<n_query;++q) for (int j=0;j<3;++j) v[q*3+j]= j < q%4 ? 4*n_blocks-3+j : -1;
+                ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
