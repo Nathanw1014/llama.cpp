@@ -13701,13 +13701,20 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
                                                                    fa_compact.dynamic_kv, use_vt, o_in_regs && !use_mr, fa_compact.slotted, gather_kv,
                                                                    use_mr);
-    // GGML_VK_FA_MR_LAZY=1: skip the per-tile O rescale of row blocks whose running max did not move
-    static const bool fa_mr_lazy = [] {
-        const char * e = getenv("GGML_VK_FA_MR_LAZY");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    if (use_mr && fa_mr_lazy) {
-        fa_pipeline_state.flags |= 4096;
+    // Multi-row FA schedule knobs, each default on (=0 disables), Qwen3.8-27B pp2048 @ d32768, FA op time:
+    //   GGML_VK_FA_MR_LAZY:  skip the O rescale of row blocks whose running max did not move   1171 -> 1095 ms
+    //   GGML_VK_FA_MR_NOEB:  drop the loop-end barrier (no LDS hazard needs it)                 1099 -> 1008 ms
+    //   GGML_VK_FA_MR_VPOST: issue the V^T loads between the S store and the softmax barrier    1099 ->  969 ms
+    //   all three: 954 ms
+    const auto fa_mr_knob = [](const char * name) {
+        const char * e = getenv(name);
+        return e == nullptr || atoi(e) != 0;
+    };
+    static const bool fa_mr_lazy  = fa_mr_knob("GGML_VK_FA_MR_LAZY");
+    static const bool fa_mr_noeb  = fa_mr_knob("GGML_VK_FA_MR_NOEB");
+    static const bool fa_mr_vpost = fa_mr_knob("GGML_VK_FA_MR_VPOST");
+    if (use_mr) {
+        fa_pipeline_state.flags |= (fa_mr_lazy ? 4096 : 0) | (fa_mr_noeb ? 8192 : 0) | (fa_mr_vpost ? 16384 : 0);
     }
 
     vk_pipeline pipeline = nullptr;

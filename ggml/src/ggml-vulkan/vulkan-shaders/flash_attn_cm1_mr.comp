@@ -73,6 +73,10 @@ shared uint32_t resc_sh[NSG];
 // skip the O rescale of a row block whose rows all kept their running max (eM == 1 exactly, so the
 // skipped multiply is an identity and the result is bit-identical); at depth the max rarely moves
 const bool MR_LAZY = (Flags & 4096) != 0;
+// drop the loop-end barrier (hazard argument at the loop end)
+const bool MR_NOEB = (Flags & 8192) != 0;
+// issue the tile's V^T loads right after the S store, before the softmax barrier
+const bool MR_VPOST = (Flags & 16384) != 0;
 
 // 2-bit mask_opt state of 64-key block j for this workgroup's tokens
 uint32_t block_bits(const uint32_t j, const uint32_t mo_offset) {
@@ -192,6 +196,7 @@ void main() {
         const uint32_t nj = (kt + 1 < Bc / KT) ? j : next_block(j, end_j, mo_offset);
         const uint32_t nkey0 = (kt + 1 < Bc / KT) ? key0 + KT : nj * Bc;
 
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> VB[OT];
         {
             // ---- S = Q K^T (this subgroup: row block s_rb, head-dim half s_half) ----
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> SAcc[2];
@@ -206,6 +211,12 @@ void main() {
             }
             SAcc[0] = SAcc[0] + SAcc[1];
             coopMatStore(SAcc[0], s_sh, (s_half * ROWS + s_rb * 16) * sstride, sstride, gl_CooperativeMatrixLayoutRowMajor);
+            if (MR_VPOST) {
+                [[unroll]] for (uint32_t t = 0; t < OT; ++t) {
+                    const uint32_t coord = (v_offset + ((t * NSG + sg) * 16) * v_stride + key0) / 4;
+                    coopMatLoad(VB[t], data_vv4, coord, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+            }
             barrier();
 
             // ---- online softmax ----
@@ -242,11 +253,12 @@ void main() {
             barrier();
 
             // ---- O = diag(eM) O + P V ----
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> VB[OT];
-            [[unroll]] for (uint32_t t = 0; t < OT; ++t) {
-                // V^T [HSV][v_stride]: B[k = key][n = dim] at dim * v_stride + key, column-major
-                const uint32_t coord = (v_offset + ((t * NSG + sg) * 16) * v_stride + key0) / 4;
-                coopMatLoad(VB[t], data_vv4, coord, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+            if (!MR_VPOST) {
+                [[unroll]] for (uint32_t t = 0; t < OT; ++t) {
+                    // V^T [HSV][v_stride]: B[k = key][n = dim] at dim * v_stride + key, column-major
+                    const uint32_t coord = (v_offset + ((t * NSG + sg) * 16) * v_stride + key0) / 4;
+                    coopMatLoad(VB[t], data_vv4, coord, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                }
             }
             [[unroll]] for (uint32_t rb = 0; rb < RB; ++rb) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> PA;
@@ -264,11 +276,19 @@ void main() {
                     OAcc[rb][t] = coopMatMulAdd(PA, VB[t], OAcc[rb][t]);
                 }
             }
-            // the next tile's S store and softmax overwrite s_sh / stage_sh / scale_sh
-            barrier();
+            // the next tile's S store and softmax overwrite s_sh / stage_sh / scale_sh. MR_NOEB: neither needs
+            // this barrier. A subgroup at the next S store has passed this tile's softmax barrier, so every
+            // softmax read of s_sh is done; the next softmax writes P / scale_sh / resc_sh only after the next
+            // S barrier, which every subgroup reaches after finishing this PV.
+            if (!MR_NOEB) {
+                barrier();
+            }
         }
         j = nj;
         key0 = nkey0;
+    }
+    if (MR_NOEB) {
+        barrier();   // the last PV may still read scale_sh
     }
 
     // ---- final per-row factor: sinks, 1 / L ----
