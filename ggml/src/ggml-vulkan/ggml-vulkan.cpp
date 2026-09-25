@@ -21540,7 +21540,17 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
+                    // DSV4_HC_POST -> RMS_NORM (HC_POST_NORM_CPY): without this the grab hoists the next GDN layer's
+                    // state ops (SCALE / GET_ROWS / the conv-state tail copy) between the combine and its norm, which kept
+                    // 34 of the 48 post-FFN combines per graph from fusing on Flash-Next (2026-09-25). Fused for real
+                    // (REAP-320 pp2048 ub2048): 34 x (DSV4_HC_POST 0.94 + RMS_NORM_MUL 0.84 + CPY 0.58 ms) become 34 more
+                    // HC_POST_NORM_CPY at 1.1 ms, -51 ms per ubatch
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_DSV4_HC_POST && graph->nodes[j]->op == GGML_OP_RMS_NORM &&
+                      graph->nodes[j]->src[0] == graph->nodes[c]) &&
+                    // RMS_NORM + MUL + CPY(f16): keep the cast behind the norm's MUL
+                    !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
+                      graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c])) {
                     ok = false;
                     break;
                 }
