@@ -13657,22 +13657,26 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool o_in_regs = (use_vt || gather_kv) && !(fa_oreg_env && fa_oreg_env[0] == '0') && f32acc &&   // gather mode: f32 O accumulators (the pvsh path accumulates in f16: ERR 9e-4 on 512-row lists)
                            ctx->device->driver_id == vk::DriverId::eMesaRadv && ctx->device->architecture == vk_device_architecture::AMD_RDNA3 &&
                            tuning_params.subgroup_size == 64 && tuning_params.block_rows == 16;
-    // Multi-row prefill FA (GGML_VK_FA_MR=1, default off; flash_attn_cm1_mr.comp, after gufo's attention_wmma):
-    // one workgroup of eight wave32 subgroups covers 64 rows = H heads x 64/H tokens that share a KV head,
-    // Q stays in registers and each 16-key K/V tile serves all 64 rows (cm1 pins Br at 16). Reads K from the
-    // contiguized f16 scratch and V from the V^T scratch. GGML_VK_FA_MR_H sets H (default 2 when it divides
-    // the GQA ratio, else 1).
+    // Multi-row prefill FA (flash_attn_cm1_mr.comp, after gufo's attention_wmma): one workgroup of eight
+    // wave32 subgroups covers 64 rows = H heads x 64/H tokens that share a KV head, Q stays in registers
+    // and each 16-key K/V tile serves all 64 rows (cm1 pins Br at 16). Reads K from the contiguized f16
+    // scratch and V from the V^T scratch. GGML_VK_FA_MR_H sets H (default 2 when it divides the GQA ratio,
+    // else 1). Default on where measured: RADV RDNA3, head size 256 (Qwen3.8-27B: FA 2067 -> 954 ms per
+    // ubatch at d32768, pp2048 +21.5%). GGML_VK_FA_MR=0 disables it, =1 enables it for every eligible shape.
     static const int fa_mr_env = [] {
         const char * e = getenv("GGML_VK_FA_MR");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : -1;
     }();
+    const bool fa_mr_on = fa_mr_env > 0 ||
+                          (fa_mr_env < 0 && HSK == 256 && ctx->device->driver_id == vk::DriverId::eMesaRadv &&
+                           ctx->device->architecture == vk_device_architecture::AMD_RDNA3);
     static const int fa_mr_h_env = [] {
         const char * e = getenv("GGML_VK_FA_MR_H");
         return e ? atoi(e) : 0;
     }();
     const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
     uint32_t mr_h = fa_mr_h_env > 0 ? (uint32_t)fa_mr_h_env : ((qk_ratio_mr % 2) == 0 ? 2u : 1u);
-    const bool use_mr = fa_mr_env != 0 && use_vt && f32acc && !gather_kv && !fa_compact.active && !gqa_fold &&
+    const bool use_mr = fa_mr_on && use_vt && f32acc && !gather_kv && !fa_compact.active && !gqa_fold &&
                         tuning_params.path == FA_COOPMAT1 && gqa_ratio == 1 &&
                         k_type_eff == GGML_TYPE_F16 && HSK == HSV && (HSK == 128 || HSK == 256) &&
                         (mr_h == 1 || mr_h == 2 || mr_h == 4) && qk_ratio_mr > 0 && (qk_ratio_mr % mr_h) == 0 &&
