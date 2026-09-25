@@ -10600,6 +10600,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // multi-row prefill FA shapes (Vulkan GGML_VK_FA_MR): 64-row workgroups of H heads x 64/H tokens,
+    // ragged last token blocks (nb 77, 130, 200), GQA 6 / 4 / 2, no mask, sinks, dequantized K/V
+    for (auto perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 77, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, perm));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 512, 130, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, perm));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 2048, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, perm));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 512, 64, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, perm));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 96, true, true, 8.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, perm));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -11168,6 +11177,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {32, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // hd256 stride probe (35B-class geometry): contiguous vs dense-permuted cache layout
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // Qwen3.8-27B prefill (hs256, 24 heads / 4 KV heads, KV-cache layout): ub2048 at d0 / 8k / 32k
+    for (int64_t kv : { 2048, 10240, 34816 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    }
 
     // speculative verification at depth, Qwen3.8-27B attention geometry (hs 256, 4 KV heads, GQA 6)
     // and Flash-Next (2 KV heads, GQA 12): nb 1 is plain decode, 2-8 the MTP/DFlash2 verify widths.

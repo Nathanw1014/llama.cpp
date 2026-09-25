@@ -4204,7 +4204,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool use_dynamic_kv = false, bool use_vt = false, bool o_in_regs = false, bool slotted = false, bool gather_kv = false) {
+                                                  bool use_dynamic_kv = false, bool use_vt = false, bool o_in_regs = false, bool slotted = false, bool gather_kv = false,
+                                                  bool use_mr = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4216,7 +4217,8 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (use_vt            ? 32 : 0) |
                      (o_in_regs         ? 64 : 0) |
                      (slotted           ? 256 : 0) |
-                     (gather_kv         ? 512 : 0);
+                     (gather_kv         ? 512 : 0) |
+                     (use_mr            ? 1024 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -5020,6 +5022,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                if (fa.first.flags & 1024) {
+                    // multi-row prefill FA (GGML_VK_FA_MR): f32 accumulation, aligned only
+                    GGML_ASSERT(f32acc && aligned);
+                    spv_data = flash_attn_f32_f16_mr_cm1_data;
+                    spv_size = flash_attn_f32_f16_mr_cm1_len;
+                    name = "flash_attn_f32_f16_mr_cm1";
+                }
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -13648,9 +13657,58 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool o_in_regs = (use_vt || gather_kv) && !(fa_oreg_env && fa_oreg_env[0] == '0') && f32acc &&   // gather mode: f32 O accumulators (the pvsh path accumulates in f16: ERR 9e-4 on 512-row lists)
                            ctx->device->driver_id == vk::DriverId::eMesaRadv && ctx->device->architecture == vk_device_architecture::AMD_RDNA3 &&
                            tuning_params.subgroup_size == 64 && tuning_params.block_rows == 16;
+    // Multi-row prefill FA (GGML_VK_FA_MR=1, default off; flash_attn_cm1_mr.comp, after gufo's attention_wmma):
+    // one workgroup of eight wave32 subgroups covers 64 rows = H heads x 64/H tokens that share a KV head,
+    // Q stays in registers and each 16-key K/V tile serves all 64 rows (cm1 pins Br at 16). Reads K from the
+    // contiguized f16 scratch and V from the V^T scratch. GGML_VK_FA_MR_H sets H (default 2 when it divides
+    // the GQA ratio, else 1).
+    static const int fa_mr_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR");
+        return e ? atoi(e) : 0;
+    }();
+    static const int fa_mr_h_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR_H");
+        return e ? atoi(e) : 0;
+    }();
+    const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
+    uint32_t mr_h = fa_mr_h_env > 0 ? (uint32_t)fa_mr_h_env : ((qk_ratio_mr % 2) == 0 ? 2u : 1u);
+    const bool use_mr = fa_mr_env != 0 && use_vt && f32acc && !gather_kv && !fa_compact.active && !gqa_fold &&
+                        tuning_params.path == FA_COOPMAT1 && gqa_ratio == 1 &&
+                        k_type_eff == GGML_TYPE_F16 && HSK == HSV && (HSK == 128 || HSK == 256) &&
+                        (mr_h == 1 || mr_h == 2 || mr_h == 4) && qk_ratio_mr > 0 && (qk_ratio_mr % mr_h) == 0 &&
+                        neq2 == (int64_t)qk_ratio_mr * nek2 && nek2 == nev2 &&
+                        (mask == nullptr || (mask->type == GGML_TYPE_F16 && nem2 <= 1 && nem3 <= 1)) &&
+                        (q_stride % 4) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
+                        (k_stride % 8) == 0 && (nbk2_eff % 16) == 0 && (nbk3_eff % 16) == 0 &&
+                        ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && 32 <= ctx->device->subgroup_max_size;
+    if (use_mr) {
+        tuning_params.block_rows = 64 / mr_h;
+        tuning_params.block_cols = 64;
+        tuning_params.row_split = mr_h;
+        tuning_params.subgroup_size = 32;
+        tuning_params.workgroup_size = 256;
+        tuning_params.shmem_staging = 0;
+        tuning_params.disable_subgroups = false;
+        tuning_params.limit_occupancy_shmem = 0;
+        workgroups_y = (uint32_t)neq2 / mr_h;
+        if (split_pmajor_log()) {
+            fprintf(stderr, "[fa-mr] engaged N=%u KV=%u hs=%u heads=%u H=%u gqa=%u mask=%d mask_opt=%d wg=(%u,%u,%u)\n",
+                    N, KV, HSK, (uint32_t)neq2, mr_h, qk_ratio_mr, mask != nullptr, (int)use_mask_opt,
+                    CEIL_DIV((uint32_t)neq1, 64 / mr_h), workgroups_y, workgroups_z);
+        }
+    }
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   fa_compact.dynamic_kv, use_vt, o_in_regs, fa_compact.slotted, gather_kv);
+                                                                   fa_compact.dynamic_kv, use_vt, o_in_regs && !use_mr, fa_compact.slotted, gather_kv,
+                                                                   use_mr);
+    // GGML_VK_FA_MR_LAZY=1: skip the per-tile O rescale of row blocks whose running max did not move
+    static const bool fa_mr_lazy = [] {
+        const char * e = getenv("GGML_VK_FA_MR_LAZY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (use_mr && fa_mr_lazy) {
+        fa_pipeline_state.flags |= 4096;
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -13685,8 +13743,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gather_kv) {
+    if (gather_kv || use_mr) {
         // gathered per-token FA: one workgroup per (token, kv head), no split (split_kv carries the mask stride)
+        // multi-row FA: prefill only, enough workgroups without a split
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
