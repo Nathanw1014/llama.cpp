@@ -333,6 +333,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp LINK ggml)
     llama_build_and_test(test-quantize-fns.cpp LINK ggml)
+    llama_build_and_test(test-tq2t.cpp LINK ggml)
+    target_compile_definitions(test-tq2t PRIVATE TQ2T_REF_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/data/tq2t_ref.bin")
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
 
     # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.
