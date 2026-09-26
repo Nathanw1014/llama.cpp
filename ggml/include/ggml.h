@@ -438,7 +438,11 @@ extern "C" {
         // Trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, hashed
         // 2-D "Hyb" codebook), group 128.
         GGML_TYPE_TQ2_T   = 144,
-        GGML_TYPE_COUNT   = 145,
+        // Bit-packed trellis siblings of TQ2_T (K = 6 / 7 new bits per 4-weight step,
+        // same codebook): 1.625 / 1.875 bpw, group 128.
+        GGML_TYPE_TQK6    = 145,
+        GGML_TYPE_TQK7    = 146,
+        GGML_TYPE_COUNT   = 147,
     };
 
     // precision
@@ -485,6 +489,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
         GGML_FTYPE_MOSTLY_TQ2_T  = 130, // except 1d tensors (trellis-coded, group 128)
+        GGML_FTYPE_MOSTLY_TQK6   = 131, // except 1d tensors (trellis-coded K=6, group 128)
+        GGML_FTYPE_MOSTLY_TQK7   = 132, // except 1d tensors (trellis-coded K=7, group 128)
     };
 
     // available tensor operations:
