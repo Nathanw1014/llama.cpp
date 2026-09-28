@@ -3642,6 +3642,44 @@ struct test_rms_norm_mul_mul : public test_case {
     }
 };
 
+// build_gdn_l2_norm: scale(rms_norm(x, eps/n), 1/sqrt(n)), fused on Vulkan as RMS_NORM_SCALE.
+// v: the input is a strided view (the GDN q/k are column slices of the conv output).
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool v;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, v);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 9, 1}, float eps = 1e-6f, bool v = false)
+        : ne(ne), eps(eps), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * 3, ne[2], ne[3], 1);
+            ggml_set_name(big, "big");
+            a = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float), big->nb[1], big->nb[2], ne[0] * ne[1] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
+        const float n = (float) ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps / n), 1.0f / sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -8936,6 +8974,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 9, 1}));
     test_cases.emplace_back(new test_rms_norm_mul_mul({100, 3, 5, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));
+    test_cases.emplace_back(new test_rms_norm_scale({256, 8, 3, 1}, 1e-5f, true));
+    test_cases.emplace_back(new test_rms_norm_scale({512, 4, 3, 1}));   // too wide for the small kernel: unfused
     test_cases.emplace_back(new test_ssm_conv_direct(100, 33, 2, 4));
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 64, 1, 4));
     // sliding-window direct conv: fewer tokens than the window, ragged token tiles (8 per thread, 32 per
@@ -10881,6 +10924,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 48, 2048, 1}, false, 1e-6f));
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 24, 2048, 1}, false, 1e-6f));
     test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 2048, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 2048, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 2048, 1, 4));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, 2048));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 2048));

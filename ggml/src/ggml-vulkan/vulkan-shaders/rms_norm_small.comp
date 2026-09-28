@@ -21,6 +21,9 @@ layout (constant_id = 1) const bool do_multiply = false;
 // contiguous and the same shape as the destination, so it shares the destination index
 layout (constant_id = 2) const bool do_multiply2 = false;
 layout (binding = 3) readonly buffer C {float data_c[];};
+// RMS_NORM + SCALE (the GDN q/k l2 norm): multiply by p.param2 on the store. The product is
+// rounded to f32 first, then scaled, the same two roundings as the separate SCALE op.
+layout (constant_id = 3) const bool do_post_scale = false;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -65,6 +68,11 @@ void main() {
             for (uint col = lane; col < ncols; col += sgsize) {
                 data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
             }
+        }
+    } else if (do_post_scale) {
+        for (uint col = lane; col < ncols; col += sgsize) {
+            const float y = float(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[d_offset + col] = D_TYPE(y * p.param2);
         }
     } else {
         for (uint col = lane; col < ncols; col += sgsize) {

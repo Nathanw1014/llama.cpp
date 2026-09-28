@@ -1021,6 +1021,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_small_f32;      // one subgroup per row, ne00 <= 256
     vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_mul_small_f32;  // + second multiplier (gated norm)
+    vk_pipeline pipeline_rms_norm_scale_small_f32;    // + SCALE (the GDN q/k l2 norm)
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
@@ -2663,6 +2664,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_rms_norm_scale {};   // RMS_NORM+SCALE (the GDN q/k l2 norm)
     bool skip_node {};              // the current node's result is never read: record nothing
     bool topk_qsa_cont_skipped {};  // the TOPK_QSA transpose was skipped; the fused dispatch must sync
     int  topk_qsa_cont_consumer = -1; // node index of the GET_ROWS that starts the fusion reading it
@@ -6355,6 +6357,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_small_f32, "rms_norm_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32, "rms_norm_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_small_f32, "rms_norm_mul_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_small_f32, "rms_norm_scale_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
 
@@ -14368,6 +14371,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16 && ctx->num_additional_fused_ops == 2 && !ctx->do_add_rms_partials) {
             return ctx->device->pipeline_rms_norm_mul_f32_f16;
         }
+        if (ctx->fused_rms_norm_scale) {
+            return ctx->device->pipeline_rms_norm_scale_small_f32;
+        }
         if (ggml_vk_rms_norm_small(ctx, src0, dst, src2)) {
             if (src2 != nullptr) {
                 return ctx->device->pipeline_rms_norm_mul_mul_small_f32;
@@ -16587,7 +16593,14 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const bool fused_cpy  = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 2]->op == GGML_OP_CPY;
     const bool fused_mul2 = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 2]->op == GGML_OP_MUL;
     const ggml_tensor * src2 = nullptr;   // second multiplier of RMS_NORM+MUL+MUL
-    if (ctx->num_additional_fused_ops > 0) {
+    float post_scale = 0.0f;
+    if (ctx->fused_rms_norm_scale) {
+        // RMS_NORM+SCALE: the scale's tensor is the destination and its factor rides in param2
+        // (unused by the norm); the fusion requires a zero bias
+        dst  = cgraph->nodes[node_idx + 1];
+        src0 = src1 = cgraph->nodes[node_idx]->src[0];
+        post_scale = ggml_get_op_params_f32(dst, 0);
+    } else if (ctx->num_additional_fused_ops > 0) {
         // fused rms_norm + mul (+ cpy to f16: the cpy's tensor is the destination; + mul: the second mul's)
         ggml_tensor *mul = cgraph->nodes[node_idx + 1];
         ggml_tensor *other_src = mul->src[0] == cgraph->nodes[node_idx + 0] ? mul->src[1] : mul->src[0];
@@ -16614,7 +16627,7 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        op_params[0], 0.0f, (int32_t)param3,
+        op_params[0], post_scale, (int32_t)param3,
     };
 
     // more than one fused op (and not the cpy / second-mul fusions) means rms_norm+mul+rope
@@ -20060,6 +20073,17 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
 
+// RMS_NORM+SCALE fusion (the GDN q/k l2 norm); also keeps the SCALE behind its norm in graph_optimize.
+// Default on (same two f32 roundings: Flash-Next KLD c4096x4 identical to the same-binary control,
+// -11.4 ms per 2048-token ubatch); GGML_VK_FUSE_RMS_NORM_SCALE=0 disables.
+static bool ggml_vk_fuse_rms_norm_scale_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_FUSE_RMS_NORM_SCALE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -20109,6 +20133,17 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
             return false;
         }
         return true;
+    }
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        // RMS_NORM+SCALE (short rows only): build_gdn_l2_norm is scale(rms_norm(x, eps/n), 1/sqrt(n)),
+        // 72 pairs of (128,16,2048) per Flash-Next ubatch. The norm kernel applies the factor as it
+        // stores: one 16 MB write instead of write + read + write.
+        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor *scale    = cgraph->nodes[node_idx + 1];
+        return ggml_vk_fuse_rms_norm_scale_enabled() && scale->src[0] == rms_norm && ggml_get_op_params_f32(scale, 1) == 0.0f &&
+               rms_norm->src[0]->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(scale) && ggml_is_contiguous_rows(rms_norm->src[0]) &&
+               ggml_vk_rms_norm_small(ctx, rms_norm->src[0], scale) && ctx->device->pipeline_rms_norm_scale_small_f32;
     }
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         // additional constraints specific to this fusion
@@ -21145,6 +21180,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
+        ctx->fused_rms_norm_scale = false;
         ctx->skip_node = false;
         const char *fusion_string {};
         // cont(permute(score)) feeding a TOPK_QSA fusion that reads score directly: the transpose
@@ -21265,6 +21301,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_rms_norm_scale = true;
+                fusion_string = "RMS_NORM_SCALE";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
@@ -21450,6 +21492,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
+                ctx->fused_rms_norm_scale = false;
             }
         }
         // a skipped transpose must be consumed by the fused dispatch right after it
@@ -21727,6 +21770,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     // RMS_NORM + MUL + MUL (the GDN gated norm, RMS_NORM_MUL_MUL): keep the gate MUL behind the gamma MUL
                     !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
                       graph->nodes[j]->op == GGML_OP_MUL && (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c])) &&
+                    // RMS_NORM -> SCALE (RMS_NORM_SCALE, the GDN q/k l2 norm): keep the scale behind its norm
+                    !(ggml_vk_fuse_rms_norm_scale_enabled() && j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE &&
+                      graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     // CONCAT(state, x^T) -> SSM_CONV (CONCAT_SSM_CONV_SILU), same hoisting problem
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_CONCAT && graph->nodes[j]->op == GGML_OP_SSM_CONV &&
                       graph->nodes[j]->src[0] == graph->nodes[c])) {
