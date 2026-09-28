@@ -2663,6 +2663,9 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool skip_node {};              // the current node's result is never read: record nothing
+    bool topk_qsa_cont_skipped {};  // the TOPK_QSA transpose was skipped; the fused dispatch must sync
+    int  topk_qsa_cont_consumer = -1; // node index of the GET_ROWS that starts the fusion reading it
     // the fused top-k's output tensor aliases one of its sources (ggml-alloc reuses the freed
     // intermediates); write the result to scratch and copy it out instead of dropping the fusion
     bool fused_topk_qsa_out_scratch {};
@@ -17211,6 +17214,47 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 
 static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 
+// The TOPK_QSA fusion's GET_ROWS reads cont(permute(score)). When score itself (contiguous
+// [n_blocks, n_tps, n_stream]) is still intact at the fused dispatch, the kernel reads it directly:
+// consecutive blocks are then consecutive floats, so the gather coalesces.
+//
+// That source is NOT an input of the fused node: its allocator lifetime ended at the cont, which
+// ran before this node, so ggml-alloc may already have placed any node between the cont and
+// this one (or the fused output itself) on its memory. Reading it then returns overwritten
+// scores: wrong top-k cells, no crash. Flash-Next keep-320 wiki c8192 PPL 3.36/3.03 vs 2.45/2.19
+// on the CPU backend (2026-09-14, section 52). Read it only when nothing in that window overlaps.
+static const ggml_tensor * ggml_vk_topk_qsa_direct_src(const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * top_k) {
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx];
+    const ggml_tensor * scores   = get_rows->src[0];
+    const ggml_tensor * cell_blk = get_rows->src[1];
+    if (scores->op != GGML_OP_CONT || scores->src[0]->op != GGML_OP_PERMUTE) {
+        return nullptr;
+    }
+    const ggml_tensor * src = scores->src[0]->src[0];
+    if (src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        src->ne[0] != scores->ne[1] || src->ne[1] != scores->ne[0] || src->ne[2] != scores->ne[2] || src->ne[3] != 1 ||
+        cell_blk->ne[1] != scores->ne[2] || src->buffer == nullptr) {
+        return nullptr;
+    }
+    int cont_idx = -1;
+    for (int j = node_idx - 1; j >= 0; --j) {
+        if (cgraph->nodes[j] == scores) { cont_idx = j; break; }
+    }
+    if (cont_idx < 0) {
+        return nullptr;
+    }
+    if (top_k->buffer == src->buffer && ggml_vk_tensors_overlap(top_k, src, false)) {
+        return nullptr;
+    }
+    for (int j = cont_idx + 1; j < node_idx; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->buffer != nullptr && t->buffer == src->buffer && ggml_vk_tensors_overlap(t, src, false)) {
+            return nullptr;
+        }
+    }
+    return src;
+}
+
 static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
@@ -17272,39 +17316,17 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    // read the untransposed block scores when the graph's cont(permute(score)) exposes them:
-    // consecutive blocks are then consecutive floats, so the gather coalesces.
-    //
-    // That source is NOT an input of this node: its allocator lifetime ended at the cont, which
-    // ran before this node, so ggml-alloc may already have placed any node between the cont and
-    // this one (or the fused output itself) on its memory. Reading it then returns overwritten
-    // scores: wrong top-k cells, no crash. Flash-Next keep-320 wiki c8192 PPL 3.36/3.03 vs 2.45/2.19
-    // on the CPU backend (2026-09-14, section 52). Read it only when nothing in that window overlaps.
+    // read the untransposed block scores when the graph's cont(permute(score)) exposes them
     const ggml_tensor * a = scores;
     uint32_t a_st_t = 1, a_st_b = n_tps, a_st_s = n_tps * n_blocks;
-    if (scores->op == GGML_OP_CONT && scores->src[0]->op == GGML_OP_PERMUTE) {
-        const ggml_tensor * src = scores->src[0]->src[0];
-        if (src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
-            src->ne[0] == n_blocks && src->ne[1] == n_tps && src->ne[2] == n_stream && src->ne[3] == 1 &&
-            src->buffer != nullptr) {
-            int cont_idx = -1;
-            for (int j = node_idx - 1; j >= 0; --j) {
-                if (cgraph->nodes[j] == scores) { cont_idx = j; break; }
-            }
-            bool src_live = cont_idx >= 0 && top_k->buffer == src->buffer && !ggml_vk_tensors_overlap(top_k, src, false);
-            if (cont_idx >= 0 && top_k->buffer != src->buffer) {
-                src_live = true;   // different buffers cannot alias
-            }
-            for (int j = cont_idx + 1; src_live && j < node_idx; ++j) {
-                const ggml_tensor * t = cgraph->nodes[j];
-                if (t->buffer != nullptr && t->buffer == src->buffer && ggml_vk_tensors_overlap(t, src, false)) {
-                    src_live = false;
-                }
-            }
-            if (src_live) {
-                a = src;
-                a_st_t = n_blocks; a_st_b = 1; a_st_s = n_blocks * n_tps;
-            }
+    if (const ggml_tensor * src = ggml_vk_topk_qsa_direct_src(cgraph, node_idx, top_k)) {
+        a = src;
+        a_st_t = n_blocks; a_st_b = 1; a_st_s = n_blocks * n_tps;
+        // the skipped CONT (see skip_node) was the only node whose read of src made the dependency
+        // tracker order this dispatch after src's producer; order it explicitly
+        if (ctx->topk_qsa_cont_skipped) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            ctx->topk_qsa_cont_skipped = false;
         }
     }
 
@@ -18751,7 +18773,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * 
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
-    if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
+    if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer || ctx->skip_node) {
         return false;
     }
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -21123,8 +21145,35 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
+        ctx->skip_node = false;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        // cont(permute(score)) feeding a TOPK_QSA fusion that reads score directly: the transpose
+        // is written and never read (Flash-Next at d32768: 12 x 1.74 ms per 2048-token ubatch)
+        if (!ctx->device->disable_fusion && cgraph->nodes[i]->op == GGML_OP_CONT && i + 1 < cgraph->n_nodes) {
+            // default on (exact: KLD c4096x4 identical to the same-binary control); =0 disables
+            static const bool skip_ok = !(getenv("GGML_VK_TOPK_QSA_SKIP_CONT") && atoi(getenv("GGML_VK_TOPK_QSA_SKIP_CONT")) == 0);
+            static const bool scratch_ok = !(getenv("GGML_VK_TOPK_QSA_SCRATCH") && atoi(getenv("GGML_VK_TOPK_QSA_SCRATCH")) == 0);
+            // the fused dispatch never falls back to the unfused chain while the scratch route is on
+            // the consumer GET_ROWS need not be adjacent: the graph optimizer can place independent nodes
+            // (the mask cast, views) between them; direct_src then checks none of those overwrote score
+            int g = -1;
+            for (int j = i + 1; j < std::min(i + 8, cgraph->n_nodes); ++j) {
+                if (cgraph->nodes[j]->op == GGML_OP_GET_ROWS && cgraph->nodes[j]->src[0] == cgraph->nodes[i]) { g = j; break; }
+            }
+            if (skip_ok && scratch_ok && g > 0 && ggml_node_has_n_uses(cgraph, i, 1) &&
+                g + (int) topk_qsa_pattern.size() <= cgraph->n_nodes &&
+                ggml_vk_can_fuse_topk_qsa(ctx, cgraph, g) &&
+                ggml_vk_topk_qsa_direct_src(cgraph, g, cgraph->nodes[g + topk_qsa_pattern.size() - 1])) {
+                ctx->skip_node = true;
+                ctx->topk_qsa_cont_skipped = true;
+                ctx->topk_qsa_cont_consumer = g;
+            }
+            static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+            if (dbg && skip_ok && g > 0) {
+                fprintf(stderr, "ggml_vulkan: TOPK_QSA cont skip at node %d (consumer +%d): %s\n", i, g - i, ctx->skip_node ? "skipped" : "kept");
+            }
+        }
+        if (!ctx->device->disable_fusion && !ctx->skip_node) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -21403,6 +21452,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa_out_scratch = false;
             }
         }
+        // a skipped transpose must be consumed by the fused dispatch right after it
+        GGML_ASSERT(!ctx->topk_qsa_cont_skipped || i != ctx->topk_qsa_cont_consumer || ctx->fused_topk_qsa);
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
