@@ -17,6 +17,20 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = TO_BUF(value);
 }
 
+// Register reuse across K steps (register-prefetch loop only). The q5_K qh dword serves all eight
+// BK = 32 steps of a superblock, as do the iq4_xs d/scale words, so fetch_a loads them once per
+// superblock and keeps the register otherwise (pos_a is uniform, so the skip is a scalar branch).
+// a_fetch_all forces full fetches: for the prologue (split-k may start anywhere in a superblock) and
+// for the non-prefetch loaders, which call fetch_a with a fresh raw. GGML_VK standalone dispatcher,
+// 3 interleaved runs, 2026-09-28, 17408x2048x5120 / 5120x2048x17408: q5_K 256x256 tile 1.14x/1.10x,
+// 128x128 1.12x/1.08x; iq4_xs 256x256 1.035x/1.02x, 128x128 1.04x/1.01x. Tried and not kept: the
+// q4_K/q5_K qs dword (it holds two consecutive steps' nibbles): q4_K 256x256 0.95x (ACO added ~100
+// copies to the loop), q5_K no change over qh alone; the q6_K qh group (serves 4 steps): 0.90-0.97x.
+#if !defined(NO_A_REUSE)
+#define A_REUSE 1
+#endif
+bool a_fetch_all = true;
+
 // ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
 // One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned).
 // fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
@@ -211,11 +225,15 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
 #define A_PREFETCH 1
 #define A_RAW_T uvec4   // xy: the lane's 8 qs bytes, z: d | scales_h << 16, w: scales_l
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 136 + 8 * (row % 2); }
-void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw) {
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, inout uvec4 raw) {
     const uint sb   = (pos_a / 32) * 136 + lane_off - 8 * (row % 2);   // superblock byte offset
     const uint ib32 = (pos_a / 4) % 8;
     const uint q    = (sb + 8 + 16 * ib32 + 8 * (row % 2)) / 4;       // row >= 2 are the high nibbles
-    raw = uvec4(data_a_u32[q], data_a_u32[q + 1], data_a_u32[sb / 4], data_a_u32[sb / 4 + 1]);
+    raw.xy = uvec2(data_a_u32[q], data_a_u32[q + 1]);
+#if defined(A_REUSE)
+    if (a_fetch_all || ib32 == 0)   // d | scales_h, scales_l: once per superblock
+#endif
+    raw.zw = uvec2(data_a_u32[sb / 4], data_a_u32[sb / 4 + 1]);
 }
 void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw) {
     const uint ib32 = (pos_a / 4) % 8;
@@ -890,15 +908,20 @@ uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 25
 #else
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 44 + row; }   // block_q5_K = 44 dwords
 #endif
-void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, inout A_RAW_T raw) {
     const uint kb  = pos_a / 64;
     const uint sub = (pos_a % 64) / 8;
 #if defined(DATA_A_Q4_K)
     // dword layout of block_q4_K: dm (1), scales (3), qs (32)
+    // (no A_REUSE here: skipping the odd-step qs load made ACO add ~100 copies to the 256x256 loop, -5%)
     raw = data_a_u32[kb * 36 + lane_off + 4 + 8 * (sub / 2)];
 #else
     // dword layout of block_q5_K: dm (1), scales (3), qh (8), qs (32); lane_off counts 44-dword blocks
     raw.x = data_a_u32[kb * 44 + lane_off + 12 + 8 * (sub / 2)];
+#if defined(A_REUSE)
+    // the qh dword of a lane is the same for all 8 sub-blocks of a superblock (bit sub selects)
+    if (a_fetch_all || sub == 0)
+#endif
     raw.y = data_a_u32[kb * 44 + lane_off + 4];
 #endif
 }
@@ -1016,7 +1039,18 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
     store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(dl * (qs.x - hm.x), dl * (qs.y - hm.y)));
 }
 #endif
-#if defined(COOPMAT) && LOAD_VEC_B == 8 && !defined(DATA_B_BF16)
+#if defined(COOPMAT) && LOAD_VEC_B == 8 && !defined(DATA_B_BF16) && defined(B_RAW_U4) && defined(BUF_MANUAL) && !defined(MUL_MAT_ID)
+#define B_PREFETCH 1
+void fetch_b(const uint pos_b, const uint row, const uint col, out uvec4 raw) {
+    raw = data_b_u4[pos_b + col * p.stride_b / LOAD_VEC_B + row];
+}
+void store_b_raw(const uint buf_idx, const uvec4 raw) {
+    buf_b[buf_idx + 0] = raw.x;
+    buf_b[buf_idx + 1] = raw.y;
+    buf_b[buf_idx + 2] = raw.z;
+    buf_b[buf_idx + 3] = raw.w;
+}
+#elif defined(COOPMAT) && LOAD_VEC_B == 8 && !defined(DATA_B_BF16)
 #define B_PREFETCH 1
 void fetch_b(const uint pos_b, const uint row, const uint col, out B_TYPE raw) {
 #ifdef MUL_MAT_ID
