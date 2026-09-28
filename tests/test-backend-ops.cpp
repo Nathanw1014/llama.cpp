@@ -10941,6 +10941,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 64, 0, 64, false, 1, 0, GGML_TYPE_F16, 128, 24, 2, false, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 64, 0, 64, false, 1, 0, GGML_TYPE_F16, 256, 12, 1, false, false));
+    // GQA speculative verify batches (2..8 tokens, separate V): Vulkan runs these as per-token
+    // single-token FAs (decode's compaction and split); 2304/2051 is the QSA shape whose
+    // per-token gather declines (kv < 2*kv_c), 4096/512 the one where it engages
+    for (int64_t nb : {2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, nb, 0,  512, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, false));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(2304, nb, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, false));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
