@@ -2315,6 +2315,20 @@ struct llama_model_qwen35 : public llama_model_base {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
+
+    // LLAMA_PLE_HOT=<sidecar>: a device-resident copy of the most frequent PLE table rows (bytes
+    // copied from the table, lossless). The host gather resolves each lookup to a hot slot or a
+    // miss and reads only the misses from the mapping. Loaded on the first graph build.
+    struct ple_hot_cache {
+        bool                  tried = false;
+        std::vector<int32_t>  ids;             // ascending global row ids; slot = position
+        struct ggml_context * ctx   = nullptr;
+        ggml_backend_buffer_t buf   = nullptr;
+        struct ggml_tensor *  tbl   = nullptr; // [head_dim, n_hot], the table's type
+    };
+    mutable ple_hot_cache ple_hot;
+    const struct ggml_tensor * ple_hot_table(ggml_backend_buffer_type_t buft) const;
 
     class llm_graph_input_qsa;
     class llm_graph_input_hc_consts;

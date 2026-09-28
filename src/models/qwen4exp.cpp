@@ -3,6 +3,8 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <thread>
+#include <atomic>
+#include <cstring>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1450,6 +1452,87 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     return cur;
 }
 
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    if (ple_hot.buf) { ggml_backend_buffer_free(ple_hot.buf); }
+    if (ple_hot.ctx) { ggml_free(ple_hot.ctx); }
+}
+
+// LLAMA_PLE_HOT=<sidecar> (scripts/flash-next/make_ple_hot.py): load the hot rows into a buffer of
+// buft once. Any mismatch with the loaded table (type, row size, row count, or the bytes of sampled
+// rows) disables the cache with a warning, so a sidecar can never change the output.
+const ggml_tensor * llama_model_qwen4exp::ple_hot_table(ggml_backend_buffer_type_t buft) const {
+    if (ple_hot.tried) {
+        return ple_hot.tbl;
+    }
+    ple_hot.tried = true;
+    const char * path = getenv("LLAMA_PLE_HOT");
+    const ggml_tensor * t = per_layer_tok_embd;
+    if (path == nullptr || *path == 0 || t == nullptr || t->data == nullptr) {
+        return nullptr;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t row_sz = ggml_row_size(t->type, t->ne[0]);
+    FILE * f = fopen(path, "rb");
+    auto fail = [&](const char * why) -> const ggml_tensor * {
+        LLAMA_LOG_WARN("%s: LLAMA_PLE_HOT=%s not used: %s\n", __func__, path, why);
+        if (f) { fclose(f); }
+        ple_hot.ids.clear();
+        return nullptr;
+    };
+    if (!f) { return fail("cannot open"); }
+    char magic[8];
+    uint32_t hdr_row = 0, hdr_type = 0;
+    uint64_t hdr_rows = 0, n_hot = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PLEHOT01", 8) != 0 ||
+        fread(&hdr_row, 4, 1, f) != 1 || fread(&hdr_type, 4, 1, f) != 1 ||
+        fread(&hdr_rows, 8, 1, f) != 1 || fread(&n_hot, 8, 1, f) != 1) {
+        return fail("bad header");
+    }
+    if (hdr_row != row_sz || hdr_type != (uint32_t) t->type || hdr_rows != (uint64_t) t->ne[1] || n_hot == 0 || n_hot > (uint64_t) INT32_MAX) {
+        return fail("sidecar was built for a different table");
+    }
+    ple_hot.ids.resize(n_hot);
+    if (fread(ple_hot.ids.data(), sizeof(int32_t), n_hot, f) != n_hot) { return fail("short read (ids)"); }
+    for (size_t i = 0; i < n_hot; ++i) {
+        if (ple_hot.ids[i] < 0 || ple_hot.ids[i] >= t->ne[1] || (i > 0 && ple_hot.ids[i] <= ple_hot.ids[i-1])) {
+            return fail("ids are not ascending table rows");
+        }
+    }
+    const long data_off = (long) ((24 + 4 * n_hot + 63) / 64 * 64);
+    if (fseek(f, data_off, SEEK_SET) != 0) { return fail("seek"); }
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ple_hot.ctx = ggml_init(ip);
+    ple_hot.tbl = ggml_new_tensor_2d(ple_hot.ctx, t->type, t->ne[0], (int64_t) n_hot);
+    ggml_set_name(ple_hot.tbl, "per_layer_token_embd.hot");
+    ple_hot.buf = ggml_backend_alloc_ctx_tensors_from_buft(ple_hot.ctx, buft);
+    if (!ple_hot.buf) { ple_hot.tbl = nullptr; return fail("buffer allocation failed"); }
+    ggml_backend_buffer_set_usage(ple_hot.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // copy in chunks, checking a spread of rows byte for byte against the mapped table
+    const size_t chunk_rows = std::max<size_t>(1, (64u << 20) / row_sz);
+    std::vector<uint8_t> buf(chunk_rows * row_sz);
+    const size_t check_every = std::max<size_t>(1, n_hot / 1024);
+    size_t n_checked = 0;
+    for (size_t r0 = 0; r0 < n_hot; r0 += chunk_rows) {
+        const size_t nr = std::min<size_t>(chunk_rows, n_hot - r0);
+        if (fread(buf.data(), row_sz, nr, f) != nr) { ple_hot.tbl = nullptr; return fail("short read (rows)"); }
+        for (size_t r = r0 + (check_every - r0 % check_every) % check_every; r < r0 + nr; r += check_every) {
+            const uint8_t * ref = (const uint8_t *) t->data + (size_t) ple_hot.ids[r] * row_sz;
+            if (memcmp(ref, buf.data() + (r - r0) * row_sz, row_sz) != 0) {
+                ple_hot.tbl = nullptr;
+                return fail("row bytes differ from the table");
+            }
+            ++n_checked;
+        }
+        ggml_backend_tensor_set(ple_hot.tbl, buf.data(), r0 * row_sz, nr * row_sz);
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("%s: LLAMA_PLE_HOT: %zu rows (%.1f MiB) in %s, %zu rows verified against the table, %.2f s\n", __func__,
+            (size_t) n_hot, n_hot * row_sz / 1048576.0, ggml_backend_buffer_name(ple_hot.buf), n_checked, (ggml_time_us() - t0) / 1e6);
+    return ple_hot.tbl;
+}
+
 // PLE n-gram hash embedding: each token gathers ple_n_heads rows of a shared table.
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
@@ -1467,6 +1550,11 @@ public:
     // LLAMA_PLE_HOST_GATHER=0 restores the in-graph gather for A/B.
     ggml_tensor * emb  = nullptr;  // F32 [ple_head_dim * ple_n_heads, n_tokens], host gather
     ggml_tensor * rows = nullptr;  // I32 [ple_n_heads * n_tokens], in-graph get_rows
+
+    // LLAMA_PLE_HOT: with a hot table, emb carries only the misses (compacted to the front) and
+    //   out[k] = concat(get_rows(hot, slot), emb)[sel[k]]
+    ggml_tensor * slot = nullptr;  // I32 [ple_n_heads * n_tokens], hot slot per lookup (0 for a miss)
+    ggml_tensor * sel  = nullptr;  // I32 [ple_n_heads * n_tokens], k for a hit, n_lookups + miss# for a miss
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1504,7 +1592,9 @@ bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
     const int64_t n_tokens = params.ubatch.n_tokens;
 
     if (emb != nullptr) {
-        return emb->buffer != nullptr && emb->ne[1] == n_tokens;
+        return emb->buffer != nullptr && emb->ne[1] == n_tokens &&
+               (slot == nullptr || (slot->buffer != nullptr && sel->buffer != nullptr &&
+                                    slot->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * n_tokens));
     }
     if (rows != nullptr) {
         return rows->buffer != nullptr &&
@@ -1640,6 +1730,46 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t t_pf0 = ple_dbg ? ggml_time_us() : 0;
     struct rusage ru0 = {}; if (ple_dbg) getrusage(RUSAGE_SELF, &ru0);
 
+    // LLAMA_PLE_DUMP=<file>: append every ubatch's global row ids (int32, token-major) for checking
+    // an offline reimplementation of the hash against the model
+    static FILE * ple_dump = [] {
+        const char * e = getenv("LLAMA_PLE_DUMP");
+        return e ? fopen(e, "ab") : (FILE *) nullptr;
+    }();
+    if (ple_dump) {
+        fwrite(idx.data(), sizeof(int32_t), idx.size(), ple_dump);
+        fflush(ple_dump);
+    }
+
+    // LLAMA_PLE_HOT: resolve every lookup to a hot slot or a miss; only the misses are read from the
+    // mapping (and hinted), compacted to the front of emb in lookup order
+    const auto & hot_ids = pmodel.ple_hot.ids;
+    const bool   hot     = slot != nullptr && !split;
+    std::vector<int32_t>  miss_idx;   // global row ids of the misses
+    std::vector<uint32_t> miss_k;     // lookup position of each miss
+    if (hot) {
+        const size_t n_lk = idx.size();
+        std::vector<int32_t> slot_v(n_lk), sel_v(n_lk);
+        miss_idx.reserve(n_lk);
+        miss_k.reserve(n_lk);
+        for (size_t k = 0; k < n_lk; ++k) {
+            auto it = std::lower_bound(hot_ids.begin(), hot_ids.end(), idx[k]);
+            if (it != hot_ids.end() && *it == idx[k]) {
+                slot_v[k] = (int32_t) (it - hot_ids.begin());
+                sel_v[k]  = (int32_t) k;
+            } else {
+                slot_v[k] = 0;
+                sel_v[k]  = (int32_t) (n_lk + miss_k.size());
+                miss_k.push_back((uint32_t) k);
+                miss_idx.push_back(idx[k]);
+            }
+        }
+        ggml_backend_tensor_set(slot, slot_v.data(), 0, n_lk*sizeof(int32_t));
+        ggml_backend_tensor_set(sel,  sel_v.data(),  0, n_lk*sizeof(int32_t));
+    }
+    // the lookups the host has to read: all of them, or only the hot misses
+    const std::vector<int32_t> & need = hot ? miss_idx : idx;
+
     // per-head tables take head-local ids in head-major order
     std::vector<int32_t> idx_h;
     if (split) {
@@ -1673,7 +1803,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
                 }
             } else {
-                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, need.data(), need.size());
             }
         }
     }
@@ -1699,8 +1829,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // copy is bound by faults, not bytes. Gather on a pool so the faults (minor when cached, disk
     // reads when not) overlap; with mode 2 each thread first hints the pages mincore() says are
     // absent, so a cold run still gets asynchronous readahead without paying the hint on warm pages.
-    std::vector<float> vals((size_t) head_dim * idx.size());
-    const size_t n_rows_all = idx.size();
+    // with a hot table vals[j] is the j-th miss (lookup miss_k[j]); otherwise vals[k] is lookup k
+    const size_t n_rows_all = need.size();
+    std::vector<float> vals((size_t) head_dim * std::max<size_t>(n_rows_all, 1));
     const int64_t page = (int64_t) sysconf(_SC_PAGESIZE);
     // mode 3: an O_DIRECT descriptor + file offset per table tensor (falls back to mode 1 if the table
     // is not a lazily mapped range, e.g. --tensor-read-lazy off)
@@ -1721,10 +1852,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
                 }
             } else {
-                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, need.data(), need.size());
             }
         }
     }
+    // the head of a gathered row: from the lookup position (split tables are never hot)
+    auto head_of = [&](size_t k) -> int64_t { return split ? (int64_t) (k % n_heads) : 0; };
     auto gather_range = [&](size_t k0, size_t k1) {
         if (direct) {
             // one or two 4 KiB pages per row through pread(); the pool gives the device its queue depth
@@ -1733,8 +1866,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             if (posix_memalign(&mem, (size_t) page, bsz) != 0) { mem = nullptr; }
             char * buf = (char *) mem;
             for (size_t k = k0; k < k1; ++k) {
-                const int64_t h = split ? (int64_t) (k % n_heads) : 0;
-                const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+                const int64_t h = head_of(k);
+                const int64_t row = split ? need[k] - (int32_t) hp.ple_head_offsets[h] : need[k];
                 const size_t foff = doff[h] + (size_t) row * row_sz;
                 const size_t p0   = foff & ~((size_t) page - 1);
                 const size_t len  = ((foff + row_sz + (size_t) page - 1) & ~((size_t) page - 1)) - p0;
@@ -1765,9 +1898,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         if (ple_prefetch == 2) {
             unsigned char vec[2];
             for (size_t k = k0; k < k1; ++k) {
-                const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+                const int64_t h = head_of(k);
                 const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
-                const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+                const int64_t row = split ? need[k] - (int32_t) hp.ple_head_offsets[h] : need[k];
                 const char * p0 = base + (size_t) row*row_sz;
                 const uintptr_t a0 = ((uintptr_t) p0) & ~(uintptr_t)(page - 1);
                 const size_t len = ((uintptr_t) p0 + row_sz) - a0;
@@ -1777,9 +1910,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
         for (size_t k = k0; k < k1; ++k) {
-            const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+            const int64_t h = head_of(k);
             const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
-            const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+            const int64_t row = split ? need[k] - (int32_t) hp.ple_head_offsets[h] : need[k];
             if (traits == nullptr) {
                 memcpy(vals.data() + k*head_dim, base + (size_t) row*row_sz, head_dim*sizeof(float));
             } else {
@@ -1805,13 +1938,25 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     const int64_t t_g1 = ple_dbg ? ggml_time_us() : 0;
-    ggml_backend_tensor_set(emb, vals.data(), 0, vals.size()*sizeof(float));
+    if (n_rows_all > 0) {
+        ggml_backend_tensor_set(emb, vals.data(), 0, (size_t) head_dim * n_rows_all * sizeof(float));
+    }
     if (ple_dbg && n_tokens >= 1024) {
         const int64_t t_s1 = ggml_time_us();
         struct rusage ru1 = {}; getrusage(RUSAGE_SELF, &ru1);
-        fprintf(stderr, "PLE_GATHER n_tokens=%lld rows=%zu prefetch=%.1f ms gather=%.1f ms upload=%.1f ms minflt=%ld majflt=%ld\n",
-                (long long) n_tokens, idx.size(), (t_pf1 - t_pf0) / 1e3, (t_g1 - t_pf1) / 1e3, (t_s1 - t_g1) / 1e3,
+        fprintf(stderr, "PLE_GATHER n_tokens=%lld rows=%zu read=%zu prefetch=%.1f ms gather=%.1f ms upload=%.1f ms minflt=%ld majflt=%ld\n",
+                (long long) n_tokens, idx.size(), n_rows_all, (t_pf1 - t_pf0) / 1e3, (t_g1 - t_pf1) / 1e3, (t_s1 - t_g1) / 1e3,
                 ru1.ru_minflt - ru0.ru_minflt, ru1.ru_majflt - ru0.ru_majflt);
+    }
+    if (hot) {
+        static std::atomic<uint64_t> n_look{0}, n_miss{0};
+        const uint64_t l = n_look += idx.size();
+        const uint64_t m = n_miss += n_rows_all;
+        if (ple_dbg && n_tokens >= 1024) {
+            fprintf(stderr, "PLE_HOT ubatch hit %.1f%%, cumulative hit %.1f%% of %llu lookups\n",
+                    100.0 * (double) (idx.size() - n_rows_all) / (double) idx.size(), 100.0 * (double) (l - m) / (double) l,
+                    (unsigned long long) l);
+        }
     }
 }
 
@@ -1903,11 +2048,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
                 (ple_host_gather() && tbl_host) ? "host" : "in-graph");
     }
     ggml_tensor * emb = nullptr;
+    // LLAMA_PLE_HOT: the hot rows go next to this layer's weights (the device the PLE matmuls run on)
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+    const ggml_tensor * hot_tbl = nullptr;
+    if (ple_host_gather() && tbl_host && model.per_layer_tok_embd != nullptr && model.layers[il].ple_key->buffer != nullptr) {
+        hot_tbl = qmodel.ple_hot_table(ggml_backend_buffer_get_type(model.layers[il].ple_key->buffer));
+    }
     if (ple_host_gather() && tbl_host) {
         ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
                 hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb);
         emb = ple_inp->emb;
+        if (hot_tbl != nullptr) {
+            // exact merge: the hot rows are dequantised by get_rows (as the in-graph path does), the
+            // misses arrive dequantised by the host gather, and a second F32 get_rows picks per lookup
+            const int64_t n_lk = n_heads * n_tokens;
+            ple_inp->slot = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_lk);
+            ple_inp->sel  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_lk);
+            ggml_set_input(ple_inp->slot);
+            ggml_set_input(ple_inp->sel);
+            ggml_tensor * hot_rows = ggml_get_rows(ctx0, const_cast<ggml_tensor *>(hot_tbl), ple_inp->slot); // [head_dim, n_lk]
+            ggml_tensor * miss     = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim, n_lk);
+            ggml_tensor * both     = ggml_concat(ctx0, hot_rows, miss, 1);                              // [head_dim, 2*n_lk]
+            emb = ggml_get_rows(ctx0, both, ple_inp->sel);
+            emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        }
         res->add_input(std::move(ple_inp));
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
