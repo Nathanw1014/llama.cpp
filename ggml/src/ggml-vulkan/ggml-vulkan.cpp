@@ -1092,6 +1092,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_topk_radix_qsa_reg[4]; // register-resident rows of up to {8,16,32,64} * BLOCK_SIZE cells
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
     vk_pipeline pipeline_cumsum_f32;
@@ -6613,6 +6614,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[0], "topk_radix_qsa_reg8",  topk_radix_qsa_reg8_len,  topk_radix_qsa_reg8_data,  "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[1], "topk_radix_qsa_reg16", topk_radix_qsa_reg16_len, topk_radix_qsa_reg16_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[2], "topk_radix_qsa_reg32", topk_radix_qsa_reg32_len, topk_radix_qsa_reg32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[3], "topk_radix_qsa_reg64", topk_radix_qsa_reg64_len, topk_radix_qsa_reg64_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -17230,9 +17235,27 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
+    // rows of up to 64 * BLOCK_SIZE cells stay in registers (see topk_reg in the shader) and
+    // need no gather scratch; longer rows fall back to the scratch variant
+    // default on (bit-identical output: qsa_cmp EXACT 11/11, Flash-Next KLD c4096x4 identical to the
+    // same-binary control; TOPK_QSA 56.1 -> 34.3 ms per 2048-token ubatch at d16384). =0 disables.
+    static const bool reg_ok = !(getenv("GGML_VK_TOPK_QSA_REG") && atoi(getenv("GGML_VK_TOPK_QSA_REG")) == 0);
+    bool use_reg = false;
+    if (reg_ok) {
+        const uint32_t bs  = pipeline->wg_denoms[0];
+        const uint32_t npt = (n_kv + bs - 1) / bs;
+        for (int v = 0; v < 4; ++v) {
+            if (npt <= (8u << v) && ctx->device->pipeline_topk_radix_qsa_reg[v]) {
+                pipeline = ctx->device->pipeline_topk_radix_qsa_reg[v];
+                use_reg  = true;
+                break;
+            }
+        }
+    }
+
     // scratch holds the gathered+masked input, materialized once and reused across passes;
     // when the output aliases a source it also holds the result, copied to top_k afterwards
-    const size_t gather_size = size_t{ n_kv } * nrows * sizeof(float);
+    const size_t gather_size = use_reg ? 256 : size_t{ n_kv } * nrows * sizeof(float);
     const size_t out_off     = (gather_size + 255) & ~size_t{ 255 };
     const size_t out_size    = size_t{ width } * nrows * sizeof(int32_t);
     const size_t scratch_need = ctx->fused_topk_qsa_out_scratch ? out_off + out_size : gather_size;
@@ -17294,6 +17317,14 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer scratch_buf { ctx->prealloc_x, 0, gather_size };
     vk_subbuffer dst_buf     = ggml_vk_tensor_subbuffer(ctx, top_k);
     vk_subbuffer out_buf     = ctx->fused_topk_qsa_out_scratch ? vk_subbuffer{ ctx->prealloc_x, out_off, out_size } : dst_buf;
+    {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static int n_dbg = 0;
+        if (dbg && n_dbg < 4) {
+            n_dbg++;
+            fprintf(stderr, "ggml_vulkan: TOPK_QSA %s n_kv %u rows %u k %u direct %d\n", pipeline->name.c_str(), n_kv, nrows, width, a != scores);
+        }
+    }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, a), out_buf,
