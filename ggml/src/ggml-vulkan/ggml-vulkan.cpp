@@ -21361,6 +21361,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 need_disable = false;
             }
             if (need_disable) {
+                // the perf logger labels the dispatch with fusion_string: a dropped fusion kept its name,
+                // so e.g. 93 "HC_POST_NORM_CPY" were ~45 fused plus ~48 plain DSV4_HC_POST (2026-09-28)
+                fusion_string = nullptr;
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
