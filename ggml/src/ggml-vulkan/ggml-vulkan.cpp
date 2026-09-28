@@ -13463,6 +13463,50 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     return true;
 }
 
+// Speculative verify of a top-k (QSA) GQA attention: a batch of 2..8 query tokens runs as that many
+// single-token flash attentions, each one exactly what decode runs for the same context. Batched, the
+// tokens share one dense masked pass over the whole cache (the per-token gather-compact that decode
+// takes declines above one token: its compact set grows with the batch), so each verify row sums a
+// different KV layout and split partition than decode does and rounds its f16 P differently -- on
+// Qwen3.8-Flash-Next at 7k context ~1e-3 relative per attention layer, enough to flip MoE routing near
+// ties and make MTP drift from greedy autoregressive decode. Per token, the compaction, KV length
+// and split partition are decode's. GGML_VK_FA_VERIFY_PER_TOKEN=0 restores the batched pass.
+static bool ggml_vk_flash_attn_verify_per_token(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
+        const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_FA_VERIFY_PER_TOKEN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const ggml_tensor * top_k = dst->src[5];
+    const int64_t n_tok = q->ne[1];
+    if (!enabled || top_k == nullptr || mask == nullptr || n_tok < 2 || n_tok > 8 ||
+        ctx->fa_forced_compact != nullptr || ctx->fa_forced_gather != nullptr ||
+        // GQA caches only (separate V); the MLA row keeps its batched union path
+        (k->buffer == v->buffer && k->data == v->data) ||
+        q->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[1] < n_tok ||
+        top_k->ne[1] != n_tok || top_k->ne[2] != 1 || top_k->ne[3] != 1 || dst->ne[2] != n_tok) {
+        return false;
+    }
+    for (int64_t t = 0; t < n_tok; ++t) {
+        // row-offset copies of the per-token operands: offsets derive from ->data
+        ggml_tensor qt = *q;     qt.view_src = nullptr; qt.view_offs = 0;
+        qt.ne[1] = 1;            qt.data = (char *) q->data + (size_t) t * q->nb[1];
+        ggml_tensor mt = *mask;  mt.view_src = nullptr; mt.view_offs = 0;
+        mt.ne[1] = 1;            mt.data = (char *) mask->data + (size_t) t * mask->nb[1];
+        ggml_tensor tk = *top_k; tk.view_src = nullptr; tk.view_offs = 0;
+        tk.ne[1] = 1;            tk.data = (char *) top_k->data + (size_t) t * top_k->nb[1];
+        ggml_tensor dt = *dst;   dt.view_src = nullptr; dt.view_offs = 0;
+        dt.ne[2] = 1;            dt.data = (char *) dst->data + (size_t) t * dst->nb[2];
+        dt.src[0] = &qt; dt.src[3] = &mt; dt.src[5] = &tk;
+        ggml_vk_flash_attn(ctx, subctx, &qt, k, v, &mt, sinks, &dt);
+        // the next token's gather and split-K partials reuse the scratch this one reads
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 // GGML_VK_FA_LOG=1 prints when the split-K partition-major order or the GQA fold engages.
 static bool split_pmajor_log() {
     static const bool log = [] {
@@ -13839,7 +13883,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // gathered per-token FA: one workgroup per (token, kv head), no split (split_kv carries the mask stride)
         // multi-row FA: prefill only, enough workgroups without a split
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        // GGML_VK_FA_SPLIT_TOKEN_INVARIANT (default on, =0 restores): without a GQA fold every
+        // workgroup_x is one query token, so sizing split_k by the whole grid gives a speculative
+        // verify batch of n tokens 1/n the KV splits of single-token decode. The split boundaries
+        // then differ, every split rounds its own f16 P against its own running max, and a verify
+        // row stops matching the decode of the same context (~1e-3 relative per attention layer on
+        // Qwen3.8-Flash-Next, enough to flip MoE routing near ties: MTP not greedy-exact). Sizing
+        // it per token keeps each token's partition identical to decode at the same KV length.
+        static const bool split_token_inv = [] {
+            const char * e = getenv("GGML_VK_FA_SPLIT_TOKEN_INVARIANT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        const uint32_t wg_x_split = (split_token_inv && !gqa_fold) ? 1u : workgroups_x;
+        split_k = shader_core_count * 2 / (wg_x_split * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
@@ -19395,7 +19451,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        if (!ggml_vk_flash_attn_verify_per_token(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node)) {
+            ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        }
 
         break;
 
