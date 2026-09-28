@@ -1797,13 +1797,23 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     if (ple_prefetch == 1 || (ple_prefetch >= 2 && !rows)) {
         // modes 2/3 are handled inside the gather (it knows the row addresses); the in-graph get_rows
         // path keeps the plain hint
+        // LLAMA_PLE_HINT_THREADS: threads issuing the page hints (default: the gather pool size; 1 =
+        // the serial pass). Each hint is ~10 us of syscall even when the page is cached, so ~15-30k
+        // hints per ubatch were 200-350 ms on one thread. LLAMA_PLE_HINT_PROBE=1 hints only the pages
+        // mincore() reports absent.
+        static const int hint_threads = [] {
+            const char * e = getenv("LLAMA_PLE_HINT_THREADS");
+            const int hw = (int) std::thread::hardware_concurrency();
+            return e ? std::max(1, atoi(e)) : std::max(1, std::min(32, 2 * hw));
+        }();
+        static const bool hint_probe = getenv("LLAMA_PLE_HINT_PROBE") && atoi(getenv("LLAMA_PLE_HINT_PROBE")) != 0;
         if (ple_prefetch == 1 || rows) {
             if (split) {
                 for (int64_t h = 0; h < n_heads; ++h) {
-                    pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
+                    pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens, hint_threads, hint_probe);
                 }
             } else {
-                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, need.data(), need.size());
+                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, need.data(), need.size(), hint_threads, hint_probe);
             }
         }
     }

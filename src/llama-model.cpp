@@ -1802,7 +1802,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows,
+                                int n_threads, bool probe) const {
     if (pimpl->gather_ranges.empty() || t == nullptr || t->data == nullptr || n_rows == 0) {
         return;
     }
@@ -1810,7 +1811,7 @@ void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * ro
     // and the mapping now holds ranges that still want the kernel's own readahead
     for (const auto & r : pimpl->gather_ranges) {
         if (r.tensor == t) {
-            pimpl->mappings[r.idx]->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+            pimpl->mappings[r.idx]->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows, n_threads, probe);
             return;
         }
     }

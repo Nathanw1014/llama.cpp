@@ -784,7 +784,8 @@ struct llama_model {
     // does nothing unless the tensor was nominated by gather_tables() and really is read out of
     // a mapping. off, and for anything else (offloaded tensors, --load-mode none, non-POSIX
     // hosts), this is one empty-vector test.
-    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows,
+                       int n_threads = 1, bool probe = false) const;
     // for a gather table that lives in a lazily mapped range: an O_DIRECT fd on its file and the
     // tensor's byte offset in that file, so rows can be pread() at queue depth. false if not mapped so.
     bool direct_row_source(const struct ggml_tensor * t, int & fd, size_t & file_off) const;

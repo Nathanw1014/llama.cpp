@@ -61,8 +61,10 @@ struct llama_mmap {
 
     // ask the kernel to start reading the given rows. issued as one batch so the faults overlap
     // instead of serializing.
+    // n_threads > 1 issues the hints from that many threads (each hint is a ~10 us syscall even on a
+    // cached page); probe = hint only the pages mincore() reports absent.
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const;
+                       const int32_t * rows, size_t n_rows, int n_threads = 1, bool probe = false) const;
 
     // an O_DIRECT descriptor on the mapped file (opened lazily, owned by the mapping), or -1: lets a
     // gather read scattered rows with pread() at NVMe queue depth instead of one page fault each

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -592,15 +593,52 @@ struct llama_mmap::impl {
     }
 
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
+                       const int32_t * rows, size_t n_rows, int n_threads, bool probe) const {
 #if defined(_POSIX_MAPPED_FILES)
         const size_t base_off = (const char *) base - (const char *) addr;
+        const size_t page     = llama_mmap_page_size();
 
-        for (const auto & [off, len] : llama_mmap_row_pages(
-                    base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
-            // deliberately unchecked: this is a hint issued thousands of times per batch, and a
-            // failed hint only costs the fault it would have avoided
-            posix_madvise((char *) addr + off, len, POSIX_MADV_WILLNEED);
+        // one hint per page (sorted, deduplicated, adjacent pages coalesced)
+        const auto ranges = llama_mmap_row_pages(base_off, stride, row_size, size, rows, n_rows, page);
+
+        auto advise = [&](size_t i0, size_t i1) {
+            std::vector<unsigned char> vec;
+            for (size_t i = i0; i < i1; ++i) {
+                const auto & [off, len] = ranges[i];
+                char * a = (char *) addr + off;
+                if (probe) {
+                    // hint only the absent pages of the range
+                    const size_t np = (len + page - 1) / page;
+                    vec.resize(np);
+                    if (mincore(a, len, vec.data()) == 0) {
+                        for (size_t k = 0; k < np; ) {
+                            if (vec[k] & 1) { ++k; continue; }
+                            size_t e = k + 1;
+                            while (e < np && !(vec[e] & 1)) { ++e; }
+                            posix_madvise(a + k * page, std::min(len - k * page, (e - k) * page), POSIX_MADV_WILLNEED);
+                            k = e;
+                        }
+                        continue;
+                    }
+                }
+                // deliberately unchecked: this is a hint issued thousands of times per batch, and a
+                // failed hint only costs the fault it would have avoided
+                posix_madvise(a, len, POSIX_MADV_WILLNEED);
+            }
+        };
+
+        const size_t nt = std::min<size_t>(std::max(1, n_threads), (ranges.size() + 255) / 256);
+        if (nt <= 1) {
+            advise(0, ranges.size());
+        } else {
+            // the hints only need the mmap lock shared, so they scale across threads
+            std::vector<std::thread> pool;
+            const size_t chunk = (ranges.size() + nt - 1) / nt;
+            for (size_t t = 0; t < nt; ++t) {
+                const size_t i0 = t * chunk, i1 = std::min(ranges.size(), i0 + chunk);
+                if (i0 < i1) { pool.emplace_back(advise, i0, i1); }
+            }
+            for (auto & th : pool) { th.join(); }
         }
 #else
         GGML_UNUSED(base);
@@ -608,6 +646,8 @@ struct llama_mmap::impl {
         GGML_UNUSED(row_size);
         GGML_UNUSED(rows);
         GGML_UNUSED(n_rows);
+        GGML_UNUSED(n_threads);
+        GGML_UNUSED(probe);
 #endif
     }
 
@@ -729,7 +769,9 @@ struct llama_mmap::impl {
     int direct_fd() { return -1; }
 
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
+                       const int32_t * rows, size_t n_rows, int n_threads, bool probe) const {
+        GGML_UNUSED(n_threads);
+        GGML_UNUSED(probe);
 #if _WIN32_WINNT >= 0x602
         BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -797,7 +839,9 @@ struct llama_mmap::impl {
     int direct_fd() { return -1; }
 
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
+                       const int32_t * rows, size_t n_rows, int n_threads, bool probe) const {
+        GGML_UNUSED(n_threads);
+        GGML_UNUSED(probe);
         GGML_UNUSED(base);
         GGML_UNUSED(stride);
         GGML_UNUSED(row_size);
@@ -836,8 +880,8 @@ bool llama_mmap::contains(const void * ptr, size_t len) const { return pimpl->co
 int llama_mmap::direct_fd() const { return pimpl->direct_fd(); }
 
 void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
-                               const int32_t * rows, size_t n_rows) const {
-    pimpl->prefetch_rows(base, stride, row_size, rows, n_rows);
+                               const int32_t * rows, size_t n_rows, int n_threads, bool probe) const {
+    pimpl->prefetch_rows(base, stride, row_size, rows, n_rows, n_threads, probe);
 }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
