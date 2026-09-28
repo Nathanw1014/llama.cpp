@@ -10590,8 +10590,19 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
-    // MMVQ is generally good for batches
-    if (n > 1) {
+    // MMVQ is generally good for batches. But it quantizes the activations to q8_1, which the
+    // n == 1 decode path below does not do for every weight type (never for Q8_0 on AMD), so taking
+    // it for n > 1 alone makes a small batch (a speculative verify batch) compute each row with
+    // 8-bit activations while single-token decode uses float ones: measured on Qwen3.8-Flash-Next,
+    // ~0.5% relative error per projection, ~1 nat logit noise at the output, and MTP not greedy-exact
+    // vs autoregressive decode. GGML_VK_MMVQ_BATCH_INVARIANT=0 restores the upstream n > 1 rule;
+    // by default the decision is the same for every n, so a row's arithmetic does not depend on
+    // how many rows share its batch.
+    static const bool batch_invariant = [] {
+        const char * e = getenv("GGML_VK_MMVQ_BATCH_INVARIANT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (n > 1 && !batch_invariant) {
         return true;
     }
 
