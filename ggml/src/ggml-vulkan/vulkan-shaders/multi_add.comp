@@ -9,6 +9,10 @@
 #endif
 
 #include "types.glsl"
+
+#ifndef MUL_LAST
+#define MUL_LAST 0
+#endif
 #include "utils.glsl"
 
 layout (push_constant) uniform parameter2
@@ -159,10 +163,18 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
 
+#if MUL_LAST
+        // MUL + ADD (d = src0 + src1 * src2, src2 broadcast through zero strides): the product is
+        // rounded to f32 before the add, the same two roundings as the unfused pair; precise keeps
+        // the compiler from contracting them into an fma
+        precise FLOAT_TYPE prod = load_a(1, src_idx(1, i00, i01, i02, i03)) * load_a(2, src_idx(2, i00, i01, i02, i03));
+        precise FLOAT_TYPE sum  = load_a(0, src_idx(0, i00, i01, i02, i03)) + prod;
+#else
         FLOAT_TYPE sum = FLOAT_TYPE(0);
         [[unroll]] for (uint s = 0; s < num_srcs; ++s) {
             sum += load_a(s, src_idx(s, i00, i01, i02, i03));
         }
+#endif
         sum_sq += sum*sum;
         store_d(num_srcs, dst_idx(i00, i01, i02, i03), sum);
 

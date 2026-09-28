@@ -990,6 +990,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_f16in[MAX_FUSED_ADDS];   // f16 sources, f32 accumulate and store (MoE combine of f16 expert outputs)
+    vk_pipeline pipeline_mul_add_bcast_f32;   // MUL + ADD: x + a * b, b broadcast (the shared-expert gate)
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -2665,6 +2666,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_rms_norm_scale {};   // RMS_NORM+SCALE (the GDN q/k l2 norm)
+    bool fused_mul_add {};          // MUL+ADD with a broadcast multiplier (MUL_ADD)
     bool skip_node {};              // the current node's result is never read: record nothing
     bool topk_qsa_cont_skipped {};  // the TOPK_QSA transpose was skipped; the fused dispatch must sync
     int  topk_qsa_cont_consumer = -1; // node index of the GET_ROWS that starts the fusion reading it
@@ -6460,6 +6462,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_f16in[i],     "multi_add_f16in_f32_"     + std::to_string(i+1), multi_add_f16in_f32_len,     multi_add_f16in_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
         }
+        ggml_vk_create_pipeline2(device, device->pipeline_mul_add_bcast_f32, "mul_add_bcast_f32", mul_add_bcast_f32_len, mul_add_bcast_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {3}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
@@ -15470,6 +15473,58 @@ static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const
     });
 }
 
+// MUL + ADD fused (MUL_ADD): d = x + a * b with b broadcast (zero strides on its size-1 dims), through
+// the multi_add kernel's MUL_LAST variant. Flash-Next's shared expert: ffn_shexp * sigmoid(gate) + moe_out,
+// 47 x (MUL 0.26 + ADD 0.22 ms) per 2048-token ubatch, one 21 MB write and read saved per layer.
+static void ggml_vk_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x   = add->src[0] == mul ? add->src[1] : add->src[0];
+    const bool b_is_src1    = mul->src[1]->ne[0] == 1 && mul->src[0]->ne[0] != 1;
+    const ggml_tensor * a   = b_is_src1 ? mul->src[0] : mul->src[1];
+    const ggml_tensor * b   = b_is_src1 ? mul->src[1] : mul->src[0];
+    const ggml_tensor * tensors[4] = { x, a, b, add };
+
+    vk_op_multi_add_push_constants pc {};
+    pc.ne20 = (uint32_t) add->ne[0];
+    pc.ne21 = (uint32_t) add->ne[1];
+    pc.ne22 = (uint32_t) add->ne[2];
+    pc.ne23 = (uint32_t) add->ne[3];
+    for (uint32_t i = 0; i < 4; ++i) {
+        const ggml_tensor * t = tensors[i];
+        for (int d = 0; d < 4; ++d) {
+            // broadcast: a size-1 dim of a smaller operand gets stride 0
+            pc.nb[i][d] = (t->ne[d] == 1 && add->ne[d] != 1) ? 0 : (uint32_t) (t->nb[d] / sizeof(float));
+        }
+    }
+    pc.rms_partials = 0;
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_add_bcast_f32;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer bufs[MAX_PARAMETER_COUNT];
+    for (uint32_t i = 0; i < 4; ++i) {
+        bufs[i] = ggml_vk_tensor_subbuffer(ctx, tensors[i]);
+    }
+    for (uint32_t i = 4; i < MAX_PARAMETER_COUNT; ++i) {
+        bufs[i] = bufs[0];
+    }
+
+    std::array<uint32_t, 3> elements;
+    const uint32_t ne = ggml_nelements(add);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+    static_assert(MAX_PARAMETER_COUNT == 12);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10], bufs[11] }, pc, elements);
+}
+
 static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
     const ggml_tensor *dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
@@ -18962,7 +19017,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_mul_add) {
+            ggml_vk_mul_add(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -20084,6 +20141,15 @@ static bool ggml_vk_fuse_rms_norm_scale_enabled() {
     return enabled;
 }
 
+// MUL+ADD fusion (the shared-expert gate + combine); also keeps the ADD behind its MUL in graph_optimize
+static bool ggml_vk_fuse_mul_add_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_FUSE_MUL_ADD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -20939,6 +21005,41 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     return true;
 }
 
+// MUL(a, b) + ADD(x, mul) with b broadcast along rows (b->ne[0] == 1), all f32: see ggml_vk_mul_add
+static bool ggml_vk_can_fuse_mul_add(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_mul_add_enabled() || !ctx->device->multi_add || !ctx->device->pipeline_mul_add_bcast_f32 || node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    if (mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD || (add->src[0] != mul && add->src[1] != mul)) {
+        return false;
+    }
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_ADD })) {
+        return false;
+    }
+    const ggml_tensor * x = add->src[0] == mul ? add->src[1] : add->src[0];
+    const bool b_is_src1  = mul->src[1]->ne[0] == 1 && mul->src[0]->ne[0] != 1;
+    const ggml_tensor * a = b_is_src1 ? mul->src[0] : mul->src[1];
+    const ggml_tensor * b = b_is_src1 ? mul->src[1] : mul->src[0];
+    if (x == mul || mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (b->ne[0] != 1 || a->ne[0] == 1 || !ggml_are_same_shape(a, mul) || !ggml_are_same_shape(x, add) ||
+        !ggml_are_same_shape(mul, add) || !ggml_can_repeat(b, a)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || a->nb[0] != sizeof(float) || x->nb[0] != sizeof(float) ||
+        ggml_nelements(add) > (int64_t) UINT32_MAX) {
+        return false;
+    }
+    if (get_misalign_bytes(ctx, x) || get_misalign_bytes(ctx, a) || get_misalign_bytes(ctx, b) || get_misalign_bytes(ctx, add)) {
+        return false;
+    }
+    return true;
+}
+
 static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -21181,6 +21282,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
         ctx->fused_rms_norm_scale = false;
+        ctx->fused_mul_add = false;
         ctx->skip_node = false;
         const char *fusion_string {};
         // cont(permute(score)) feeding a TOPK_QSA fusion that reads score directly: the transpose
@@ -21301,6 +21403,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mul_add(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mul_add = true;
+                fusion_string = "MUL_ADD";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_scale = true;
@@ -21493,6 +21601,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
                 ctx->fused_rms_norm_scale = false;
+                ctx->fused_mul_add = false;
             }
         }
         // a skipped transpose must be consumed by the fused dispatch right after it
@@ -21770,6 +21879,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     // RMS_NORM + MUL + MUL (the GDN gated norm, RMS_NORM_MUL_MUL): keep the gate MUL behind the gamma MUL
                     !(j == c+1 && c == current_set.back() && c >= 1 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
                       graph->nodes[j]->op == GGML_OP_MUL && (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c])) &&
+                    // MUL(a, broadcast b) -> ADD (MUL_ADD, the shared-expert gate + combine)
+                    !(ggml_vk_fuse_mul_add_enabled() && j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
+                      (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c]) &&
+                      (graph->nodes[c]->src[1]->ne[0] == 1 || graph->nodes[c]->src[0]->ne[0] == 1)) &&
                     // RMS_NORM -> SCALE (RMS_NORM_SCALE, the GDN q/k l2 norm): keep the scale behind its norm
                     !(ggml_vk_fuse_rms_norm_scale_enabled() && j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE &&
                       graph->nodes[j]->src[0] == graph->nodes[c]) &&
