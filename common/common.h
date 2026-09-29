@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstdlib>
 #include <set>
 #include <sstream>
 #include <string>
@@ -391,8 +392,16 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // MTP too: on a hybrid target without recurrent snapshots every partially accepted draft
+        // costs a checkpoint restore plus a replay forward of the accepted tokens (Qwen3.8-Flash-Next,
+        // n_max 3: most steps). LLAMA_SPEC_MTP_RS_ROLLBACK=0 restores the checkpoint path.
+        static const bool mtp_rs = [] {
+            const char * e = getenv("LLAMA_SPEC_MTP_RS_ROLLBACK");
+            return e == nullptr || atoi(e) != 0;
+        }();
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                   (mtp_rs && t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         });
 
         return needs_rs_seq ? draft.n_max : 0u;

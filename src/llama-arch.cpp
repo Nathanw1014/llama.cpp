@@ -1139,6 +1139,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_QWEN4EXP:
             return true;
         default:
             return false;

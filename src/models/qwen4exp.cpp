@@ -2032,6 +2032,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] with n_rs_seq > 0, snapshot group s holds the history as it was
+    // s tokens before the end of this ubatch (split_equal keeps the trailing n_rs_seq + 1 tokens of a
+    // sequence in one ubatch), so a speculative verify can roll back a rejected suffix without a
+    // checkpoint restore and a replay. The snapshots read the old history and x, never conv_input,
+    // so the concat keeps its single consumer and the fused conv path is the same as without them.
+    const int64_t n_seq_tokens = x->ne[1];
+    const int64_t mem_size     = mctx_cur->get_size();
+    for (int64_t s = 1; s <= (int64_t) cparams.n_rs_seq && s <= n_seq_tokens; ++s) {
+        // columns [c0, c0 + state_cols) of [history | x^T]
+        const int64_t c0 = n_seq_tokens - s;
+        ggml_tensor * snap;
+        if (c0 >= state_cols) {
+            snap = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                    channels, state_cols, n_seqs,
+                    x->nb[1], x->nb[2],
+                    (c0 - state_cols) * x->nb[1]));
+        } else {
+            ggml_tensor * old = ggml_view_3d(ctx0, state,
+                    state_cols - c0, channels, n_seqs,
+                    state->nb[1], state->nb[2],
+                    c0 * state->nb[0]);
+            if (c0 == 0) {
+                snap = old;
+            } else {
+                ggml_tensor * xs = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                        channels, c0, n_seqs,
+                        x->nb[1], x->nb[2], 0));
+                snap = ggml_concat(ctx0, ggml_cont(ctx0, old), ggml_cont(ctx0, xs), 0);
+            }
+        }
+        ggml_tensor * snap_dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                ((size_t) s * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, snap), snap_dst));
+    }
+
     return conv_input;
 }
 
