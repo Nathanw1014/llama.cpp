@@ -2692,6 +2692,7 @@ struct ggml_backend_vk_context {
     // the fused top-k's output tensor aliases one of its sources (ggml-alloc reuses the freed
     // intermediates); write the result to scratch and copy it out instead of dropping the fusion
     bool fused_topk_qsa_out_scratch {};
+    bool fused_topk_moe_logits_scratch {};   // TOPK_MOE reads a copy of the logits (see ggml_vk_topk_moe)
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -17141,6 +17142,22 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     vk_subbuffer logits_buf = ggml_vk_tensor_subbuffer(ctx, logits);
     vk_subbuffer bias_buf = ggml_vk_tensor_subbuffer(ctx, bias);
+    if (ctx->fused_topk_moe_logits_scratch) {
+        // the outputs alias the logits (see the fusion check): read a copy in prealloc_x
+        GGML_ASSERT(bias == logits && ggml_is_contiguous(logits));
+        const size_t size = ggml_nbytes(logits);
+        if (ctx->prealloc_size_x < size) {
+            ctx->prealloc_size_x = size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_buffer_copy_async(subctx, ctx->prealloc_x, 0, logits_buf.buffer, logits_buf.offset, size);
+        ggml_vk_sync_buffers(ctx, subctx);
+        logits_buf = { ctx->prealloc_x, 0, size };
+        bias_buf   = logits_buf;
+    }
     vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx, weights);
     vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
 
@@ -17195,6 +17212,9 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
     std::array<uint32_t, 3> elements = { CEIL_DIV(n_rows, rows_per_block), 1, 1 };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
+    if (ctx->fused_topk_moe_logits_scratch) {
+        ctx->prealloc_x_need_sync = true;
+    }
 }
 
 static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
@@ -21568,6 +21588,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_topk_moe_logits_scratch = false;
         ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
         ctx->fused_rms_norm_scale = false;
@@ -21888,6 +21909,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "TOPK_QSA_SCRATCH";
                 need_disable = false;
             }
+            // A 2..8-row TOPK_MOE (a speculative verify batch) whose weights land in the freed router
+            // logits: a row's weights can overwrite a later row's logits before that row has read them,
+            // so the fusion is dropped and the rows take the unfused softmax/argsort/sum/div chain, whose
+            // arithmetic differs from the fused kernel that single-token decode runs (one ulp in the
+            // routing weights per layer, ~3e-3 logit difference at the output of Qwen3.8-Flash-Next, and
+            // MTP not greedy-exact). The logits are the only outside source of the chain, so reading them
+            // from a copy removes the hazard and every row gets decode's arithmetic.
+            // GGML_VK_TOPK_MOE_SCRATCH=0 restores dropping the fusion.
+            static const bool topk_moe_scratch_ok = !(getenv("GGML_VK_TOPK_MOE_SCRATCH") && atoi(getenv("GGML_VK_TOPK_MOE_SCRATCH")) == 0);
+            if (need_disable && topk_moe_scratch_ok && ctx->fused_topk_moe_mode == TOPK_MOE_EARLY_SOFTMAX_NORM &&
+                ggml_nrows(cgraph->nodes[i]->src[0]) <= 8 && ggml_is_contiguous(cgraph->nodes[i]->src[0])) {
+                ctx->fused_topk_moe_logits_scratch = true;
+                fusion_string = "TOPK_MOE_EARLY_SOFTMAX_NORM_SCRATCH";
+                need_disable = false;
+            }
             if (need_disable) {
                 // the perf logger labels the dispatch with fusion_string: a dropped fusion kept its name,
                 // so e.g. 93 "HC_POST_NORM_CPY" were ~45 fused plus ~48 plain DSV4_HC_POST (2026-09-28)
@@ -21896,6 +21932,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_topk_moe_logits_scratch = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_topk_qsa_out_scratch = false;
                 ctx->fused_rms_norm_scale = false;
