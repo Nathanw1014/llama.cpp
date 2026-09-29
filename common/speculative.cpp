@@ -1510,6 +1510,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // GGML_MTP_PF_PROF=1: per-call timing of the catch-up (adds a draft sync, profiling only)
+        static const bool pf_prof = getenv("GGML_MTP_PF_PROF") && atoi(getenv("GGML_MTP_PF_PROF")) != 0;
+        // GGML_MTP_PF_TRIM=0: keep every target row in verify_h (the draft-graph side of the same
+        //                     switch lives in the model's MTP graph)
+        static const bool pf_trim = [] {
+            const char * e = getenv("GGML_MTP_PF_TRIM");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        const int64_t t_p0 = pf_prof ? ggml_time_us() : 0;
+        int64_t t_p1 = t_p0, t_p2 = t_p0, t_p3 = t_p0;
+
+        // fetched (one sync on the target) before the draft decode is queued, so reading the
+        // verify rows below does not wait for the draft to finish
+        const float * h_tgt_all = pf_trim ? llama_get_embeddings_nextn(ctx_tgt) : nullptr;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1524,7 +1539,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = h_tgt_all ? h_tgt_all : llama_get_embeddings_nextn(ctx_tgt);
+                if (pf_prof) { t_p1 = ggml_time_us(); }
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1571,6 +1587,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+            if (pf_prof) {
+                t_p2 = ggml_time_us();
+                llama_synchronize(ctx_dft);
+                t_p3 = ggml_time_us();
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1580,6 +1601,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+
+            if (pf_trim) {
+                // accept() reads row min(n_accepted, n_rows - 1) and n_accepted never exceeds the
+                // draft length, so rows past n_max + 1 are dead: a prompt ubatch keeps a handful of
+                // rows instead of copying n_tokens x n_embd floats. The target's nextn rows are
+                // dense by batch index (unmasked), so read them from one base pointer rather than
+                // one synchronising _ith call per row.
+                const int32_t n_keep = std::min(n_rows, std::max({ params.n_max, this->n_max, 16 }) + 1);
+                const float * h_all  = h_tgt_all;
+                verify_h[seq_id].resize((size_t) n_keep * n_embd);
+                std::memcpy(verify_h[seq_id].data(), h_all + (size_t) i_batch_beg[seq_id] * n_embd,
+                        (size_t) n_keep * row_bytes);
+                std::memcpy(pending_h[seq_id].data(), h_all + (size_t) i_batch_end[seq_id] * n_embd, row_bytes);
+                continue;
+            }
+
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -1589,6 +1626,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+        }
+
+        if (pf_prof) {
+            const int64_t t_p4 = ggml_time_us();
+            LOG_INF("mtp_pf: n=%d pos0=%d get_h=%.2f submit=%.2f dft_wait=%.2f verify_h=%.2f total=%.2f ms\n",
+                    n_tokens, (int) batch_in.pos[0], (t_p1 - t_p0)/1e3, (t_p2 - t_p1)/1e3, (t_p3 - t_p2)/1e3,
+                    (t_p4 - t_p3)/1e3, (t_p4 - t_p0)/1e3);
         }
 
         return true;
@@ -1757,6 +1801,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        GGML_ASSERT((size_t) (i_h + 1) * n_embd <= verify_h[seq_id].size() && "MTP accept past the kept verify rows");
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 };

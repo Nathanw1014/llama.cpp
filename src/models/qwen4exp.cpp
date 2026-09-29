@@ -434,17 +434,23 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
-        std::vector<int32_t> v(hc);
-        for (int64_t i = 0; i < hc; ++i) {
-            v[i] = (int32_t) i;
+        // either constant can be dead in a trimmed graph (the MTP KV-only catch-up), and a tensor
+        // no node reads is never allocated
+        if (iota && iota->buffer) {
+            std::vector<int32_t> v(hc);
+            for (int64_t i = 0; i < hc; ++i) {
+                v[i] = (int32_t) i;
+            }
+            ggml_backend_tensor_set(iota, v.data(), 0, hc*sizeof(int32_t));
         }
-        ggml_backend_tensor_set(iota, v.data(), 0, hc*sizeof(int32_t));
 
-        std::vector<float> e(hc*hc, 0.0f);
-        for (int64_t i = 0; i < hc; ++i) {
-            e[i*hc + i] = 1.0f;
+        if (eye && eye->buffer) {
+            std::vector<float> e(hc*hc, 0.0f);
+            for (int64_t i = 0; i < hc; ++i) {
+                e[i*hc + i] = 1.0f;
+            }
+            ggml_backend_tensor_set(eye, e.data(), 0, hc*hc*sizeof(float));
         }
-        ggml_backend_tensor_set(eye, e.data(), 0, hc*hc*sizeof(float));
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -2243,8 +2249,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp_h->h, n_embd, hc, n_tokens);
     res->add_input(std::move(inp_h));
 
+    // catch-up batches (the drafter consuming the target's prompt / accepted rows) request no
+    // outputs: nothing downstream of this block's KV write is ever read, because the next draft
+    // step restarts from the target's own hidden row. Store K/V for every row and stop, the way
+    // Gufo trims its prefill MTP pass. Same K/V ops as build_layer_attn, so the cache is identical.
+    // GGML_MTP_PF_TRIM=0 keeps the full block.
+    static const bool kv_only_enabled = [] {
+        const char * e = getenv("GGML_MTP_PF_TRIM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool kv_only = kv_only_enabled && n_outputs == 0;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // an unused out_ids input is never allocated, and setting it would abort
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     // the MTP context holds a plain attention cache over the nextn layer(s) only, the
     // deepseek32 pattern: the draft runs dense (no indexer cache, no recurrent state)
@@ -2265,7 +2283,23 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(e_norm, "mtp_enorm", il);
 
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat);
+    // eh_proj runs per stream: src1 is [2*n_embd, hc, n_tokens], which the backends treat as
+    // n_tokens batched hc-column mat-vecs and so re-read the weight once per token (~114 ms for
+    // a 2k-token prompt ubatch on gfx1151). Flattened to [2*n_embd, hc*n_tokens] it is one GEMM.
+    // Kept to prompt-sized batches so draft steps and small verify catch-ups keep their kernel.
+    // GGML_MTP_EH_GEMM=0 disables.
+    static const bool eh_gemm_enabled = [] {
+        const char * e = getenv("GGML_MTP_EH_GEMM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    ggml_tensor * res_hc = nullptr;
+    if (eh_gemm_enabled && n_tokens >= 32) {
+        ggml_tensor * concat_2d = ggml_reshape_2d(ctx0, concat, concat->ne[0], hc*n_tokens);
+        res_hc = build_lora_mm(layer.nextn.eh_proj, concat_2d);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens);
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, concat);
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     // one HC-wrapped full-attention QSA block, the mainline loop body minus PLE/GDN
@@ -2274,6 +2308,46 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
             &inject, il);
     ggml_build_forward_expand(gf, cur);
+
+    if (kv_only) {
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "Kcur_normed", il);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+        cb(Kcur, "Kcur", il);
+
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+
+        const auto * mctx_cur = inp_attn->mctx;
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+
+        res->t_h_nextn = nullptr;
+        res->t_embd    = nullptr;
+        res->t_logits  = nullptr;
+        return;
+    }
 
     cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);

@@ -2391,10 +2391,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        static const bool pf_prof = getenv("GGML_MTP_PF_PROF") && atoi(getenv("GGML_MTP_PF_PROF")) != 0;
+        const int64_t t_c0 = pf_prof ? ggml_time_us() : 0;
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_c1 = pf_prof ? ggml_time_us() : 0;
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_c2 = pf_prof ? ggml_time_us() : 0;
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        if (pf_prof) {
+            SLT_INF(slot, "ckpt_prof: n_tokens=%d tgt=%.2f ms dft=%.2f ms spec=%.2f ms size=%.3f MiB\n",
+                    (int) slot.prompt.n_tokens(), (t_c1 - t_c0)/1e3, (t_c2 - t_c1)/1e3, (ggml_time_us() - t_c2)/1e3,
+                    (float) cur.size() / 1024 / 1024);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
