@@ -2040,33 +2040,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const int64_t n_seq_tokens = x->ne[1];
     const int64_t mem_size     = mctx_cur->get_size();
     for (int64_t s = 1; s <= (int64_t) cparams.n_rs_seq && s <= n_seq_tokens; ++s) {
-        // columns [c0, c0 + state_cols) of [history | x^T]
-        const int64_t c0 = n_seq_tokens - s;
-        ggml_tensor * snap;
+        // columns [c0, c0 + state_cols) of [history | x^T], copied straight into the group's row
+        const int64_t c0   = n_seq_tokens - s;
+        const size_t  row0 = ((size_t) s * mem_size + kv_head) * row_size;
+        const size_t  esz  = ggml_element_size(conv_states_all);
         if (c0 >= state_cols) {
-            snap = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+            ggml_tensor * xs = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
                     channels, state_cols, n_seqs,
                     x->nb[1], x->nb[2],
                     (c0 - state_cols) * x->nb[1]));
-        } else {
-            ggml_tensor * old = ggml_view_3d(ctx0, state,
-                    state_cols - c0, channels, n_seqs,
-                    state->nb[1], state->nb[2],
-                    c0 * state->nb[0]);
-            if (c0 == 0) {
-                snap = old;
-            } else {
-                ggml_tensor * xs = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
-                        channels, c0, n_seqs,
-                        x->nb[1], x->nb[2], 0));
-                snap = ggml_concat(ctx0, ggml_cont(ctx0, old), ggml_cont(ctx0, xs), 0);
-            }
+            ggml_tensor * d = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols, channels, n_seqs,
+                    state_cols * esz, conv_states_all->nb[1], row0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, xs, d));
+            continue;
         }
-        ggml_tensor * snap_dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                ((size_t) s * mem_size + kv_head) * row_size);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, snap), snap_dst));
+        // the part still in the old history
+        ggml_tensor * old = ggml_view_3d(ctx0, state,
+                state_cols - c0, channels, n_seqs,
+                state->nb[1], state->nb[2],
+                c0 * state->nb[0]);
+        ggml_tensor * d_old = ggml_view_3d(ctx0, conv_states_all,
+                state_cols - c0, channels, n_seqs,
+                state_cols * esz, conv_states_all->nb[1], row0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, old, d_old));
+        if (c0 > 0) {
+            // and the first c0 tokens of this ubatch
+            ggml_tensor * xs = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                    channels, c0, n_seqs,
+                    x->nb[1], x->nb[2], 0));
+            ggml_tensor * d_x = ggml_view_3d(ctx0, conv_states_all,
+                    c0, channels, n_seqs,
+                    state_cols * esz, conv_states_all->nb[1], row0 + (state_cols - c0) * esz);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, xs, d_x));
+        }
     }
 
     return conv_input;
