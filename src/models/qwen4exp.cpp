@@ -429,6 +429,20 @@ static void qwen4exp_keep_until(ggml_tensor * node, ggml_tensor * t) {
     GGML_ABORT("no free source slot");
 }
 
+// LLAMA_HC_KEEP_SRCS=1 keeps the inputs of a combine (block output, residual, inject weights) allocated until
+// the next mix's f16 norm cast is. Their last reader is the DSV4_HC_POST that Vulkan fuses with that norm
+// (HC_POST_NORM_CPY), so ggml-alloc was free to put the f16 norm output on their bytes; the fused kernel would
+// then overwrite rows other workgroups have not read yet, and the overlap check dropped the fusion on 32 of 96
+// combines at d0 and 50 at d16384 (REAP-320 ub2048). The hc gate cast keeps the low-rank input the same way
+// instead of through a consumer-less view, which pinned it to the end of the graph.
+static bool qwen4exp_hc_keep_srcs() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_KEEP_SRCS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
     static const bool on = [&]() {
         if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
@@ -607,6 +621,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             // prefill only (nt >= 32): at decode the f16-B mat-vec paths are slower than the f32 ones
             // and there is no conversion pass to save (2026-09-14: tg 27.2 -> 25.2 with the cast at N=1)
             xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+            if (x->op == GGML_OP_DSV4_HC_POST && qwen4exp_hc_keep_srcs()) {
+                // the combine's inputs stay allocated until the cast is (see qwen4exp_hc_keep_srcs)
+                for (int s = 0; s < 3; ++s) {
+                    qwen4exp_keep_until(xn, x->src[s]);
+                }
+            }
         }
         xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     } else {
@@ -626,7 +646,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         gate_logits = ggml_cast(ctx0, gate_logits, GGML_TYPE_F16);
         // the low-rank input stays referenced past the cast: the fused matmul reads it while it writes the
         // cast's destination, so the allocator must not place the two on the same bytes
-        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo, 1, 0));
+        if (qwen4exp_hc_keep_srcs()) {
+            qwen4exp_keep_until(gate_logits, lo);
+        } else {
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo, 1, 0));
+        }
     }
 
     ggml_tensor * mixed;
