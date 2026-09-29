@@ -500,6 +500,29 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // LLAMA_SPEC_DEPTH_N_MAX="<ctx>:<n>[,<ctx>:<n>...]": from <ctx> tokens of context on, draft at most
+        // <n> tokens (the last matching entry wins; 0 turns drafting off). A verify token costs more of an
+        // autoregressive step deep in the context, so the best draft width shrinks with depth.
+        static const std::vector<std::pair<int, int>> depth_n_max = [] {
+            std::vector<std::pair<int, int>> v;
+            const char * e = getenv("LLAMA_SPEC_DEPTH_N_MAX");
+            std::stringstream ss(e ? e : "");
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                const auto c = item.find(':');
+                if (c != std::string::npos) {
+                    v.emplace_back(atoi(item.substr(0, c).c_str()), atoi(item.substr(c + 1).c_str()));
+                }
+            }
+            std::sort(v.begin(), v.end());
+            return v;
+        }();
+        for (const auto & [depth, n] : depth_n_max) {
+            if (prompt.n_tokens() >= depth) {
+                n_draft_max = std::min(n_draft_max, n);
+            }
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
