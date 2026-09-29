@@ -9062,6 +9062,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 128, 320, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 200, 130, 2560, {1, 1}, {1, 1}));
     }
+    // Flash-Next hc down/up GEMMs at their real shapes (skinny tile / split-K selection): f32 and f16 B, n = 512 / 2048
+    for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, tb,   320, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, tb, 10240, n,   320, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 2048, 320));
     for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 256, 128, 320));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 200, 130, 2560));
@@ -11085,6 +11093,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_rms_norm_mul_cpy({2560, 4, 2048, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 2048, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, 2048, 320));
+    // Flash-Next REAP-320 hc down/up (q8_0): f16 B (the XN16 chain feeds the down GEMM f16) and the f16-output up GEMM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 2048, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 2048, 320));
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q8_0, 128, 10, true, 2560, 2048, 640));
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q4_K, 128, 10, false, 640, 2048, 2560));
     test_cases.emplace_back(new test_multi_add_f16(2560, 10, 2048));
