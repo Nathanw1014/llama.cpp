@@ -11189,6 +11189,50 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
           bias ? ggml_vk_tensor_subbuffer(ctx, bias) : out_buf }, pc, { M, N, ns });
 }
 
+// A float MUL_MAT with 9..64 columns runs as mat-vec dispatches of at most mul_mat_vec_max_cols columns
+// instead of one GEMM. The qwen4exp QSA indexer scorer multiplies the keys by 4 heads x n tokens: a
+// single decode token (4 columns) takes the f32 mat-vec, a 3..16-token speculative verify batch took
+// the coopmat GEMM, whose f16 staging changes the scores enough to flip the top-k selection near ties
+// (Qwen3.8-Flash-Next at 7k context: 0.3..0.8 nat logit difference between a verify row and the
+// decode of the same context). Each column of the mat-vec accumulates the same way whatever the
+// column count, so a verify row's scores equal decode's. GGML_VK_MMV_SPLIT_COLS=0 restores the GEMM.
+static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+static bool ggml_vk_mul_mat_vec_split_cols(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_MMV_SPLIT_COLS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const ggml_tensor * dst  = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t n = dst->ne[1];
+    if (!enabled || ctx->num_additional_fused_ops != 0 || n <= (int64_t) mul_mat_vec_max_cols || n > 64 ||
+        (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->ne[2] * src1->ne[3] != 1 || dst->ne[2] * dst->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    for (int64_t c0 = 0; c0 < n; c0 += mul_mat_vec_max_cols) {
+        const int64_t nc = std::min<int64_t>(mul_mat_vec_max_cols, n - c0);
+        // row-offset copies: offsets derive from ->data
+        ggml_tensor s1 = *src1; s1.view_src = nullptr; s1.view_offs = 0;
+        s1.ne[1] = nc; s1.data = (char *) src1->data + c0 * src1->nb[1];
+        s1.nb[2] = s1.nb[1] * nc; s1.nb[3] = s1.nb[2];
+        ggml_tensor d = *dst;    d.view_src = nullptr;  d.view_offs = 0;
+        d.ne[1] = nc;  d.data = (char *) dst->data + c0 * dst->nb[1];
+        d.nb[2] = d.nb[1] * nc; d.nb[3] = d.nb[2];
+        d.src[1] = &s1;
+        ggml_tensor * nodes[1] = { &d };
+        ggml_cgraph g = {};
+        g.n_nodes = 1;
+        g.nodes   = nodes;
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, &g, 0);
+    }
+    // the staging cache is keyed by tensor address; the copies above lived on this stack frame
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    return true;
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -11253,6 +11297,8 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (ggml_vk_mul_mat_vec_split_cols(ctx, subctx, cgraph, node_idx)) {
+        // done as <= 8-column mat-vec dispatches
     } else {
         // MUL_MAT+CPY(f16): write the f16 result straight into the CPY's destination
         ggml_tensor * fused_cpy = (ctx->num_additional_fused_ops == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_CPY)
