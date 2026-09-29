@@ -2026,6 +2026,8 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t sp0, sp1;
     uint32_t sc0, sc1, sc2;
     uint32_t sd0, sd1, sd2;
+    uint32_t gate;               // HC_POST_GATE: post = gate_out*sigmoid(gate_in*p)
+    float    gate_in, gate_out;
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
@@ -2036,6 +2038,8 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t sp0, sp1;
     uint32_t sg0, sg1;
     float    eps;
+    uint32_t gate;               // HC_POST_GATE: post = gate_out*sigmoid(gate_in*p)
+    float    gate_in, gate_out;
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 
@@ -2692,6 +2696,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_rms_norm_scale {};   // RMS_NORM+SCALE (the GDN q/k l2 norm)
     bool fused_mul_add {};          // MUL+ADD with a broadcast multiplier (MUL_ADD)
+    bool fused_hc_post_gate {};     // SCALE -> SIGMOID -> SCALE folded into DSV4_HC_POST(+NORM) as the post weights (HC_POST_GATE)
     bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue
     const ggml_tensor * qsa_score_bias {};
     bool skip_node {};              // the current node's result is never read: record nothing
@@ -16261,10 +16266,12 @@ static void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subc
         pc, {n_tokens, 1, 1});
 }
 
-static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// gate_in: the first SCALE of a fused HC_POST_GATE chain (scale -> sigmoid -> scale -> post). The kernel
+// then reads the chain's input and applies the two scales and the sigmoid itself.
+static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * gate_in = nullptr) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * post     = gate_in ? gate_in->src[0] : dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     const uint32_t n_embd   = (uint32_t) x->ne[0];
@@ -16282,6 +16289,9 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
         (uint32_t)(post->nb[0] / sizeof(float)), (uint32_t)(post->nb[1] / sizeof(float)),
         (uint32_t)(comb->nb[0] / sizeof(float)), (uint32_t)(comb->nb[1] / sizeof(float)), (uint32_t)(comb->nb[2] / sizeof(float)),
         (uint32_t)(dst->nb[0] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[2] / sizeof(float)),
+        gate_in ? 1u : 0u,
+        gate_in ? ggml_get_op_params_f32(gate_in, 0) : 1.0f,
+        gate_in ? ggml_get_op_params_f32(dst->src[2], 0) : 1.0f,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -16350,12 +16360,69 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
     return true;
 }
 
-static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+// HC_POST_GATE (idea from upstream #29520): qwen4exp's combine weights are w = 2*sigmoid(inject/hc), a
+// SCALE -> SIGMOID -> SCALE chain over [hc, n_tokens] feeding DSV4_HC_POST's post operand. Three tiny
+// dispatches (and their barriers) per combine, 96 combines per token; the hc_post kernels apply the chain
+// themselves while they read the weights. Bit-exact: the shaders use scale.comp's and op_sigmoid's own
+// expressions. Returns the number of fused nodes after node_idx (3, or 6 with HC_POST_NORM_CPY behind it).
+// GGML_VK_FUSE_HC_POST_GATE=0 disables.
+static bool ggml_vk_fuse_hc_post_gate_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_HC_POST_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+
+static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
+    { 1, 0, 0 }, // sigmoid->src[0] == scale_in
+    { 2, 0, 1 }, // scale_out->src[0] == sigmoid
+    { 3, 2, 2 }, // hc_post->src[2] (post) == scale_out
+};
+
+static bool ggml_vk_hc_post_gate_matches(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + (int) hc_post_gate_pattern.size() > cgraph->n_nodes) {
+        return false;
+    }
+    for (size_t k = 0; k < hc_post_gate_pattern.size(); ++k) {
+        if (cgraph->nodes[node_idx + k]->op != hc_post_gate_pattern.begin()[k]) {
+            return false;
+        }
+    }
+    return ggml_get_unary_op(cgraph->nodes[node_idx + 1]) == GGML_UNARY_OP_SIGMOID &&
+           ggml_check_edges(cgraph, node_idx, hc_post_gate_edges);
+}
+
+static int ggml_vk_can_fuse_hc_post_gate(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_hc_post_gate_enabled() || cgraph->nodes[node_idx]->op != GGML_OP_SCALE ||
+        !ggml_vk_hc_post_gate_matches(cgraph, node_idx) ||
+        // the three chain nodes are elided: nothing outside the fusion may read them
+        !ggml_can_fuse_subgraph(cgraph, node_idx, hc_post_gate_pattern, { node_idx + 3 })) {
+        return 0;
+    }
+    const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
+    const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * inj       = scale_in->src[0];
+    // the kernels fold scale -> sigmoid -> scale; a bias on either scale is not handled
+    if (ggml_get_op_params_f32(scale_in, 1) != 0.0f || ggml_get_op_params_f32(scale_out, 1) != 0.0f ||
+        inj->type != GGML_TYPE_F32 || sigmoid->type != GGML_TYPE_F32 || scale_out->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(inj, scale_out) || !ggml_is_contiguous(inj) || !ggml_is_contiguous(scale_out) ||
+        get_misalign_bytes(ctx, inj) != 0) {
+        return 0;
+    }
+    return ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, node_idx + 3) ? 6 : 3;
+}
+
+static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                      const ggml_tensor * gate_in = nullptr) {
     ggml_tensor * post = cgraph->nodes[node_idx];
     const ggml_tensor * rms  = cgraph->nodes[node_idx + 1];
     const ggml_tensor * mul  = cgraph->nodes[node_idx + 2];
     ggml_tensor * cpy  = cgraph->nodes[node_idx + 3];
-    const ggml_tensor * x = post->src[0], * res = post->src[1], * pw = post->src[2];
+    const ggml_tensor * x = post->src[0], * res = post->src[1], * pw = gate_in ? gate_in->src[0] : post->src[2];
     const ggml_tensor * gamma = mul->src[1];
 
     const uint32_t n_embd = (uint32_t) x->ne[0];
@@ -16374,6 +16441,9 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t)(pw->nb[0] / 4), (uint32_t)(pw->nb[1] / 4),
         (uint32_t)(gamma->nb[0] / 4), (uint32_t)(gamma->nb[1] / 4),
         eps,
+        gate_in ? 1u : 0u,
+        gate_in ? ggml_get_op_params_f32(gate_in, 0) : 1.0f,
+        gate_in ? ggml_get_op_params_f32(post->src[2], 0) : 1.0f,
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
@@ -19354,6 +19424,15 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SCALE:
+        if (ctx->fused_hc_post_gate) {
+            // HC_POST_GATE(_NORM): node is the chain's first SCALE, the DSV4_HC_POST is three nodes on
+            if (ctx->num_additional_fused_ops == 6) {
+                ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx + 3, node);
+            } else {
+                ggml_vk_dsv4_hc_post(ctx, compute_ctx, cgraph->nodes[node_idx + 3], node);
+            }
+            break;
+        }
         ggml_vk_scale(ctx, compute_ctx, src0, node);
 
         break;
@@ -21699,6 +21778,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_rms_norm_scale = false;
         ctx->fused_mul_add = false;
         ctx->fused_qsa_score = false;
+        ctx->fused_hc_post_gate = false;
         ctx->qsa_score_bias = nullptr;
         ctx->skip_node = false;
         const char *fusion_string {};
@@ -21734,6 +21814,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (const int gate_n = ggml_vk_can_fuse_hc_post_gate(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = gate_n;
+                ctx->fused_hc_post_gate = true;
+                // the kernel reads the chain's input while it writes the residual: no aliasing anywhere
+                std::fill_n(op_srcs_fused_elementwise, gate_n + 1, false);
+                if (gate_n == 6) {
+                    fusion_string = "HC_POST_GATE_NORM_CPY";
+                    ctx->fused_ops_write_mask |= (1 << 3) | (1 << 6);   // the residual and the f16 norm output
+                    op_srcs_fused_elementwise[6] = true;                // the CPY's src[1] is its own destination
+                } else {
+                    fusion_string = "HC_POST_GATE";
+                }
             } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "HC_POST_NORM_CPY";
@@ -22043,6 +22135,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_mul_add = false;
                 ctx->fused_qsa_score = false;
+                ctx->fused_hc_post_gate = false;
                 ctx->qsa_score_bias = nullptr;
             }
         }
@@ -22259,6 +22352,11 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             keep_pattern(qsa_score_pattern)) {
             continue;
         }
+        // HC_POST_GATE: keep the scatter-weight chain in front of its hc_post (qwen4exp builds them adjacent)
+        if (ggml_vk_fuse_hc_post_gate_enabled() && ggml_vk_hc_post_gate_matches(graph, first_unused) &&
+            keep_pattern(hc_post_gate_pattern)) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -22301,6 +22399,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
+                (ggml_vk_fuse_hc_post_gate_enabled() && match_pattern(hc_post_gate_pattern, j) && ggml_vk_hc_post_gate_matches(graph, j)) ||
                 in_qsa_pattern(j)) {
                 continue;
             }

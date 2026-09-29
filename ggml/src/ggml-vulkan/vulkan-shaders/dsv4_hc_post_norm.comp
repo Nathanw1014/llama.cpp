@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
     uint  sp0, sp1;        // post strides: stream, token
     uint  sg0, sg1;        // gamma strides: element, stream
     float eps;
+    uint  gate;           // HC_POST_GATE fusion: post = gate_out * sigmoid(gate_in * p) (qwen4exp scatter weights)
+    float gate_in;
+    float gate_out;
 } p;
 
 // vec4 everywhere: n_embd % 4 == 0 and every operand has element stride 1 (host-checked), so the
@@ -49,7 +52,11 @@ void main() {
         return;
     }
     const uint  nv4 = p.n_embd / 4;
-    const float pw  = data_p[h * p.sp0 + t * p.sp1];
+    float pw = data_p[h * p.sp0 + t * p.sp1];
+    if (p.gate != 0) {
+        // the same expressions as scale.comp and unary.comp's op_sigmoid, so the fused result is bit-identical
+        pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
+    }
     const uint  ob  = ((t * p.hc + h) * p.n_embd) / 4;   // contiguous [n_embd, hc, n_tokens] outputs, vec4 index
     const uint  xb  = (t * p.sx1) / 4;
     const uint  rb  = (h * p.sr1 + t * p.sr2) / 4;

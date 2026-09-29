@@ -4355,16 +4355,18 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
 
     bool run_whole_graph() override { return true; }
 
+    const bool gated;   // post = 2*sigmoid(post/hc) as qwen4exp builds it (Vulkan HC_POST_GATE_NORM_CPY)
+
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
+        return VARS_TO_STR3(n_embd, n_tokens, gated);
     }
 
     double max_nmse_err() override {
         return 1e-4;   // f16 norm output
     }
 
-    test_dsv4_hc_post_norm(int64_t n_embd = 31, int64_t n_tokens = 17)
-        : n_embd(n_embd), n_tokens(n_tokens) {}
+    test_dsv4_hc_post_norm(int64_t n_embd = 31, int64_t n_tokens = 17, bool gated = false)
+        : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4379,6 +4381,9 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
         ggml_set_name(gamma, "gamma");
 
         ggml_tensor * comb = ggml_repeat_4d(ctx, eye, hc, hc, n_tokens, 1);
+        if (gated) {
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+        }
         ggml_tensor * res_out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_tensor * xn = ggml_cast(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, res_out, 1e-6f), gamma), GGML_TYPE_F16);
         // the fused kernel writes both; check both through one output
@@ -4397,12 +4402,16 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         return "DSV4_HC_POST";
     }
 
+    const bool gated;   // post = 2*sigmoid(post/hc) as qwen4exp builds it (Vulkan HC_POST_GATE)
+
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
+        return VARS_TO_STR3(n_embd, n_tokens, gated);
     }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17)
-        : n_embd(n_embd), n_tokens(n_tokens) {}
+    bool run_whole_graph() override { return gated; }
+
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool gated = false)
+        : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4416,6 +4425,10 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
         ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
         ggml_set_name(comb, "comb");
+
+        if (gated) {
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+        }
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
@@ -9044,6 +9057,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(32, 17));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, 21));
+    test_cases.emplace_back(new test_dsv4_hc_post(1, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(32, 17, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(4096, 3));
     test_cases.emplace_back(new test_dsv4_hc_mix(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_mix(31, 17));

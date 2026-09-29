@@ -399,6 +399,19 @@ static bool qwen4exp_hc_mixop() {
     return on;
 }
 
+// LLAMA_HC_POST_GATE=0 restores the old combine node order. Default: the combine emits its scatter-weight
+// chain (scale -> sigmoid -> scale) directly in front of the DSV4_HC_POST that reads it, with the block
+// output, the residual and the identity comb expanded first, so a backend can fold the chain into the
+// hc_post kernel (Vulkan HC_POST_GATE; the idea of upstream #29520). The identity comb is built once per
+// graph and token count instead of once per combine (upstream #28901 drops it for the same reason).
+static bool qwen4exp_hc_post_gate() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_POST_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
     static const bool on = [&]() {
         if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
@@ -585,6 +598,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         int           il) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
+
+    if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_post_gate() && inject->ne[0] == hc && inject->ne[1] == nt &&
+        ggml_n_dims(inject) <= 2) {
+        // the same combine as below, ordered for HC_POST_GATE: every other operand is in the graph before
+        // the chain, and w needs no reshape, so scale, sigmoid, scale and hc_post are consecutive nodes
+        ggml_tensor * x = ggml_reshape_2d(ctx0, block_out, n_embd, nt);
+        ggml_tensor *& comb = hc_comb_by_nt[nt];
+        if (comb == nullptr) {
+            comb = ggml_repeat_4d(ctx0, build_hc_consts()->eye, hc, hc, nt, 1);
+        }
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, x);
+        ggml_build_forward_expand(gf, comb);
+        ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
+        ggml_tensor * cur = ggml_dsv4_hc_post(ctx0, x, residual, w, comb);
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));

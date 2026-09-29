@@ -2396,6 +2396,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         // hc fast path constants (I32 iota [hc], F32 identity [hc, hc]), created on first use
         llm_graph_input_hc_consts * hc_consts = nullptr;
         llm_graph_input_hc_consts * build_hc_consts();
+        // the identity comb repeated to [hc, hc, nt], one per token count (the last layer runs on the output rows)
+        std::map<int64_t, ggml_tensor *> hc_comb_by_nt;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(

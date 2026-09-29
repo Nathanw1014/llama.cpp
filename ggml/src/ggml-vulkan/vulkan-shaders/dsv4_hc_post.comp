@@ -22,6 +22,9 @@ layout(push_constant) uniform Parameters {
     uint sp0, sp1;
     uint sc0, sc1, sc2;
     uint sd0, sd1, sd2;
+    uint  gate;           // HC_POST_GATE fusion: post = gate_out * sigmoid(gate_in * p) (qwen4exp scatter weights)
+    float gate_in;
+    float gate_out;
 } p;
 
 void main() {
@@ -34,7 +37,12 @@ void main() {
     const uint idst = (ir / p.n_embd) % p.hc;
     const uint it   = ir / (p.n_embd * p.hc);
 
-    float sum = data_x[i0 * p.sx0 + it * p.sx1] * data_p[idst * p.sp0 + it * p.sp1];
+    float pw = data_p[idst * p.sp0 + it * p.sp1];
+    if (p.gate != 0) {
+        // the same expressions as scale.comp and unary.comp's op_sigmoid, so the fused result is bit-identical
+        pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
+    }
+    float sum = data_x[i0 * p.sx0 + it * p.sx1] * pw;
     for (uint isrc = 0; isrc < p.hc; ++isrc) {
         sum += data_r[i0 * p.sr0 + isrc * p.sr1 + it * p.sr2]
              * data_c[idst * p.sc0 + isrc * p.sc1 + it * p.sc2];
