@@ -11264,7 +11264,7 @@ void ggml_compute_forward_dsv4_hc_post(
 }
 
 // ggml_compute_forward_dsv4_hc_mix
-//   dst[i, t] = scale * sum_c xn[i, c, t] * sigmoid(gate[c*n_embd + i, t])
+//   dst[i, t] = scale * sum_c xn[i, c, t] * sigmoid(gate[c*n_embd + i, t])   (op param 1: gate row i*hc + c)
 
 static void ggml_compute_forward_dsv4_hc_mix_f32(
         const ggml_compute_params * params,
@@ -11291,6 +11291,8 @@ static void ggml_compute_forward_dsv4_hc_mix_f32(
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
+    // gate row of stream c, element i0: c*n_embd + i0 (stream-major) or i0*hc + c (hc-interleaved)
+    const bool gil = ggml_get_op_params_i32(dst, 1) != 0;
 
     GGML_TENSOR_LOCALS(size_t, nbx, xn,   nb);
     GGML_TENSOR_LOCALS(size_t, nbg, gate, nb);
@@ -11311,7 +11313,7 @@ static void ggml_compute_forward_dsv4_hc_mix_f32(
             for (int64_t c = 0; c < hc; ++c) {
                 const char * xp = (const char *) xn->data + i0*nbx0 + c*nbx1 + it*nbx2;
                 const float xv = xn_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) xp) : *(const float *) xp;
-                const char * gp = (const char *) gate->data + (c*n_embd + i0)*nbg0 + it*nbg1;
+                const char * gp = (const char *) gate->data + (gil ? i0*hc + c : c*n_embd + i0)*nbg0 + it*nbg1;
                 const float gv = g_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) gp) : *(const float *) gp;
                 sum += xv * (1.0f / (1.0f + expf(-gv)));
             }

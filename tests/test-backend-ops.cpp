@@ -4192,6 +4192,7 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     const ggml_type type_x;
     const ggml_type type_d;
     const ggml_type type_g;   // gate logits: f32, or f16 (the up-GEMM wrote f16) with f16 xn and result
+    const bool gate_il;       // gate rows hc-interleaved (LLAMA_HC_UP_IL)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4199,15 +4200,16 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_embd, n_tokens, type_x, type_d, type_g);
+        return VARS_TO_STR6(n_embd, n_tokens, type_x, type_d, type_g, gate_il);
     }
 
     double max_nmse_err() override {
         return type_d == GGML_TYPE_F16 ? 1e-4 : 1e-7;
     }
 
-    test_dsv4_hc_mix(int64_t n_embd = 31, int64_t n_tokens = 17, ggml_type type_x = GGML_TYPE_F32, ggml_type type_d = GGML_TYPE_F32, ggml_type type_g = GGML_TYPE_F32)
-        : n_embd(n_embd), n_tokens(n_tokens), type_x(type_x), type_d(type_d), type_g(type_g) {}
+    test_dsv4_hc_mix(int64_t n_embd = 31, int64_t n_tokens = 17, ggml_type type_x = GGML_TYPE_F32, ggml_type type_d = GGML_TYPE_F32, ggml_type type_g = GGML_TYPE_F32,
+                     bool gate_il = false)
+        : n_embd(n_embd), n_tokens(n_tokens), type_x(type_x), type_d(type_d), type_g(type_g), gate_il(gate_il) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * xn = ggml_new_tensor_3d(ctx, type_x, n_embd, hc, n_tokens);
@@ -4216,7 +4218,65 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
         ggml_tensor * gate = ggml_new_tensor_2d(ctx, type_g, n_embd*hc, n_tokens);
         ggml_set_name(gate, "gate");
 
-        out = ggml_dsv4_hc_mix(ctx, xn, gate, 0.25f, type_d);
+        out = ggml_dsv4_hc_mix_ext(ctx, xn, gate, 0.25f, type_d, gate_il);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// qwen4exp hc up-projection + f16 cast + DSV4_HC_MIX with hc-interleaved gate rows (LLAMA_HC_UP_IL): Vulkan folds
+// the mix into the up-GEMM epilogue (HC_UP_MIX), so the whole graph is one dispatch
+struct test_hc_up_mix : public test_case {
+    static constexpr int64_t hc = 4;
+    const int64_t n_embd, n_tokens, lr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_UP_MIX";
+    }
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, lr);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_hc_up_mix(int64_t n_embd = 2560, int64_t n_tokens = 130, int64_t lr = 320)
+        : n_embd(n_embd), n_tokens(n_tokens), lr(lr) {}
+
+    // fixed-seed inputs: the fused and unfused Vulkan results can then be compared bit for bit across runs
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            std::vector<float> v((size_t) ggml_nelements(t));
+            for (float & x : v) {
+                x = dist(rng);
+            }
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            if (t->type == GGML_TYPE_F32) {
+                memcpy(buf.data(), v.data(), buf.size());
+            } else if (t->type == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(v.data(), (ggml_fp16_t *) buf.data(), (int64_t) v.size());
+            } else {
+                ggml_quantize_chunk(t->type, v.data(), buf.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd*hc);
+        ggml_set_name(w, "w_up");
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr, n_tokens);
+        ggml_set_name(lo, "lo");
+        ggml_tensor * xn = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd, hc, n_tokens);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * gate = ggml_cast(ctx, ggml_mul_mat(ctx, w, lo), GGML_TYPE_F16);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out = ggml_dsv4_hc_mix_ext(ctx, xn, gate, 0.25f, GGML_TYPE_F16, true);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9277,6 +9337,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F32, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(31, 17, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_mix(31, 17, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_hc_up_mix(2560, 130, 320));
+    test_cases.emplace_back(new test_hc_up_mix(2560, 256, 320));
+    test_cases.emplace_back(new test_hc_up_mix(48, 70, 320));
+    test_cases.emplace_back(new test_hc_up_mix(64, 97, 96));
     // f16-output matmuls (MUL_MAT(+MUL)+CPY(f16) fusions) at GEMM shapes, and the f16 MoE combine
     // large-tile dense GEMMs (the per-type eval loops above stop at m=16 / m=1): f16 B direct and the f32-B conversion path
     for (ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
@@ -11390,6 +11457,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Flash-Next REAP-320 hc down/up (q8_0): f16 B (the XN16 chain feeds the down GEMM f16) and the f16-output up GEMM
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 2048, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 2048, 320));
+    test_cases.emplace_back(new test_hc_up_mix(2560, 2048, 320));
+    // the hc inject mat-vec (xn f16 as A, the four f32 inject rows as B)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, 4, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q8_0, 128, 10, true, 2560, 2048, 640));
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q4_K, 128, 10, false, 640, 2048, 2560));
     test_cases.emplace_back(new test_multi_add_f16(2560, 10, 2048));

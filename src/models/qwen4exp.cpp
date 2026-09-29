@@ -11,6 +11,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -412,6 +413,22 @@ static bool qwen4exp_hc_post_gate() {
     return on;
 }
 
+// Keep `t` allocated until `node` has been allocated, by listing it as an extra source of `node` that no
+// backend reads (ggml-alloc frees a tensor after its last consumer). A consumer-less keep-alive view instead
+// never releases its source: it pins the tensor to the end of the graph.
+static void qwen4exp_keep_until(ggml_tensor * node, ggml_tensor * t) {
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (node->src[s] == t) {
+            return;
+        }
+        if (node->src[s] == nullptr) {
+            node->src[s] = t;
+            return;
+        }
+    }
+    GGML_ABORT("no free source slot");
+}
+
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
     static const bool on = [&]() {
         if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
@@ -429,6 +446,77 @@ static bool qwen4exp_hc_fastpath(const llama_model & model) {
         return true;
     }();
     return on;
+}
+
+// LLAMA_HC_UP_IL=1 reorders the rows of every hc up-projection weight once, on the first graph build, from
+// stream-major (row c*n_embd + i) to hc-interleaved (row i*hc + c), and build_hc_mix tells DSV4_HC_MIX so.
+// Each gate logit is the same row dot product as before, so the mix is the same bits; what changes is that a
+// GEMM row tile of the up-projection then holds whole elements (all hc streams of each), which lets the Vulkan
+// backend apply the mix in the up-GEMM epilogue (HC_UP_MIX) instead of writing and re-reading the
+// [n_embd*hc, nt] gate: 84 MB of traffic per mix at ub2048, 95 mixes per graph. Needs the mix op path and
+// every hc up weight in a device buffer that is not a host mapping (the rows are rewritten in place);
+// otherwise it stays off. Default off.
+bool llama_model_qwen4exp::hc_up_interleaved() const {
+    std::lock_guard<std::mutex> lock(hc_up_il_mutex);
+    if (hc_up_il_tried) {
+        return hc_up_il;
+    }
+    [this] {
+        const char * e = getenv("LLAMA_HC_UP_IL");
+        if (e == nullptr || atoi(e) == 0 || !qwen4exp_hc_fastpath(*this) || !qwen4exp_hc_mixop()) {
+            hc_up_il_tried = true;
+            return;
+        }
+        const int64_t hc     = hparams.dsv4_hc_mult;
+        const int64_t n_embd = hparams.n_embd;
+        std::vector<ggml_tensor *> ws;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * w : { layer.hc_attn_up, layer.hc_ffn_up, layer.nextn.hc_head_up }) {
+                if (w != nullptr) {
+                    ws.push_back(w);
+                }
+            }
+        }
+        if (hc_head_up != nullptr) {
+            ws.push_back(hc_head_up);
+        }
+        for (const ggml_tensor * w : ws) {
+            if (w->data == nullptr) {
+                return;   // a no-alloc model (the -fit probe): decide on a later build, with the weights loaded
+            }
+        }
+        hc_up_il_tried = true;
+        for (const ggml_tensor * w : ws) {
+            ggml_backend_buffer_t buf = w->buffer;
+            ggml_backend_dev_t    dev = buf ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) : nullptr;
+            ggml_backend_dev_props props;
+            if (dev != nullptr) {
+                ggml_backend_dev_get_props(dev, &props);
+            }
+            if (buf == nullptr || ggml_backend_buffer_is_host(buf) || dev == nullptr || props.caps.buffer_from_host_ptr ||
+                !ggml_is_contiguous(w) || w->ne[1] != hc * n_embd || w->ne[2] != 1 || w->ne[3] != 1) {
+                LLAMA_LOG_WARN("%s: LLAMA_HC_UP_IL: %s is not a contiguous device-resident [*, %" PRId64 "] weight, keeping the stream-major layout\n",
+                        __func__, ggml_get_name(w), hc * n_embd);
+                return;
+            }
+        }
+        std::vector<uint8_t> src, dst;
+        for (ggml_tensor * w : ws) {
+            const size_t row = w->nb[1];
+            src.resize(ggml_nbytes(w));
+            dst.resize(ggml_nbytes(w));
+            ggml_backend_tensor_get(w, src.data(), 0, src.size());
+            for (int64_t c = 0; c < hc; ++c) {
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    memcpy(dst.data() + (i*hc + c)*row, src.data() + (c*n_embd + i)*row, row);
+                }
+            }
+            ggml_backend_tensor_set(w, dst.data(), 0, dst.size());
+        }
+        hc_up_il = true;
+        LLAMA_LOG_INFO("%s: LLAMA_HC_UP_IL: %zu hc up weights reordered to hc-interleaved rows\n", __func__, ws.size());
+    }();
+    return hc_up_il;
 }
 
 // w_inject is [hc_dim, hc]: hc (4) output rows. ggml_mul_mat(w_inject, xn) is a quantized GEMM with a
@@ -550,8 +638,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // conversion passes disappear and the write halves; f32 at decode (f16-B mat-vec paths are slower)
         const ggml_type mix_type = (qwen4exp_hc_xn16() && nt >= 32 && qwen4exp_takes_f16_b(model))
                                    ? GGML_TYPE_F16 : GGML_TYPE_F32;
-        mixed = ggml_dsv4_hc_mix(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), gate_logits, 1.0f / (float) hc, mix_type);
+        const bool gate_il = static_cast<const llama_model_qwen4exp &>(model).hc_up_interleaved();
+        if (gate_il) {
+            for (const auto & lora : *loras) {
+                if (lora.first->get_weight(w_up) != nullptr) {
+                    GGML_ABORT("LLAMA_HC_UP_IL: a LoRA adapter on %s would add a stream-major delta to the interleaved gate", ggml_get_name(w_up));
+                }
+            }
+        }
+        mixed = ggml_dsv4_hc_mix_ext(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), gate_logits, 1.0f / (float) hc, mix_type, gate_il);
         cb(mixed, "hc_mixed", il);
+        if (gate_il && gate_logits->op == GGML_OP_CPY) {
+            // HC_UP_MIX reads the low-rank input in the GEMM while its epilogue writes the mixed stream: keep lo
+            // allocated until the mix is, so the allocator cannot hand the mixed stream lo's freed bytes
+            qwen4exp_keep_until(mixed, lo);
+        }
     } else {
         ggml_tensor * gate = ggml_sigmoid(ctx0, gate_logits);
         cb(gate, "hc_gate", il);

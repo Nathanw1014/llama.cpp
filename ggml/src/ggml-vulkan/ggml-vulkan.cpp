@@ -949,6 +949,7 @@ struct vk_device_struct {
     // f16 OUTPUT (MUL_MAT+CPY(f16) fusion): f16-B KHR coopmat pipelines whose epilogue stores float16_t.
     // Only the weight types the Flash-Next graph writes f16 from are populated (q4_K q5_0 q8_0 q6_K).
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_COUNT];
+    vk_matmul_pipeline2 pipeline_matmul_q8_0_f16_hcmix;   // qwen4exp hc up-GEMM with the hc mix epilogue (HC_UP_MIX)
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
@@ -1380,6 +1381,12 @@ struct vk_mat_mat_push_constants {
 struct vk_mat_mat_qsa_push_constants {
     vk_mat_mat_push_constants mm;
     uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+};
+
+// matmul_q8_0_f16_hcmix (HC_EPI in mul_mm.comp): the plain push constants plus the xn addressing and the mix scale
+struct vk_mat_mat_hcmix_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t xn_c; uint32_t xn_t; float scale;
 };
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
@@ -2055,6 +2062,7 @@ struct vk_op_dsv4_hc_mix_push_constants {
     uint32_t sg0, sg1;
     uint32_t sd0, sd1;
     float    scale;
+    uint32_t gil;   // gate rows hc-interleaved (op param 1)
 };
 static_assert(sizeof(vk_op_dsv4_hc_mix_push_constants) <= 128);
 
@@ -2717,6 +2725,7 @@ struct ggml_backend_vk_context {
     bool fused_mul_add {};          // MUL+ADD with a broadcast multiplier (MUL_ADD)
     bool fused_hc_post_gate {};     // SCALE -> SIGMOID -> SCALE folded into DSV4_HC_POST(+NORM) as the post weights (HC_POST_GATE)
     bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue
+    bool fused_hc_up_mix {};        // qwen4exp hc up-GEMM + f16 cast + DSV4_HC_MIX in the GEMM epilogue (HC_UP_MIX)
     const ggml_tensor * qsa_score_bias {};
     bool skip_node {};              // the current node's result is never read: record nothing
     bool topk_qsa_cont_skipped {};  // the TOPK_QSA transpose was skipped; the fused dispatch must sync
@@ -5470,6 +5479,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q8_0], matmul_q8_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q6_K], matmul_q6_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_IQ4_NL], matmul_iq4_nl_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_matmul_q8_0_f16_hcmix, matmul_q8_0_f16_hcmix, mmq_wg_denoms, warptile_mmq, vk_mat_mat_hcmix_push_constants, 4, );
         }
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -10581,7 +10591,7 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 
 static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& subctx, const char * name);
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out = nullptr) {
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out = nullptr, ggml_tensor * hc_mix = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -10681,6 +10691,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // Fall back to f16 dequant mul mat
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], d16);
         quantize_y = false;
+    }
+    if (hc_mix != nullptr) {
+        // HC_UP_MIX: the same accumulator choice as the d16 pipeline it replaces, so the gate logits are the same bits
+        GGML_ASSERT(d16 && y_non_contig && src0->type == GGML_TYPE_Q8_0);
+        vk_matmul_pipeline2 & hp = ctx->device->pipeline_matmul_q8_0_f16_hcmix;
+        mmp = (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT &&
+               !hp.f16acc->is_empty()) ? hp.f16acc : hp.f32acc;
     }
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
@@ -10873,6 +10890,23 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
+    if (hc_mix != nullptr) {
+        GGML_ASSERT(split_k == 1 && ne12 * ne13 == 1);
+        const ggml_tensor * xn = hc_mix->src[0];
+        vk_mat_mat_hcmix_push_constants pc {};
+        const uint32_t stride_mix = (uint32_t) (hc_mix->nb[1] / ggml_type_size(hc_mix->type));
+        pc.mm = { (uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10, (uint32_t) ne10, (uint32_t) ne10, stride_mix,
+                  stride_batch_x, stride_batch_y, stride_mix * (uint32_t) hc_mix->ne[1],
+                  0, 1, (uint32_t) ne10, (uint32_t) ne02, (uint32_t) ne12, (uint32_t) r2, (uint32_t) r3, padded_n };
+        pc.xn_c  = (uint32_t) (xn->nb[1] / ggml_type_size(xn->type));
+        pc.xn_t  = (uint32_t) (xn->nb[2] / ggml_type_size(xn->type));
+        pc.scale = ggml_get_op_params_f32(hc_mix, 0);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { vk_subbuffer{ d_X, x_buf_offset, x_sz }, vk_subbuffer{ d_Y, y_buf_offset, y_sz },
+              ggml_vk_tensor_subbuffer(ctx, hc_mix), ggml_vk_tensor_subbuffer(ctx, xn) },
+            pc, { (uint32_t) ne01, (uint32_t) ne11, 1 });
+    } else {
     ggml_vk_matmul(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
@@ -10881,6 +10915,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
     );  // NOLINT
+    }
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
@@ -11555,6 +11590,11 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 
     if (ctx->fused_qsa_score) {
         ggml_vk_qsa_score(ctx, subctx, dst, ctx->qsa_score_bias, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+        return;
+    }
+    if (ctx->fused_hc_up_mix) {
+        // HC_UP_MIX: the f16-output GEMM path with the mix epilogue writing the DSV4_HC_MIX node
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
         return;
     }
 
@@ -16866,7 +16906,7 @@ static void ggml_vk_dsv4_hc_mix(ggml_backend_vk_context * ctx, vk_context& subct
         (uint32_t)(xn->nb[0] / xts), (uint32_t)(xn->nb[1] / xts), (uint32_t)(xn->nb[2] / xts),
         (uint32_t)(gate->nb[0] / gts), (uint32_t)(gate->nb[1] / gts),
         (uint32_t)(dst->nb[0] / dts), (uint32_t)(dst->nb[1] / dts),
-        scale,
+        scale, (uint32_t) (ggml_get_op_params_i32(dst, 1) != 0),
     };
 
     const uint32_t n_vec = (n_embd + 3) / 4;
@@ -21703,6 +21743,80 @@ static bool ggml_vk_can_fuse_mm_cpy16(const ggml_backend_vk_context * ctx, const
     }
     return true;
 }
+// qwen4exp hyper-connection mix (build_hc_mix, prefill) with the hc up weights hc-interleaved at load (LLAMA_HC_UP_IL):
+//   gate  = MUL_MAT(w_up Q8_0 [lr, n_embd*hc], lo F32 [lr, nt]) -> CPY(f16)
+//   mixed = DSV4_HC_MIX(xn F16 [n_embd, hc, nt], gate, gate rows i*hc + c)             [n_embd, nt] f16
+// matmul_q8_0_f16_hcmix runs the same f16-output GEMM and applies the sigmoid gate, the per-stream product and the
+// stream mean in its epilogue (a row tile holds whole elements), so the [n_embd*hc, nt] gate is neither written nor
+// read back: 42 + 42 MB per mix at ub2048, 95 mixes per graph. Gufo's DenseF16 GEMM kHcMix epilogue does the same.
+// Returns the DSV4_HC_MIX node index (0: no match). Only no-op view nodes may sit between the cast and the mix.
+// default on: it only matches the interleaved graphs LLAMA_HC_UP_IL builds; GGML_VK_HC_UP_MIX=0 disables,
+// =2 keeps only the graph order below (the control for the fusion itself)
+static int ggml_vk_hc_up_mix_mode() {
+    static const int m = [] { const char * e = getenv("GGML_VK_HC_UP_MIX"); return e ? atoi(e) : 1; }();
+    return m;
+}
+// graph_optimize keeps the cast and the mix adjacent (modes 1 and 2)
+static bool ggml_vk_hc_up_mix_enabled() {
+    return ggml_vk_hc_up_mix_mode() != 0;
+}
+static int ggml_vk_match_hc_up_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    auto reject = [&](const char * why) {
+        if (dbg && node_idx + 1 < cgraph->n_nodes && cgraph->nodes[node_idx + 1]->op == GGML_OP_CPY) {
+            fprintf(stderr, "ggml_vulkan: HC_UP_MIX not matched at node %d (%s): %s\n", node_idx, cgraph->nodes[node_idx]->name, why);
+        }
+        return 0;
+    };
+    const vk_matmul_pipeline2 & hp = ctx->device->pipeline_matmul_q8_0_f16_hcmix;
+    if (ggml_vk_hc_up_mix_mode() != 1 || (hp.f16acc->is_empty() && hp.f32acc->is_empty())) {
+        return reject("disabled or no pipeline");
+    }
+    if (!ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, node_idx)) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+    constexpr int64_t HC = 4;   // HC_N in mul_mm.comp
+    if (mm->src[0]->type != GGML_TYPE_Q8_0 || mm->ne[2] != 1 || mm->ne[3] != 1 || mm->ne[0] % (16 * HC) != 0 ||
+        (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return reject("matmul / cast shape or type");
+    }
+    int mix_idx = 0;
+    for (int j = node_idx + 2; j < std::min(node_idx + 8, cgraph->n_nodes); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_DSV4_HC_MIX && n->src[1] == cpy) {
+            mix_idx = j;
+            break;
+        }
+        if (n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE && n->op != GGML_OP_PERMUTE && n->op != GGML_OP_TRANSPOSE && n->op != GGML_OP_NONE) {
+            break;
+        }
+    }
+    if (mix_idx == 0) {
+        return reject("no DSV4_HC_MIX of the cast behind it");
+    }
+    // the gate is never written: nothing but the mix may read the cast (its use count also counts the view of
+    // its destination that a cast is, so walk the graph instead)
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (j != mix_idx && j != node_idx + 1 && cgraph->nodes[j]->src[k] == cpy) {   // the cast's src[1] is itself
+                if (dbg) { fprintf(stderr, "ggml_vulkan: HC_UP_MIX gate reader %d %s %s (mix %d)\n", j, ggml_op_name(cgraph->nodes[j]->op), cgraph->nodes[j]->name, mix_idx); }
+                return reject("the gate has another reader");
+            }
+        }
+    }
+    const ggml_tensor * mix = cgraph->nodes[mix_idx];
+    const ggml_tensor * xn  = mix->src[0];
+    if (ggml_get_op_params_i32(mix, 1) == 0 || mix->type != GGML_TYPE_F16 || !ggml_is_contiguous(mix) ||
+        xn->type != GGML_TYPE_F16 || xn->ne[1] != HC || xn->ne[0] * HC != mm->ne[0] || xn->ne[2] != mm->ne[1] || xn->ne[3] != 1 ||
+        xn->nb[0] != ggml_type_size(GGML_TYPE_F16) || mix->ne[0] != xn->ne[0] || mix->ne[1] != mm->ne[1] ||
+        get_misalign_bytes(ctx, xn) != 0 || get_misalign_bytes(ctx, mix) != 0) {
+        return reject(ggml_get_op_params_i32(mix, 1) == 0 ? "stream-major gate" : "mix / xn shape, type or alignment");
+    }
+    return mix_idx;
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
 // GGML_VK_FUSION_DEBUG=1 also reports why a MUL_MAT_ID(+MUL)+CPY(f16) candidate was not matched
 static void ggml_vk_cpy16_reject(const struct ggml_cgraph * cgraph, int node_idx, const char * why) {
@@ -22167,6 +22281,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_qsa_score = false;
         ctx->fused_hc_post_gate = false;
         ctx->qsa_score_bias = nullptr;
+        ctx->fused_hc_up_mix = false;
         ctx->skip_node = false;
         const char *fusion_string {};
         // cont(permute(score)) feeding a TOPK_QSA fusion that reads score directly: the transpose
@@ -22222,6 +22337,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[2] = false;
                 op_srcs_fused_elementwise[3] = true;    // the CPY's src[1] is its own destination; false here meant the
                                                         // overlap check disabled the fusion on every graph (2026-09-14)
+            } else if (const int hc_mix_idx = cgraph->nodes[i]->op == GGML_OP_MUL_MAT ? ggml_vk_match_hc_up_mix(ctx, cgraph, i) : 0) {
+                ctx->num_additional_fused_ops = hc_mix_idx - i;
+                ctx->fused_hc_up_mix = true;
+                fusion_string = "HC_UP_MIX";
+                // the epilogue reads xn (and the GEMM its operands) while it writes the mixed stream: no aliasing at all;
+                // the cast's src[1] is its own (never written) destination
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (const int qsa_last = cgraph->nodes[i]->op == GGML_OP_MUL_MAT ?
                                                 ggml_vk_match_qsa_score(ctx, cgraph, i, &ctx->qsa_score_bias) : 0) {
                 ctx->num_additional_fused_ops = qsa_last - i;
@@ -22524,6 +22646,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_qsa_score = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->qsa_score_bias = nullptr;
+                ctx->fused_hc_up_mix = false;
             }
         }
         // a skipped transpose must be consumed by the fused dispatch right after it
@@ -22804,6 +22927,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && j >= 2 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_MUL_MAT_ID &&
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
+                    // the hc gate cast followed by its DSV4_HC_MIX (HC_UP_MIX): keep the mix behind the cast
+                    !(ggml_vk_hc_up_mix_enabled() && j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_CPY &&
+                      graph->nodes[j]->op == GGML_OP_DSV4_HC_MIX && graph->nodes[j]->src[1] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&

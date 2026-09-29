@@ -2666,6 +2666,16 @@ extern "C" {
             float                 scale,
             enum   ggml_type      type);
 
+    // hc_mix with the gate rows hc-interleaved: gate[i*hc + c, t] is stream c of element i (the qwen4exp hc up
+    // weights reordered at load so a GEMM row tile holds whole elements, see LLAMA_HC_UP_IL)
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * gate,
+            float                 scale,
+            enum   ggml_type      type,
+            bool                  gate_interleaved);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

@@ -6500,6 +6500,16 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
         struct ggml_tensor  * gate,
         float                 scale,
         enum   ggml_type      type) {
+    return ggml_dsv4_hc_mix_ext(ctx, xn, gate, scale, type, false);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_mix_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xn,
+        struct ggml_tensor  * gate,
+        float                 scale,
+        enum   ggml_type      type,
+        bool                  gate_interleaved) {
     GGML_ASSERT(xn->type == GGML_TYPE_F32 || xn->type == GGML_TYPE_F16);
     GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
     GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
@@ -6517,7 +6527,8 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_embd, n_tokens);
 
-    ggml_set_op_params(result, &scale, sizeof(scale));
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, gate_interleaved ? 1 : 0);
 
     result->op     = GGML_OP_DSV4_HC_MIX;
     result->src[0] = xn;

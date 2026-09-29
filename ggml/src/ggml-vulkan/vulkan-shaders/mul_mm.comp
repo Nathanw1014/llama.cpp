@@ -87,6 +87,16 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout (binding = 3) readonly buffer QSA_BIAS {float data_qsa_bias[];};
 #endif
 
+#ifdef HC_EPI
+// qwen4exp hyper-connection mix epilogue (fused MUL_MAT(hc up) -> CPY(f16) -> DSV4_HC_MIX): the up weight rows are
+// hc-interleaved at load (row i*HC_N + c is stream c of element i, LLAMA_HC_UP_IL), so a 16-row tile holds TM/HC_N
+// whole elements, and D is the f16 mixed stream [n_embd, N] with
+//   D[t*stride_d + i] = f16(scale * sum_c xn[t*xn_t + c*xn_c + i] * sigmoid(f16(acc[i*HC_N + c, t])))
+// the order DSV4_HC_MIX evaluates it in, from the same f16-rounded gate logits. The gate itself is never written.
+#define HC_N 4
+layout (binding = 3) readonly buffer HC_XN {float16_t data_hc_xn[];};
+#endif
+
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
@@ -129,6 +139,12 @@ layout (push_constant) uniform parameter
     uint qsa_has_bias;
     uint qsa_stride_bias;
     uint qsa_batch_stride_bias;
+#endif
+#ifdef HC_EPI
+    uint padded_N;
+    uint hc_xn_c;      // xn strides in elements: stream, token
+    uint hc_xn_t;
+    float hc_scale;
 #endif
 #endif
 } p;
@@ -912,6 +928,36 @@ void main() {
                             s += data_qsa_bias[batch_idx * p.qsa_batch_stride_bias + t * p.qsa_stride_bias + row];
                         }
                         data_d[batch_idx * p.batch_stride_d + t * p.stride_d + row] = D_TYPE(s);
+                    }
+                }
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
+        }
+    }
+#elif defined(HC_EPI)
+    // TM is a multiple of HC_N and every row tile starts on one: the staged tile is TM/HC_N elements x TN tokens
+    [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+        [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
+                // the gate logits rounded to f16 through the same coopmat conversion the d16 store uses
+                const coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> g16 =
+                    coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+                        coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]));
+                coopMatStore(g16, coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                [[unroll]] for (uint o = tiw; o < TM * TN / HC_N; o += WARP) {
+                    const uint e   = o % (TM / HC_N);
+                    const uint g   = o / (TM / HC_N);
+                    const uint row = dr + cm_row * TM + e * HC_N;
+                    const uint col = dc + cm_col * TN + g;
+                    if (row < p.M && col < p.N) {
+                        const uint i = row / HC_N;
+                        float s = 0.0;
+                        [[unroll]] for (uint c = 0; c < HC_N; c++) {
+                            const float gv = float(coopmat_stage[warp_i * TM * TN + g * TM + e * HC_N + c]);
+                            s += float(data_hc_xn[col * p.hc_xn_t + c * p.hc_xn_c + i]) * (1.0f / (1.0f + exp(-gv)));
+                        }
+                        data_d[col * p.stride_d + i] = D_TYPE(s * p.hc_scale);
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);

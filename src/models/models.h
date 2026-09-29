@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2329,6 +2330,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     };
     mutable ple_hot_cache ple_hot;
     const struct ggml_tensor * ple_hot_table(ggml_backend_buffer_type_t buft) const;
+
+    // LLAMA_HC_UP_IL=1: the hc up-projection weights' rows reordered in place to hc-interleaved (row i*hc + c)
+    // on the first graph build; see qwen4exp.cpp. Model-wide, decided on the first build with loaded weights.
+    mutable std::mutex hc_up_il_mutex;
+    mutable bool       hc_up_il_tried = false;
+    mutable bool       hc_up_il       = false;
+    bool hc_up_interleaved() const;
 
     class llm_graph_input_qsa;
     class llm_graph_input_hc_consts;

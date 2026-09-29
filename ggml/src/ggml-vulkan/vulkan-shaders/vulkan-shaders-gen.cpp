@@ -631,6 +631,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
              (matmul_id_type != MatMulIdType::NONE && (tname == "iq3_xxs" || tname == "iq4_xs")))) {
             string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
+        // qwen4exp hc up-projection with the hyper-connection mix epilogue (HC_EPI): the f16 mixed stream, never the gate
+        if (coopmat && !coopmat2 && fp16 && !dot2 && matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
+            string_to_spv(shader_name + "_" + tname + "_f16_hcmix", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if ((coopmat || coopmat2) && (tname == "mxfp4" || tname == "nvfp4")) {

@@ -27,7 +27,12 @@ layout(push_constant) uniform Parameters {
     uint  sg0, sg1;        // gate strides in floats: element, token (element index = c*n_embd + i0)
     uint  sd0, sd1;        // dst strides in floats: element, token
     float scale;
+    uint  gil;             // 1: gate rows hc-interleaved (element index = i0*hc + c, the LLAMA_HC_UP_IL weights)
 } p;
+
+uint gate_row(const uint c, const uint i) {
+    return p.gil != 0 ? i * p.hc + c : c * p.n_embd + i;
+}
 
 float sigmoid(float v) {
     return 1.0f / (1.0f + exp(-v));
@@ -46,9 +51,10 @@ void main() {
     if (i0 + 4 <= p.n_embd) {
         for (uint c = 0; c < p.hc; ++c) {
             const uint xb = i0 + c * p.sx1 + it * p.sx2;
-            const uint gb = (c * p.n_embd + i0) + it * p.sg1;
+            const uint gb = it * p.sg1;
             const vec4 xv = vec4(float(data_x[xb]), float(data_x[xb + 1]), float(data_x[xb + 2]), float(data_x[xb + 3]));
-            const vec4 gv = vec4(float(data_g[gb]), float(data_g[gb + 1]), float(data_g[gb + 2]), float(data_g[gb + 3]));
+            const vec4 gv = vec4(float(data_g[gb + gate_row(c, i0)]),     float(data_g[gb + gate_row(c, i0 + 1)]),
+                                 float(data_g[gb + gate_row(c, i0 + 2)]), float(data_g[gb + gate_row(c, i0 + 3)]));
             sum += xv * vec4(sigmoid(gv.x), sigmoid(gv.y), sigmoid(gv.z), sigmoid(gv.w));
         }
         const uint db = i0 + it * p.sd1;
@@ -58,7 +64,7 @@ void main() {
         for (uint k = i0; k < p.n_embd; ++k) {
             float s = 0.0f;
             for (uint c = 0; c < p.hc; ++c) {
-                s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(float(data_g[(c * p.n_embd + k) + it * p.sg1]));
+                s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(float(data_g[gate_row(c, k) + it * p.sg1]));
             }
             data_d[k + it * p.sd1] = D_TYPE(p.scale * s);
         }
