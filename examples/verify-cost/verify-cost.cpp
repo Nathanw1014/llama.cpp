@@ -92,6 +92,11 @@ int main(int argc, char ** argv) {
     restore();
 
     printf("ctx n0=%d\n", n0);
+    // fingerprint of the single-token reference rows (compare across runs, e.g. with and without VC_RS)
+    for (int r = 0; r < nmax; ++r) {
+        double sum = 0; for (int k = 0; k < n_vocab; ++k) sum += ref[r][k];
+        printf("ref row %d sum %.9e logit0 %a\n", r, sum, ref[r][0]);
+    }
     printf("%3s %9s %9s %9s %8s  %s\n", "n", "med_ms", "min_ms", "ms/tok", "vs_n1", "row max|diff| vs single-token decode");
     double t1 = 0;
     for (int n : ns) {
