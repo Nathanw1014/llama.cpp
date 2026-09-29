@@ -17,9 +17,10 @@
 // S stays in f32 WMMA accumulators; it is fed back as an f16 B operand by swapping rows between the two
 // half-waves (RDNA3 layout: an f32 accumulator lane L holds column L%16, rows 2i + L/16; a B operand lane L
 // holds column L%16, rows 0..15). The A operands (Q, K, K^T, T, P) are stored by the prep in fragment order,
-// so a lane's fragment is two adjacent 16-byte units. With USE_LDS the workgroup stages the chunk's K, K^T,
-// T, P and gate factors (20 KB, 3 workgroups per CU) in LDS from registers loaded one chunk ahead; Q
-// fragments are read from global memory. Operands f16, accumulation f32: not bit-identical to the
+// so a lane's fragment is two adjacent 16-byte units, read straight from the scratch (one wave per workgroup:
+// 384 waves at the Flash-Next shape). USE_LDS (probe, GGML_VK_GDN_CHUNK_SCAN=1) stages the chunk's K, K^T, T,
+// P and gate factors per workgroup in LDS from registers loaded one chunk ahead instead: equal in-model,
+// 6% slower op-level, 1.5x slower at 4 heads. Operands f16, accumulation f32: not bit-identical to the
 // sequential kernel. Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
 
 layout(constant_id = 0) const uint WGT = 128;        // NW waves of 32
@@ -64,27 +65,30 @@ layout(binding = 3) readonly  buffer ScrBuf   { uvec4 scr4[];       };
 #define TFRAG(j, i)   (((j) * NT + (i)) * 32)        // T/P tile
 
 #ifdef USE_LDS
-// LDS: Kh, KhT, T, P, gam/dec in the global order
+// LDS: Kh, KhT, T, P, gam/dec in the global order (20 KB = 3 workgroups per CU; staging Q as well, 29 KB,
+// measured slower)
 #define L_K   0
-#define L_KT  512
-#define L_T   1024
-#define L_P   1152
-#define L_G   1280
-#define L_N   1296
+#define L_KT  (L_K + 512)
+#define L_T   (L_KT + 512)
+#define L_P   (L_T + 128)
+#define L_G   (L_P + 128)
+#define L_N   (L_G + 16)
+#define L_SRC (G_K - L_K)                            // global q/k block unit of LDS unit 0
 shared uvec4 L[L_N];
 #define A_K(u)  L[L_K + (u)]
 #define A_KT(u) L[L_KT + (u)]
 #define A_T(u)  L[L_T + (u)]
 #define A_P(u)  L[L_P + (u)]
 float gd(uint i) { return uintBitsToFloat(L[L_G + i / 4][i % 4]); }   // gam [0, CL), dec [CL, 2CL)
+#define A_Q(u)  scr4[qk4 + (u)]
 #else
 #define A_K(u)  scr4[qk4 + G_K + (u)]
 #define A_KT(u) scr4[qk4 + G_KT + (u)]
 #define A_T(u)  scr4[tp4 + (u)]
 #define A_P(u)  scr4[tp4 + G_P + (u)]
 #define gd(i)   uintBitsToFloat(scr4[tp4 + G_G + (i) / 4][(i) % 4])
-#endif
 #define A_Q(u)  scr4[qk4 + (u)]
+#endif
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -107,7 +111,8 @@ float gd(uint i) { return uintBitsToFloat(L[L_G + i / 4][i % 4]); }   // gam [0,
 #define LOAD_A(a, SRC, frag) { const uvec4 y0_ = SRC((frag) + la); const uvec4 y1_ = SRC((frag) + la + 1); SET_A(a, y0_, y1_) }
 
 // f32 accumulator -> f16 B operand of the same 16x16 tile: rows 4m+hi, 4m+2+hi are packed into one dword,
-// swapped with the other half-wave, and interleaved into rows 4m..4m+3
+// swapped with the other half-wave, and interleaved into rows 4m..4m+3. (A hi/lo f16 split of S, R and
+// Delta changed neither the test NMSE nor the Flash-Next KLD: the error is set by the f16 Q/K/T/P.)
 #define TO_B(b, acc) { \
     [[unroll]] for (uint m_ = 0; m_ < 4; m_++) { \
         const uint own_ = packFloat2x16(f16vec2(acc[2 * m_], acc[2 * m_ + 1])); \
@@ -133,8 +138,9 @@ void main() {
     const uint v0    = ((gl_WorkGroupID.x % nsplit) * NW + gl_SubgroupID) * 16;
 
     const uint state_base = (seq * H + h) * S_V * S_V + (v0 + lr) * S_V;
-    const uint v_base     = seq * sv3 + h * sv1 + v0 + lr;
-    const uint o_base     = (seq * n_tokens * H + h) * S_V + v0 + lr;
+    // token-row addressing: lane part (column, half-wave row parity) + a uniform row offset
+    const uint v_lane     = seq * sv3 + h * sv1 + v0 + lr + hi * sv2;
+    const uint o_lane     = (seq * n_tokens * H + h) * S_V + v0 + lr + hi * (S_V * H);
     // scratch is chunk-major (all heads of a chunk adjacent), see gdn_chunk_prep.comp
     const uint qk_base4   = (seq * nch * neq1 + iq1) * (QKU / 4);
     const uint tp_base4   = (n_seqs * nch * neq1 * QKU + (seq * nch * H + h) * TPU) / 4;
@@ -149,14 +155,14 @@ void main() {
 #ifdef USE_LDS
     // staging: unit u of the chunk comes from the q/k block (Kh, KhT) for u < L_T, else from the T/P block
     const uint NST = (L_N + WGT - 1) / WGT;
-    uvec4 stage[(L_N + 127) / 128];
+    uvec4 stage[(L_N + WGT - 1) / WGT];
 #define STAGE_LOAD(cc) { \
         const uint qk4_ = qk_base4 + (cc) * neq1 * (QKU / 4); \
         const uint tp4_ = tp_base4 + (cc) * H * (TPU / 4); \
         [[unroll]] for (uint n = 0; n < NST; n++) { \
             const uint u = tid + WGT * n; \
             if (u < L_N) { \
-                stage[n] = u < L_T ? scr4[qk4_ + G_K + u] : scr4[tp4_ + u - L_T]; \
+                stage[n] = u < L_T ? scr4[qk4_ + L_SRC + u] : scr4[tp4_ + u - L_T]; \
             } \
         } }
     STAGE_LOAD(0)
@@ -180,6 +186,14 @@ void main() {
 #else
         const uint tp4 = tp_base4 + c * H * (TPU / 4);
 #endif
+        // V rows of this chunk, issued before phase 1 (rows past n_tokens clamp to the last row and are masked)
+        float vv[NT][8];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                const uint t = t0 + 16 * j + 2 * i;      // uniform; the lane adds hi
+                vv[j][i] = data_v[v_lane + min(t, n_tokens - 1 - hi) * sv2];
+            }
+        }
         const float gam_last = gd(CL - 1);
 
         // phase 1, all reads of the chunk-start state S: KS_j = K_j S, QS_j = Q_j S; S *= gam_last
@@ -207,7 +221,7 @@ void main() {
             ACC r;
             [[unroll]] for (uint i = 0; i < 8; i++) {
                 const uint t = 16 * j + AROW(i);
-                const float v = t0 + t < n_tokens ? data_v[v_base + (t0 + t) * sv2] : 0.0;
+                const float v = t0 + t < n_tokens ? vv[j][i] : 0.0;
                 r[i] = v - gd(t) * KS[j][i];
             }
             TO_B(RB[j], r);
@@ -247,10 +261,15 @@ void main() {
                 LOAD_A(a, A_P, TFRAG(j, i));
                 o = coopMatMulAdd(a, DB[i], o);
             }
-            [[unroll]] for (uint i = 0; i < 8; i++) {
-                const uint t = t0 + 16 * j + AROW(i);
-                if (t < n_tokens) {
-                    data_dst[o_base + t * (S_V * H)] = o[i];
+            if (t0 + CL <= n_tokens) {
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    data_dst[o_lane + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[i];
+                }
+            } else {
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    if (t0 + 16 * j + AROW(i) < n_tokens) {
+                        data_dst[o_lane + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[i];
+                    }
                 }
             }
         }

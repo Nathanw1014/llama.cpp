@@ -6841,26 +6841,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     sizeof(vk_op_lightning_indexer_push_constants), {16, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
                     device->subgroup_size);
             }
-            // chunked gated delta net (GGML_VK_GDN_CHUNK): hand-built wave32 RDNA3 WMMA fragments, so AMD + wave32 only
-            if (device->vendor_id == VK_VENDOR_ID_AMD && device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
+            // chunked gated delta net (GGML_VK_GDN_CHUNK): hand-built wave32 WMMA fragments in the RDNA3 layout
+            // (RDNA4 lays its fragments out differently), so RDNA3 + wave32 only
+            if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
+                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
                 const uint32_t prep_stage = getenv("GGML_VK_GDN_PREP_STAGE") ? (uint32_t) atoi(getenv("GGML_VK_GDN_PREP_STAGE")) : 0;  // timing probe
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep, "gdn_chunk_prep_f32", gdn_chunk_prep_f32_len, gdn_chunk_prep_f32_data,
                     "main", 5, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {prep_stage}, 1, true, true, 32);
                 if (getenv("GGML_VK_GDN_CHUNK_SCAN") && atoi(getenv("GGML_VK_GDN_CHUNK_SCAN")) == 1) {
-                    // probe: no-LDS scan, one wave (16 state columns) per workgroup
-                    device->gdn_chunk_scan_nsplit = 8;
-                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_nolds_f32", gdn_chunk_scan_nolds_f32_len, gdn_chunk_scan_nolds_f32_data,
-                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
-                } else {
-                    // NW waves (16 state columns each) per workgroup, 8 / NW workgroups per value head;
-                    // GGML_VK_GDN_CHUNK_NW overrides (probe)
+                    // probe: NW waves per workgroup staging the chunk operands in LDS (GGML_VK_GDN_CHUNK_NW = 2, 4, 8)
                     uint32_t nw = getenv("GGML_VK_GDN_CHUNK_NW") ? (uint32_t) atoi(getenv("GGML_VK_GDN_CHUNK_NW")) : 4;
                     if (nw != 2 && nw != 4 && nw != 8) {
                         nw = 4;
                     }
                     device->gdn_chunk_scan_nsplit = 8 / nw;
-                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_lds_f32", gdn_chunk_scan_lds_f32_len, gdn_chunk_scan_lds_f32_data,
                         "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {nw * 32}, 1, true, true, 32);
+                } else {
+                    // one wave (16 state columns) per workgroup, operands straight from the scratch
+                    device->gdn_chunk_scan_nsplit = 8;
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
+                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
                 }
             }
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
