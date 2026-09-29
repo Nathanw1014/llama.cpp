@@ -4743,7 +4743,7 @@ struct test_gated_delta_net : public test_case {
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
           v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), g_min(g_min) {}
 
-    // shapes the Vulkan chunked form can take (GGML_VK_GDN_CHUNK=1, f16 WMMA operands with f32 accumulation)
+    // shapes the Vulkan chunked form can take (default on RDNA3, f16 WMMA operands with f32 accumulation)
     // land around 2e-7 against the f32 CPU scan, above the default 1e-7
     double max_nmse_err() override {
         return head_size == 128 && !kda && K == 1 && n_seq_tokens >= 64 ? 5e-7 : 1e-7;
@@ -10886,7 +10886,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
-    // Flash-Next head layout (v_repeat 3, S_v 128) incl. partial chunks: the Vulkan chunked form (GGML_VK_GDN_CHUNK=1)
+    // Flash-Next head layout (v_repeat 3, S_v 128) incl. partial chunks: the Vulkan chunked form (default on RDNA3)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64,  1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64,  2, 3));

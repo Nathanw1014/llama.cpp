@@ -6841,7 +6841,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     sizeof(vk_op_lightning_indexer_push_constants), {16, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
                     device->subgroup_size);
             }
-            // chunked gated delta net (GGML_VK_GDN_CHUNK): hand-built wave32 WMMA fragments in the RDNA3 layout
+            // chunked gated delta net (default on, GGML_VK_GDN_CHUNK=0 off): hand-built wave32 WMMA fragments in the RDNA3 layout
             // (RDNA4 lays its fragments out differently), so RDNA3 + wave32 only
             if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
@@ -16128,8 +16128,9 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     // chunked prefill form (gdn_chunk_prep/scan.comp): S_v 128, scalar gate, final state only (K == 1), q/k/v
     // rows with unit element stride, q and k with the same strides. f16 WMMA operands, f32 accumulation: not
-    // bit-identical to the sequential scan. =2 / =3 run only the prep / only the scan (timing probes, wrong results).
-    static const int chunk_mode = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return e ? atoi(e) : 0; }();
+    // bit-identical to the sequential scan. Default on where the pipelines exist (RDNA3 wave32); GGML_VK_GDN_CHUNK=0
+    // opts out, =2 / =3 run only the prep / only the scan (timing probes, wrong results).
+    static const int chunk_mode = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return e ? atoi(e) : 1; }();
     static const uint32_t chunk_min = [] { const char * e = getenv("GGML_VK_GDN_CHUNK_MIN"); return e ? (uint32_t) atoi(e) : 64u; }();
     const bool kda = dst->src[3]->ne[0] == (int64_t) S_v;
     if (chunk_mode != 0 && ctx->device->pipeline_gdn_chunk_scan && S_v == 128 && !kda && K == 1 && n_tokens >= chunk_min &&
