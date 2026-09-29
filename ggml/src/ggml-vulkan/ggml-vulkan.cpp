@@ -5429,6 +5429,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_IQ4_XS, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_XS], matmul_iq4_xs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL], matmul_iq4_nl_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );   // 8-wide loader + d16 need the f16-B kernel
         // f16-output variants (MUL_MAT+CPY(f16) fusion)
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q4_K], matmul_q4_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
