@@ -599,7 +599,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_post_gate() && inject->ne[0] == hc && inject->ne[1] == nt &&
+    // decode and verify-sized graphs only (nt < 32): at prefill the reorder moves the allocation, which moves two
+    // allocation-dependent fusions (HC_POST_NORM_CPY 64 -> 66, TOPK_MOE 14 -> 15 of 96/47 on REAP-320 ub2048);
+    // their kernels round differently from the unfused chains, so prefill was no longer bit-identical
+    // (KLD 0.0118 at c4096x4, the same with the Vulkan gate fusion off) for a +1.3% pp2048 inside noise
+    if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_post_gate() && nt < 32 && inject->ne[0] == hc && inject->ne[1] == nt &&
         ggml_n_dims(inject) <= 2) {
         // the same combine as below, ordered for HC_POST_GATE: every other operand is in the graph before
         // the chain, and w needs no reshape, so scale, sigmoid, scale and hc_post are consecutive nodes
