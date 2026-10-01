@@ -713,6 +713,9 @@ struct vk_op_flash_attn_gather_union_push_constants {
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
     uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch, row_words;
+    // nbk2/n_head_kv carry the KV-head dimension a GQA cache has and MLA does not; write_mask
+    // is 0 on the second (V) pass when K and V are separate tensors.
+    uint32_t nbk2, n_head_kv, write_mask;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
