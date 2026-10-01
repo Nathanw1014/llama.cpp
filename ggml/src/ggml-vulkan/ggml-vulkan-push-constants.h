@@ -709,6 +709,7 @@ struct vk_op_flash_attn_union_push_constants {
 // interprets what is in them, so it works for any type whose row is a whole number of words.
 struct vk_op_flash_attn_gather_union_push_constants {
     uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch, row_words;
+    uint32_t nbk2, n_head_kv, write_mask;   // GQA tiles; MLA passes 0, 1, 1
 };
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;

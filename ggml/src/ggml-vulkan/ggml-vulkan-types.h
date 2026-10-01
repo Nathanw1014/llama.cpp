@@ -1300,6 +1300,9 @@ struct ggml_backend_vk_context {
     vk_buffer fa_union_stat;
     float     fa_union_est_ratio[64]; // union / candidates, decaying peak; 0 = unseeded
     uint64_t  fa_union_declines;
+    // qwen4exp QSA prefill: the tile loop hands each tile's compact scratch to the dense FA
+    // through here instead of letting it run its own (decode-shaped) compaction
+    const struct vk_fa_compact_state * fa_forced_compact {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};

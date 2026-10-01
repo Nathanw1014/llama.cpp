@@ -8877,9 +8877,17 @@ static uint32_t ggml_vk_fa_union_estimate(ggml_backend_vk_context * ctx, uint32_
 // compact contiguous scratch in prealloc_y, and let the ordinary dense FA below run
 // over the compacted K/V/mask. Correct by the same contract as the sparse shader:
 // the source mask carries the selection, and the gathered mask preserves it.
+static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
+        const ggml_tensor * sinks, ggml_tensor * dst);
+
 static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
+    if (ctx->fa_forced_compact) {
+        st = *ctx->fa_forced_compact;
+        return true;
+    }
     const ggml_tensor * top_k = dst->src[5];
     static const char * gather_env = getenv("GGML_VK_FA_TOPK_GATHER");
     // K/V type: the gather relocates rows verbatim and never reads a value out of them, so it
@@ -9079,6 +9087,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
             (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
             n_batch, dq ? (uint32_t) k->ne[0] : k_row_words,
+            0u, 1u, 1u,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, gather_pipe,
             { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
@@ -9231,6 +9240,241 @@ union_unavailable:;
     return true;
 }
 
+// qwen4exp QSA PREFILL (2026-09-13). The top-k only writes a mask, so prefill attention was
+// dense over the whole cache: FA was 40-48% of a QSA-layer ubatch at 49k context and linear in
+// n_kv, which is why Flash-Next prefill decayed with depth on Vulkan while the model's 2051-cell
+// budget says it should not. The masked-block skip in the FA shader cannot help: selections are
+// scattered 4-cell blocks, so a 16 x Bc tile is almost never entirely masked.
+//
+// Per tile of TILE consecutive queries: union their selections (adjacent tokens overlap heavily,
+// so the union is a few thousand rows, not n_kv), gather those K and V rows once into scratch
+// with a per-row membership mask, and run the dense FA on the compact set. This is the decode
+// gather-compact machinery (union bitmap -> list, gather, FA with dynamic KV) driven from a
+// tile loop, with the union gather taught the KV-head dimension and a separate V.
+// GGML_VK_FA_PREFILL_UNION=0 disables; GGML_VK_FA_PREFILL_TILE sets the tile (16..256, default 128).
+// 2026-09-14 sweep on keep-128 Flash-Next, pp2048 vs tile 64: 16 -8%/-10% (d16k/d32k), 32 -7%/-4%
+// (fewer FA workgroups per tile), 128 +2%/0% over two interleaved launch pairs, 256 mixed (the
+// TILE x kv_c mask slot and its gather grow with the tile). Sizes above 64 need the looped mask write
+// in flash_attn_gather_union.comp (a single 64-lane pass left rows >= 64 stale: future-token leak,
+// PPL 2.03 against a 2.42 reference); PPL is at the reference for every size with that fix.
+static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
+        const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const char * env = getenv("GGML_VK_FA_PREFILL_UNION");
+    if (env && env[0] == '0') {
+        return false;
+    }
+    const ggml_tensor * top_k = dst->src[5];
+    if (!top_k || top_k->type != GGML_TYPE_I32 || !mask || mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const bool separate_v = !(k->buffer == v->buffer && k->data == v->data);
+    const uint32_t n_head_kv = (uint32_t) k->ne[2];
+    // GQA only (DeepSeek V4 MLA prefill has its own sparse shader); f16 K/V rows gathered verbatim
+    if (!separate_v || n_head_kv == 0 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->ne[1] < 64 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[2] % n_head_kv != 0 || k->ne[2] != v->ne[2] ||
+        k->ne[1] != v->ne[1] || q->ne[0] != k->ne[0] ||
+        top_k->ne[1] != q->ne[1] || top_k->ne[3] != q->ne[3] || top_k->ne[2] != 1 ||
+        mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1] ||
+        k->nb[1] % 4 != 0 || k->nb[2] % 4 != 0 || v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0 ||
+        !ctx->device->pipeline_flash_attn_union_f16 || !ctx->device->pipeline_flash_attn_gather_union_f16) {
+        return false;
+    }
+    const int32_t n_kv_raw = ggml_get_op_params_i32(dst, 4);
+    const uint32_t n_kv    = (uint32_t) k->ne[1];
+    const uint32_t n_top_k = (uint32_t) top_k->ne[0];
+    if (n_kv_raw < 0 || (uint32_t) n_kv_raw > n_kv || n_top_k > n_kv - n_kv_raw) {
+        return false;
+    }
+    const uint32_t max_words = 12288;   // shared bitmap capacity in flash_attn_union.comp
+    if ((uint64_t) (n_kv - n_kv_raw + 31) / 32 > max_words) {
+        return false;
+    }
+    // shallow contexts: a 64-query union covers most of the cache and the gather costs more than
+    // it saves (micro-qwen4exp: -2.5% over a 16k prompt with the gate at 2 budgets, +42% at 32k)
+    if (n_kv < 8192 || (uint64_t) (n_kv - n_kv_raw) < 3ull * n_top_k) {
+        return false;
+    }
+
+    static const char * tile_env = getenv("GGML_VK_FA_PREFILL_TILE");
+    const uint32_t TILE = tile_env ? std::max(16u, std::min(256u, (uint32_t) atoi(tile_env))) : 128u;
+    const uint32_t N       = (uint32_t) q->ne[1];
+    const uint32_t n_tiles = (N + TILE - 1) / TILE;
+
+    // The compact scratch packs rows at their row SIZE; the source stride k->nb[1] is only equal to it
+    // when the cache holds one KV head. Qwen3.8-Flash-Next interleaves its 2 KV heads (nb[1] = 2x the
+    // row), and using nb[1] here put KV head 1's rows at twice the right head stride: every query head
+    // over KV head 1 read the wrong K/V, PPL 543-723 vs 3.01 at c8192 (found 2026-09-13; the op tests
+    // use contiguous single-stride K/V and could not see it).
+    const uint32_t row_bytes   = (uint32_t) ggml_row_size(k->type, k->ne[0]);
+    const uint32_t v_row_bytes = (uint32_t) ggml_row_size(v->type, v->ne[0]);
+    const uint32_t row_words   = (uint32_t) ggml_row_size(k->type, k->ne[0]) / 4;
+    const uint32_t v_row_words = (uint32_t) ggml_row_size(v->type, v->ne[0]) / 4;
+    const uint32_t max_union   = std::min<uint32_t>(TILE * n_top_k, n_kv - n_kv_raw);
+    const uint32_t kv_c_max    = GGML_PAD((uint32_t) n_kv_raw + max_union, 256u);
+
+    // scratch (prealloc_y): per-tile [count 256 B][list] for every tile, then ONE compact slot
+    // [K heads][V heads][mask]. Tiles run union -> gather -> FA sequentially through that slot.
+    const size_t ul_sz    = GGML_PAD((size_t) max_union * sizeof(uint32_t), 256);
+    const size_t tile_sz  = 256 + ul_sz;
+    const size_t lists_sz = (size_t) n_tiles * tile_sz;
+    const size_t kc_sz    = (size_t) n_head_kv * kv_c_max * ggml_row_size(k->type, k->ne[0]);
+    const size_t vc_sz    = (size_t) n_head_kv * kv_c_max * ggml_row_size(v->type, v->ne[0]);
+    const size_t mc_sz    = (size_t) TILE * kv_c_max * sizeof(ggml_fp16_t);
+    const size_t need     = lists_sz + kc_sz + vc_sz + mc_sz;
+    if (ctx->prealloc_size_y < need) {
+        const size_t step = size_t{ 256 } << 20;   // grow in steps: a grow drains the device
+        ctx->prealloc_size_y = ((need + step - 1) / step) * step;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_subbuffer kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, lists_sz);
+    const vk_subbuffer vc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, lists_sz + kc_sz);
+    const vk_subbuffer mc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, lists_sz + kc_sz + vc_sz);
+
+    const vk_subbuffer top_buf  = ggml_vk_tensor_subbuffer(ctx, top_k);
+    const vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+    const vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+    const vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+
+    // GGML_VK_FA_PREFILL_STATS=1: how sparse is the prefill really? Host readback of the top-k lists
+    // (diagnostic only, costs a sync) and the union size of consecutive-query groups of 16/32/64/128
+    // against n_kv, so the per-tile FA work can be compared with dense and with a true per-row
+    // sparse kernel (n_top_k rows per query) before any of that is built.
+    static const char * stats_env = getenv("GGML_VK_FA_PREFILL_STATS");
+    if (stats_env && stats_env[0] == '1') {
+        // ggml_vk_buffer_read does not flush the command buffer being recorded, so this can see the
+        // previous writer of the top-k memory (an earlier layer or ubatch: fine for a census) or, on
+        // the first calls, unwritten memory. A real top-k row is n_top_k distinct in-range indices
+        // (or -1 padding); reject the call if any row is not, rather than count garbage as density.
+        const size_t stride_i = top_k->nb[1] / sizeof(int32_t);
+        std::vector<int32_t> idx((size_t) N * stride_i);
+        vk_buffer top_dev = top_buf.buffer;
+        ggml_vk_buffer_read(top_dev, top_buf.offset, idx.data(), idx.size() * sizeof(int32_t));
+        const int32_t range = (int32_t) (n_kv - n_kv_raw);
+        bool sane = true;
+        {
+            std::vector<uint8_t> seen((size_t) range);
+            for (uint32_t t = 0; t < N && sane; ++t) {
+                std::fill(seen.begin(), seen.end(), 0);
+                for (uint32_t j = 0; j < n_top_k; ++j) {
+                    const int32_t v = idx[(size_t) t * stride_i + j];
+                    if (v == -1) continue;
+                    if (v < 0 || v >= range || seen[v]) { sane = false; break; }
+                    seen[v] = 1;
+                }
+            }
+        }
+        fprintf(stderr, "[fa-prefill-stats] n_kv=%u n_kv_raw=%d N=%u n_top_k=%u:", n_kv, n_kv_raw, N, n_top_k);
+        if (!sane) {
+            fprintf(stderr, "  skipped (top-k memory not a valid selection yet)\n");
+        }
+        for (uint32_t g = 16; sane && g <= 128; g *= 2) {
+            uint64_t uni_total = 0, valid_total = 0;
+            std::vector<uint8_t> seen((size_t) range);
+            for (uint32_t t0 = 0; t0 < N; t0 += g) {
+                std::fill(seen.begin(), seen.end(), 0);
+                uint64_t uni = 0;
+                for (uint32_t t = t0; t < std::min(N, t0 + g); ++t) {
+                    for (uint32_t j = 0; j < n_top_k; ++j) {
+                        const int32_t v = idx[(size_t) t * stride_i + j];
+                        if (v >= 0 && v < range) { ++valid_total; if (!seen[v]) { seen[v] = 1; ++uni; } }
+                    }
+                }
+                uni_total += uni;
+            }
+            // mean union rows per group, as a fraction of the sparse range and of the whole cache
+            const double per_group = (double) uni_total / (double) ((N + g - 1) / g);
+            fprintf(stderr, "  g%u: union %.0f rows = %.1f%% of range, %.1f%% of n_kv (valid/q %.0f)",
+                    g, per_group, 100.0 * per_group / std::max(1, range), 100.0 * (per_group + n_kv_raw) / n_kv,
+                    (double) valid_total / N);
+        }
+        if (sane) {
+            fprintf(stderr, "\n");
+        }
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, n_tiles);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 2 * n_tiles);
+
+    // 1. every tile's union list and padded count: disjoint scratch, one barrier after all
+    for (uint32_t t = 0; t < n_tiles; ++t) {
+        const uint32_t rows = std::min(TILE, N - t * TILE);
+        const vk_subbuffer uc_t { ctx->prealloc_y, t * tile_sz, 256 };
+        const vk_subbuffer ul_t { ctx->prealloc_y, t * tile_sz + 256, ul_sz };
+        const vk_subbuffer top_t { top_buf.buffer, top_buf.offset + (size_t) t * TILE * top_k->nb[1], top_buf.size - (size_t) t * TILE * top_k->nb[1] };
+        const vk_op_flash_attn_union_push_constants upc = {
+            n_kv, (uint32_t) n_kv_raw, rows, n_top_k, max_union,
+            (uint32_t) (top_k->nb[1] / sizeof(int32_t)), max_words, 256u, 0u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
+            { top_t, ul_t, uc_t }, upc, { 1, 1, 1 });
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // 2. per tile: gather K (and the mask), gather V, dense FA on the compact set
+    for (uint32_t t = 0; t < n_tiles; ++t) {
+        const uint32_t rows = std::min(TILE, N - t * TILE);
+        const vk_subbuffer uc_t { ctx->prealloc_y, t * tile_sz, 256 };
+        const vk_subbuffer ul_t { ctx->prealloc_y, t * tile_sz + 256, ul_sz };
+        const vk_subbuffer mask_t { mask_buf.buffer, mask_buf.offset + (size_t) t * TILE * mask->nb[1], mask_buf.size - (size_t) t * TILE * mask->nb[1] };
+
+        const vk_op_flash_attn_gather_union_push_constants gk = {
+            n_kv, (uint32_t) n_kv_raw, kv_c_max, (uint32_t) (k->nb[1] / 4),
+            (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)), rows, row_words,
+            (uint32_t) (k->nb[2] / 4), n_head_kv, 1u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
+            { k_buf, ul_t, mask_t, kc_buf, mc_buf, uc_t }, gk, { kv_c_max, n_head_kv, 1 });
+        const vk_op_flash_attn_gather_union_push_constants gv = {
+            n_kv, (uint32_t) n_kv_raw, kv_c_max, (uint32_t) (v->nb[1] / 4),
+            (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)), rows, v_row_words,
+            (uint32_t) (v->nb[2] / 4), n_head_kv, 0u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
+            { v_buf, ul_t, mask_t, vc_buf, mc_buf, uc_t }, gv, { kv_c_max, n_head_kv, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        vk_fa_compact_state st;
+        st.active      = true;
+        st.dynamic_kv  = true;
+        st.kv_c        = kv_c_max;
+        st.n_batch     = rows;
+        st.row_bytes   = row_bytes;
+        st.row_elems   = (uint32_t) k->ne[0];
+        st.dequantized = false;
+        st.n_head_kv   = n_head_kv;
+        st.separate_v  = true;
+        st.v_row_bytes = v_row_bytes;
+        st.v_row_elems = (uint32_t) v->ne[0];
+        st.kv_buf      = uc_t;
+        st.kc_buf      = kc_buf;
+        st.vc_buf      = vc_buf;
+        st.mc_buf      = mc_buf;
+
+        // row-offset copies of the per-token operands: offsets derive from ->data
+        ggml_tensor qt = *q;   qt.view_src = nullptr; qt.view_offs = 0;
+        qt.ne[1] = rows;       qt.data = (char *) q->data + (size_t) t * TILE * q->nb[1];
+        ggml_tensor mt = *mask; mt.view_src = nullptr; mt.view_offs = 0;
+        mt.ne[1] = rows;       mt.data = (char *) mask->data + (size_t) t * TILE * mask->nb[1];
+        ggml_tensor tk = *top_k; tk.view_src = nullptr; tk.view_offs = 0;
+        tk.ne[1] = rows;       tk.data = (char *) top_k->data + (size_t) t * TILE * top_k->nb[1];
+        ggml_tensor dt = *dst; dt.view_src = nullptr; dt.view_offs = 0;
+        dt.ne[2] = rows;       dt.data = (char *) dst->data + (size_t) t * TILE * dst->nb[2];
+        dt.src[0] = &qt; dt.src[3] = &mt; dt.src[5] = &tk;
+
+        ctx->fa_forced_compact = &st;
+        ggml_vk_flash_attn(ctx, subctx, &qt, k, v, &mt, sinks, &dt);
+        ctx->fa_forced_compact = nullptr;
+        // the next tile's gather overwrites the slot this FA reads
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -9282,7 +9526,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    if (ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
+    if (!ctx->fa_forced_compact && ggml_vk_flash_attn_prefill_union(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
+    if (!ctx->fa_forced_compact && ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
     // V4 sparse decode: gather the active set into a compact scratch and run the dense
@@ -9435,7 +9682,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    // never on a compact mask: the prepass writes its bitfield at prealloc_y offset 0, which the compact
+    // paths use for their own scratch (the QSA prefill tile lists live there), and the compact mask is
+    // small by construction
+    bool use_mask_opt = mask && !fa_compact.active && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     // Selected-key attention (src[5]) may name any cell, so masked keys must not leak NaN/inf from V; dense
     // attention relies on the KV cache zeroing freed cells. GGML_VK_FA_NAN_SAFE=1 hardens every masked FA
