@@ -10952,10 +10952,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Trellis types in a small Flash-Next-like MoE (10 of 32 experts; gate/up-like k = 640 = 5 blocks,
     // down-like m = 640): mat-vec (n <= 8, incl. the multi-token MoE kernel), the n = 9 / 32 fallback
     // through the dequant + BLAS path, and the fused gate/up mat-vec.
+    // n >= 9 runs the batched path (HIP gfx1151: mmb BF16 WMMA GEMM with the trellis slice decoder).
     for (ggml_type type_a : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQK7}) {
-        for (int n : {1, 2, 4, 8, 9, 32}) {
+        for (int n : {1, 2, 4, 8, 9, 16, 32, 64, 128, 256, 512}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, n, 256));
+        }
+        for (int n : {16, 63, 513}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true, 128, n, 640));
+        }
+        // Flash-Next expert matrix shapes (gate/up [2560 -> 640], down [640 -> 2560], 10 used) with 32 instead
+        // of 512 experts: test setup quantizes with the CPU placeholder encoder, ~3.5/8.5/18 min per
+        // 512-expert tensor for TQ2_T/TQK6/TQK7.
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, 64, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, 64, 640));
+        // dense MUL_MAT on the batched path
+        for (int n : {9, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 129, n, 640, {1, 1}, {1, 1}));
         }
         for (int n : {1, 4}) {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640, 1));
