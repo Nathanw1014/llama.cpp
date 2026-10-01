@@ -51,6 +51,8 @@ layout(push_constant) uniform Parameters {
 
 const uint LANES = 64;
 
+shared uint visible;
+
 void main() {
     const uint row    = gl_WorkGroupID.x;
     const uint head   = gl_WorkGroupID.y;
@@ -75,6 +77,24 @@ void main() {
                 src = p.n_kv_raw + uint(idx);
             }
         }
+    }
+
+    // A row hidden by the mask from every token that may see it (its owner, or any token for the
+    // shared prefix) is dropped: zero row, -inf mask. Its K/V data is then never read, so a
+    // selected-but-masked cell holding NaN/inf cannot reach the FA as 0 * NaN. The K and V passes
+    // and every head make the same decision from the same mask.
+    if (tid == 0) {
+        visible = 0;
+    }
+    barrier();
+    if (src < p.n_kv && tid < p.n_batch && (owner == ALL_TOKENS || owner == tid)) {
+        if (float(data_m[(stream % p.nem3) * p.nbm3 + tid * p.nbm1 + src]) > -65504.0) {
+            visible = 1;
+        }
+    }
+    barrier();
+    if (visible == 0) {
+        src = p.n_kv;
     }
 
     // Zeroing writes zero BYTES, which decode to zero for every block-quantised type here (a

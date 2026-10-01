@@ -1303,6 +1303,8 @@ struct ggml_backend_vk_context {
     // qwen4exp QSA prefill: the tile loop hands each tile's compact scratch to the dense FA
     // through here instead of letting it run its own (decode-shaped) compaction
     const struct vk_fa_compact_state * fa_forced_compact {};
+    // qwen4exp QSA prefill: per-token gathered FA (GATHER_KV); the top-k list tensor the kernel reads
+    const ggml_tensor * fa_forced_gather {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};

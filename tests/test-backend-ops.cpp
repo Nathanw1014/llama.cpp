@@ -9523,9 +9523,14 @@ struct test_flash_attn_ext_top_k : public test_case {
                     // offset the selection by the stream too, so a dropped stream stride
                     // reads another sequence's keys and shows up as a mismatch
                     const bool shared = (int64_t) j * 100 < n_top_k * ov;
+                    // keep every token's list free of duplicates: a per-token offset below the selection
+                    // stride never wraps into another entry's slot (a real top-k list is duplicate-free, and
+                    // a per-token gather counts a repeated entry twice where the mask-based reference
+                    // counts it once)
+                    const int64_t stride = std::max<int64_t>(1, range / n_top_k);
                     int32_t idx = shared
-                        ? (int32_t) ((j * range) / n_top_k + s * 7) % (int32_t) range
-                        : (int32_t) ((j * range) / n_top_k + b + s * 7) % (int32_t) range;
+                        ? (int32_t) ((j * range) / n_top_k + (s * 7) % stride) % (int32_t) range
+                        : (int32_t) ((j * range) / n_top_k + (b + s * 7) % stride) % (int32_t) range;
                     if (j == n_top_k - 1 && b == 0 && s == 0) {
                         idx = -1; // exercise the ignore-invalid-index path
                     } else {
@@ -13718,6 +13723,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // and the kv=512 case verify dense-fallback parity with the hint attached, the
     // nb=64/128 cases exercise the sparse shader itself.
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
+    // per-token gathered prefill FA (GATHER_KV, qwen4exp QSA shape: hs 256, GQA, separate V):
+    // one block, several blocks, a ragged list, a raw prefix, the GQA ratios, hs 128, one KV head
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  64,   0,   64, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  64,   0,  128, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  64,   0,  100, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  65, 256,   64, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192, 130,   0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  64,   0, 2051, true,  1, 0, GGML_TYPE_F16, 256, 24, 2, false, true));
+    for (int64_t nh : {4, 8, 16, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 64, 0, 64, false, 1, 0, GGML_TYPE_F16, 256, nh, 2, false, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 64, 0, 64, false, 1, 0, GGML_TYPE_F16, 128, 24, 2, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 64, 0, 64, false, 1, 0, GGML_TYPE_F16, 256, 12, 1, false, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));

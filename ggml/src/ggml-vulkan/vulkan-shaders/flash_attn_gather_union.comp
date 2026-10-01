@@ -47,6 +47,8 @@ layout(push_constant) uniform Parameters {
 
 const uint LANES = 64;
 
+shared uint visible;
+
 void main() {
     const uint row  = gl_WorkGroupID.x;
     const uint head = gl_WorkGroupID.y;
@@ -64,6 +66,25 @@ void main() {
         src = row;
     } else if (row - p.n_kv_raw < n_uni) {
         src = p.n_kv_raw + data_u[row - p.n_kv_raw];
+    }
+
+    // A row hidden from every token of the batch by the mask is dropped (zero row, -inf mask): its
+    // K/V data is never read, so a selected-but-masked cell holding NaN/inf cannot reach the FA as
+    // 0 * NaN. Every pass (K and V, every head) makes the same decision from the same mask.
+    if (tid == 0) {
+        visible = 0;
+    }
+    barrier();
+    if (src < p.n_kv) {
+        for (uint t = tid; t < p.n_batch; t += LANES) {
+            if (float(data_m[t * p.nbm1 + src]) > -65504.0) {
+                visible = 1;
+            }
+        }
+    }
+    barrier();
+    if (visible == 0) {
+        src = p.n_kv;
     }
 
     // Zeroing an unused row writes zero BYTES, which decode to zero for every block-quantised

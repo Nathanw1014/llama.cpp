@@ -32,6 +32,15 @@ const bool DYNAMIC_KV       = (Flags & 16) != 0;
 // Masked keys contribute nothing even where their V rows hold NaN/inf (P is 0, but 0 * NaN is not): set for
 // selected-key (sparse) attention, whose selections can name any cell. Costs occupancy in cm1 (V staging).
 const bool NAN_SAFE_V       = (Flags & 32) != 0;
+// GATHER_KV (coopmat1 only; ported from the strix-halo fork): per-token selected-key attention. The
+// workgroup is one (token, KV head) under the GQA fold (its rows are the group's query heads), and the
+// KV columns are that token's own selected cache rows, read through its top-k list (binding 7 as int32,
+// list stride p.ne3 entries, list length p.KV, cache rows p.split_kv with the mask-stride bit set so
+// m_row_len is the real mask row; p.nb03 carries n_kv_raw: columns below it are the always-attended
+// prefix). K/V rows are staged through LDS by index, and the mask column is gathered the same way.
+// A column whose entry is invalid, or whose mask hides it from the token, is staged as zero K/V and
+// scores -inf, so a hidden key's data is never read: NaN-safe without NAN_SAFE_V.
+const bool GATHER_KV        = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -157,6 +166,26 @@ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
 bool partial_output;
+uint32_t gather_list_base;
+
+// GATHER_KV: cache row for column c, or 0xFFFFFFFF when c is past the list or the entry is out of range
+uint32_t gather_row(uint32_t c) {
+    if (c >= KV) {
+        return 0xFFFFFFFFu;
+    }
+    const uint32_t n_raw = p.nb03;
+    uint32_t r;
+    if (c < n_raw) {
+        r = c;
+    } else {
+        const uint32_t e = data_kv_dyn[gather_list_base + (c - n_raw)];
+        r = e + n_raw;
+        if (e >= 0x80000000u) {
+            r = 0xFFFFFFFFu;
+        }
+    }
+    return r < p.split_kv ? r : 0xFFFFFFFFu;
+}
 
 void init_indices()
 {
@@ -189,6 +218,10 @@ void init_indices()
         i = gl_WorkGroupID.x;
         gqa_iq1 = 0;
         split_k_index = 0;
+    }
+
+    if (GATHER_KV) {
+        gather_list_base = gqa_iq1 * p.ne3;
     }
 
     Tr = CEIL_DIV(N, Br);
@@ -237,6 +270,10 @@ void init_indices()
     // under the sparse split path, where this dispatch only covers the raw prefix (KV) but
     // the mask rows span the whole K range.
     m_row_len = mask_stride_in_split_kv ? p.split_kv : KV;
+    if (GATHER_KV) {
+        // the rows are the token's query heads and share its one mask row
+        m_stride = 0;
+    }
 }
 
 // Bias applied to softmax to stay in fp16 range.

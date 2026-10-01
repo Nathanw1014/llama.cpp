@@ -1425,7 +1425,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool use_dynamic_kv, bool nan_safe_v) {
+                                                  bool use_dynamic_kv, bool nan_safe_v, bool gather_kv) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1434,7 +1434,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
                      (use_dynamic_kv    ? 16 : 0) |
-                     (nan_safe_v        ? 32 : 0);
+                     (nan_safe_v        ? 32 : 0) |
+                     (gather_kv         ? 64 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -8383,7 +8384,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t slope = Br * acctype;
 
     // dead_stamp[Bc] + dead_blk (hidden-key tracking; only NAN_SAFE_V pipelines use it, counted for all)
-    const uint32_t live = (Bc + 1) * sizeof(uint32_t);
+    // + grow_sh[Bc] (GATHER_KV row list; counted for all)
+    const uint32_t live = (2 * Bc + 1) * sizeof(uint32_t);
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + live;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
@@ -8786,6 +8788,9 @@ struct vk_fa_compact_state {
     uint32_t row_bytes = 0;       // bytes per compact K row; K may be quantised
     uint32_t row_elems = 0;       // K row stride in ELEMENTS/blocks, for the FA push constant
     bool dequantized = false;     // scratch holds f16 because the gather decoded on the way in
+    // the verbatim gathers drop every row the mask hides from all its tokens (zero row, -inf mask),
+    // so the FA over the compact set never reads a hidden key's data and needs no NAN_SAFE_V
+    bool nan_safe = false;
     // A GQA cache gathers each KV head into its own compact block, and its V is a separate
     // tensor rather than the K latent. MLA leaves these at 1 / equal-to-K and behaves as before.
     uint32_t n_head_kv = 1;
@@ -9105,6 +9110,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         st.v_row_bytes = st.row_bytes;   // MLA: V is the K latent, one head, one scratch
         st.v_row_elems = st.row_elems;
         st.dequantized = dq;
+        st.nan_safe    = !dq;   // the dequantising union gather has no visibility drop
         st.kc_buf     = kc_buf;
         st.vc_buf     = kc_buf;   // V is the K latent here, so it reads the same scratch
         st.mc_buf     = mc_buf;
@@ -9233,10 +9239,74 @@ union_unavailable:;
     st.row_bytes = row_by;
     st.row_elems = tok_dq ? (uint32_t) k->ne[0] : (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
     st.dequantized = tok_dq;
+    st.nan_safe = !tok_dq;   // the dequantising gather has no visibility drop
     st.n_head_kv = n_head_kv;
     st.separate_v = separate_v;
     st.v_row_bytes = v_row_by;
     st.v_row_elems = separate_v ? (uint32_t) (v->ne[0] / ggml_blck_size(v->type)) : st.row_elems;
+    return true;
+}
+
+// qwen4exp QSA per-token gathered PREFILL (ported from the strix-halo fork, 002083fdb): every
+// (token, KV head) workgroup attends the token's own top-k rows, read from the cache by index inside
+// the coopmat1 FA kernel under the GQA fold (the group's query heads are the tile rows), the mask
+// column gathered the same way. No union, no gather scratch, no per-tile barriers; work per token is
+// exactly its selection. See GATHER_KV in flash_attn_base.glsl. Keys the token's mask hides are
+// dropped before their K/V is read, so the op needs no NAN_SAFE_V pipeline.
+// Contract: a token's list is duplicate-free (ggml_top_k output is); a repeated entry would be
+// counted twice, where the mask-based reference counts it once.
+// GGML_VK_FA_PREFILL_GATHER=0 disables (the union path below is the fallback).
+// GGML_VK_FA_PREFILL_GATHER_MIN=R: engage when the selectable range is >= R/100 x n_top_k.
+static bool ggml_vk_flash_attn_prefill_gather(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
+        const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const char * env = getenv("GGML_VK_FA_PREFILL_GATHER");
+    if (env && env[0] == '0') {
+        return false;
+    }
+    static const uint32_t min_ratio = [] {
+        const char * e = getenv("GGML_VK_FA_PREFILL_GATHER_MIN");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 200u;
+    }();
+    const ggml_tensor * top_k = dst->src[5];
+    if (!top_k || top_k->type != GGML_TYPE_I32 || !mask || mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const uint32_t n_head_kv = (uint32_t) k->ne[2];
+    if (n_head_kv == 0 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32 ||
+        q->ne[1] < 64 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[2] % n_head_kv != 0 || q->ne[2] == (int64_t) n_head_kv || q->ne[2] / n_head_kv > 16 ||
+        k->ne[2] != v->ne[2] || k->ne[1] != v->ne[1] || q->ne[0] != k->ne[0] ||
+        k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) ||
+        k->nb[1] % 8 != 0 || v->nb[1] % 8 != 0 || k->nb[2] % 8 != 0 || v->nb[2] % 8 != 0 ||
+        k->ne[0] % 4 != 0 || v->ne[0] % 4 != 0 ||
+        top_k->ne[1] != q->ne[1] || top_k->ne[3] != q->ne[3] || top_k->ne[2] != 1 || top_k->nb[0] != sizeof(int32_t) ||
+        mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+        mask->nb[0] != sizeof(ggml_fp16_t) || mask->nb[1] != (size_t) mask->ne[0] * sizeof(ggml_fp16_t) ||
+        !ctx->device->coopmat_support || ctx->device->coopmat2) {
+        return false;
+    }
+    const int32_t n_kv_raw = ggml_get_op_params_i32(dst, 4);
+    const uint32_t n_kv    = (uint32_t) k->ne[1];
+    const uint32_t n_top_k = (uint32_t) top_k->ne[0];
+    if (n_kv_raw < 0 || (uint32_t) n_kv_raw > n_kv || n_top_k > n_kv - n_kv_raw || n_top_k == 0) {
+        return false;
+    }
+    // shallow contexts: the selection is most of the cache and the dense kernel is cheaper
+    if (n_kv < 4096 || (uint64_t) (n_kv - n_kv_raw) * 100 < (uint64_t) min_ratio * n_top_k) {
+        return false;
+    }
+    // the GATHER_KV code is coopmat1-only: make sure the FA below takes that path for the folded shape
+    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32;
+    const uint32_t gqa = (uint32_t) (q->ne[2] / n_head_kv);
+    const vk_fa_tuning_params tp = get_fa_tuning_params(ctx->device, (uint32_t) q->ne[0], (uint32_t) v->ne[0], gqa,
+                                                        (uint32_t) n_kv_raw + n_top_k, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
+    if (tp.path != FA_COOPMAT1 || gqa > std::min(tp.block_rows, 32u)) {
+        return false;
+    }
+    ctx->fa_forced_gather = top_k;
+    ggml_vk_flash_attn(ctx, subctx, q, k, v, mask, sinks, dst);
+    ctx->fa_forced_gather = nullptr;
     return true;
 }
 
@@ -9445,6 +9515,7 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
         st.row_bytes   = row_bytes;
         st.row_elems   = (uint32_t) k->ne[0];
         st.dequantized = false;
+        st.nan_safe    = true;
         st.n_head_kv   = n_head_kv;
         st.separate_v  = true;
         st.v_row_bytes = v_row_bytes;
@@ -9526,17 +9597,22 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    if (!ctx->fa_forced_compact && ggml_vk_flash_attn_prefill_union(ctx, subctx, q, k, v, mask, sinks, dst)) {
+    // the sparse entries keyed on src[5] must not re-enter while one of them drives this FA
+    const bool fa_forced = ctx->fa_forced_compact || ctx->fa_forced_gather;
+    if (!fa_forced && ggml_vk_flash_attn_prefill_gather(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
-    if (!ctx->fa_forced_compact && ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
+    if (!fa_forced && ggml_vk_flash_attn_prefill_union(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
+    if (!fa_forced && ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
     // V4 sparse decode: gather the active set into a compact scratch and run the dense
     // FA below on it. Overrides KV, the mask geometry, and (further down) the K/V/mask
     // bindings and strides; every other decision then sizes itself to the compact KV.
     vk_fa_compact_state fa_compact;
-    if (ggml_vk_flash_attn_gather_compact(ctx, subctx, q, k, v, mask, dst, fa_compact)) {
+    if (!ctx->fa_forced_gather && ggml_vk_flash_attn_gather_compact(ctx, subctx, q, k, v, mask, dst, fa_compact)) {
         KV   = fa_compact.kv_c;
         nem0 = fa_compact.kv_c;
         nem1 = fa_compact.n_batch;
@@ -9591,10 +9667,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // and the VRAM heuristic must not veto them (there is no fallback), so force the path on.
     const bool kv_needs_dequant = !ggml_vk_fa_kv_native(k->type, ctx->device->coopmat2) ||
                                   !ggml_vk_fa_kv_native(v->type, ctx->device->coopmat2);
+    // per-token gathered prefill (GATHER_KV): reads the cache rows by index, K/V untouched
+    const bool gather_kv = ctx->fa_forced_gather != nullptr;
     const bool use_dequant_kv = !fa_dequant_off &&
                                 // the gather-to-compact scratch is already contiguous f16; the
                                 // dequant/contiguize pass must not run on top of it
-                                !fa_compact.active &&
+                                !fa_compact.active && !gather_kv &&
                                 ((k_quant && v_quant) || kv_needs_dequant || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -9618,7 +9696,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    if ((N <= 8 || gather_kv) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -9685,16 +9763,22 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // never on a compact mask: the prepass writes its bitfield at prealloc_y offset 0, which the compact
     // paths use for their own scratch (the QSA prefill tile lists live there), and the compact mask is
     // small by construction
-    bool use_mask_opt = mask && !fa_compact.active && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !fa_compact.active && !gather_kv && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     // Selected-key attention (src[5]) may name any cell, so masked keys must not leak NaN/inf from V; dense
     // attention relies on the KV cache zeroing freed cells. GGML_VK_FA_NAN_SAFE=1 hardens every masked FA
     // (e.g. a unified multi-sequence cache, whose masked cells belong to live sequences).
     static const bool fa_nan_safe_all = [] { const char * e = getenv("GGML_VK_FA_NAN_SAFE"); return e && atoi(e) != 0; }();
-    const bool nan_safe_v = mask != nullptr && (dst->src[5] != nullptr || fa_nan_safe_all);
+    // The gathered paths never read a key the mask hides (the gathers drop such rows, GATHER_KV drops
+    // such columns), so the selected-key ops they take are NaN-safe without the V staging.
+    const bool sparse_nan_safe = gather_kv || (fa_compact.active && fa_compact.nan_safe);
+    const bool nan_safe_v = mask != nullptr && ((dst->src[5] != nullptr && !sparse_nan_safe) || fa_nan_safe_all);
+    if (gather_kv) {
+        GGML_ASSERT(tuning_params.path == FA_COOPMAT1 && gqa_ratio > 1 && !nan_safe_v);
+    }
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   fa_compact.dynamic_kv, nan_safe_v);
+                                                                   fa_compact.dynamic_kv, nan_safe_v, gather_kv);
 
     vk_pipeline pipeline = nullptr;
 
@@ -9741,7 +9825,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
+    if (gather_kv) {
+        // gathered per-token FA: one workgroup per (token, KV head), no split (split_kv carries the mask stride)
+    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
@@ -9756,8 +9842,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
         // The Xe dual-phase decode reads K/V through the source tensor strides and nek1, so it
-        // cannot consume the gather-compacted scratch; a compacted call stays on the generic FA.
-        xe_fa_opt = !fa_compact.active && xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
+        // cannot consume the gather-compacted scratch or GATHER_KV lists; those stay on the generic FA.
+        xe_fa_opt = !fa_compact.active && !gather_kv && xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
         if (xe_fa_opt) {
             const uint32_t split_p_size = 32;
             const size_t max_dim = (nek1 + split_p_size - 1) / split_p_size;
@@ -9915,13 +10001,42 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t eff_nbv2 = fa_compact.active ? fa_compact.kv_c * fa_compact.v_row_bytes : nbv2_eff;
     const uint32_t eff_nbv3 = fa_compact.active ? fa_compact.n_head_kv * fa_compact.kv_c * fa_compact.v_row_bytes : nbv3_eff;
 
+    uint32_t pc_ne3  = (uint32_t) ne3;
+    uint32_t pc_nb03 = (uint32_t) nbq3;
+    vk_subbuffer kv_dyn_buf = fa_compact.dynamic_kv ? fa_compact.kv_buf : q_buf;
+    if (gather_kv) {
+        // GATHER_KV: list length in KV, cache rows in split_kv (mask stride bit set: m_row_len), list stride
+        // in ne3, the always-attended prefix in nb03 (neq3 == ne3 == 1, so neither is otherwise read
+        // without split_k), the list itself on binding 7
+        const ggml_tensor * top_k = ctx->fa_forced_gather;
+        const int32_t n_kv_raw = ggml_get_op_params_i32(dst, 4);
+        GGML_ASSERT(split_k == 1 && neq3 == 1 && ne3 == 1 && n_kv_raw >= 0);
+        KV       = (uint32_t) n_kv_raw + (uint32_t) top_k->ne[0];
+        split_kv = (uint32_t) k->ne[1];
+        pc_ne3   = (uint32_t) (top_k->nb[1] / sizeof(int32_t));
+        pc_nb03  = (uint32_t) n_kv_raw;
+        gqa_ratio |= 0x80000000u;
+        kv_dyn_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
+        static const bool gdbg = [] { const char * e = getenv("GGML_VK_FA_GATHER_DEBUG"); return e && atoi(e) != 0; }();
+        if (gdbg) {
+            fprintf(stderr, "[vk-fa-qsa] gather-prefill N_tok=%u list=%u n_kv=%u gqa=%u wg=(%u,%u,%u) Br=%u Bc=%u aligned=%d nan_safe_v=%d\n",
+                    (uint32_t) neq1, KV, split_kv, gqa_ratio & 0xffff, workgroups_x, workgroups_y, workgroups_z, Br, Bc, (int) aligned, (int) nan_safe_v);
+        }
+    } else if (fa_compact.active) {
+        static const bool gdbg = [] { const char * e = getenv("GGML_VK_FA_GATHER_DEBUG"); return e && atoi(e) != 0; }();
+        if (gdbg && dst->src[5] != nullptr) {
+            fprintf(stderr, "[vk-fa-qsa] compact N_tok=%u kv_c=%u n_head_kv=%u separate_v=%d dynamic=%d nan_safe_v=%d\n",
+                    (uint32_t) neq1, fa_compact.kv_c, fa_compact.n_head_kv, (int) fa_compact.separate_v, (int) fa_compact.dynamic_kv, (int) nan_safe_v);
+        }
+    }
+
     const vk_flash_attn_push_constants pc = { N, KV,
-                                              (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
+                                              (uint32_t)ne1, (uint32_t)ne2, pc_ne3,
                                               (uint32_t)neq2, (uint32_t)neq3,
                                               (uint32_t)nek2, (uint32_t)nek3,
                                               (uint32_t)nev2, (uint32_t)nev3,
                                               nem1, nem2, nem3,
-                                              q_stride, (uint32_t)nbq2, (uint32_t)nbq3,
+                                              q_stride, (uint32_t)nbq2, pc_nb03,
                                               k_stride, eff_nbk2, eff_nbk3,
                                               v_stride, eff_nbv2, eff_nbv3,
                                               scale, max_bias, logit_softcap,
@@ -10008,7 +10123,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : q_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, kv_dyn_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -10023,7 +10138,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             workgroups_x *= pipeline->wg_denoms[0];
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : q_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, kv_dyn_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
