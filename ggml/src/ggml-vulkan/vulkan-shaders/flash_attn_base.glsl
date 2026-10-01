@@ -41,6 +41,12 @@ const bool NAN_SAFE_V       = (Flags & 32) != 0;
 // A column whose entry is invalid, or whose mask hides it from the token, is staged as zero K/V and
 // scores -inf, so a hidden key's data is never read: NaN-safe without NAN_SAFE_V.
 const bool GATHER_KV        = (Flags & 64) != 0;
+// GATHER_FRAG (with GATHER_KV, f16 K/V, coopmat1, AMD RDNA3 only): the gathered K and V fragments are built
+// in registers straight from the cache rows instead of being staged through LDS. It relies on the gfx11
+// WMMA fragment layout (A: lane L holds row L % 16, element i = column i; B: lane L holds column L % 16,
+// element i = row i), which is not guaranteed by the spec, so the host sets it only on RDNA3.
+// One comparison (both bits), so no && between spec constants reaches main().
+const bool GATHER_FRAG      = (Flags & 192) == 192;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

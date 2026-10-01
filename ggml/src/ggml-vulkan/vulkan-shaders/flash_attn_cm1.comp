@@ -14,6 +14,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 
@@ -74,6 +75,11 @@ shared uint dead_blk;
 // GATHER_KV: the block's Bc gathered cache rows, resolved once per KV block (0xFFFFFFFF = zero row,
 // -inf score: past the list, an invalid entry, or a key the token's mask hides)
 shared uint32_t grow_sh[Bc];
+// GATHER_FRAG: the block's gathered mask column (-inf for a dropped column); grow_sh then holds a live row for
+// every column (a dropped one borrows the block's first live row), so the fragment loads need no bounds test
+shared float16_t gmask_sh[Bc];
+// GATHER_FRAG: the block's per-row O rescale factors, read by the register-resident O accumulators
+shared float eMsh[Br];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -169,6 +175,26 @@ void main() {
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
 
+    // GATHER_FRAG: subgroup 0 keeps the list two blocks ahead and the mask one block ahead in registers, so a
+    // block's resolution never waits on the dependent list -> mask load chain
+    uint32_t pf_row1 = 0xFFFFFFFFu, pf_row2 = 0xFFFFFFFFu;
+    float16_t pf_m1 = float16_t(0.0);
+    if (GATHER_FRAG && gl_SubgroupID == 0) {
+        pf_row1 = gather_row(start_j * Bc + tid);
+        pf_m1 = pf_row1 != 0xFFFFFFFFu ? (MASK_ENABLE ? data_m[m_offset + pf_row1] : float16_t(0.0))
+                                       : float16_t(uintBitsToFloat(0xFF800000));
+        pf_row2 = gather_row((start_j + 1) * Bc + tid);
+    }
+
+    // GATHER_FRAG: O lives in f32 coopmat accumulators across the KV loop (one per hsv tile of this subgroup),
+    // rescaled per row through the gfx11 accumulator layout (lane L holds column L % 16, rows L / 16 + 4 i),
+    // instead of a per-block pvsh round trip with two barriers per hsv tile. Drained into Of after the loop.
+    const uint o_num_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split);
+    coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> OAcc[o_num_tiles];
+    [[unroll]] for (uint32_t t = 0; t < o_num_tiles; ++t) {
+        OAcc[t] = coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0.0);
+    }
+
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
         bool dead_rows = false;
@@ -177,7 +203,33 @@ void main() {
             mask_cache[idx] = f16vec4(0);
         }
 
-        if (GATHER_KV) {
+        if (GATHER_FRAG) {
+            barrier();   // the previous block's fragment loads may still read grow_sh
+            // host gate: Bc == gl_SubgroupSize, so subgroup 0 resolves the whole block
+            if (gl_SubgroupID == 0) {
+                uint32_t gr = pf_row1;
+                float16_t mg = pf_m1;
+                // a key the token's mask hides is dropped here (an invalid entry already carries -inf)
+                if (float(mg) <= FA_MASK_DEAD) {
+                    gr = 0xFFFFFFFFu;
+                    mg = float16_t(uintBitsToFloat(0xFF800000));
+                }
+                // issue the next blocks' loads now; they complete under this block's work
+                pf_row1 = pf_row2;
+                pf_m1 = pf_row1 != 0xFFFFFFFFu ? (MASK_ENABLE ? data_m[m_offset + pf_row1] : float16_t(0.0))
+                                               : float16_t(uintBitsToFloat(0xFF800000));
+                pf_row2 = gather_row((j + 2) * Bc + tid);
+                // a dropped column reads the block's first live row: P is exactly 0 there, and a live row's V is
+                // finite unless the reference itself is NaN (it weighs that row too). A block with no live column
+                // is skipped below before any K/V load.
+                const uvec4 live = subgroupBallot(gr != 0xFFFFFFFFu);
+                const uint32_t first = subgroupBallotFindLSB(live);
+                const uint32_t sub = subgroupShuffle(gr, first);
+                grow_sh[tid] = gr != 0xFFFFFFFFu ? gr : (sub != 0xFFFFFFFFu ? sub : 0u);
+                gmask_sh[tid] = mg;
+            }
+            barrier();
+        } else if (GATHER_KV) {
             barrier();   // the previous block's V staging may still read grow_sh
             if (tid < Bc) {
                 uint32_t gr = gather_row(j * Bc + tid);
@@ -212,7 +264,11 @@ void main() {
                     if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
-                            if (GATHER_KV) {
+                            if (GATHER_FRAG) {
+                                const float16_t mg = gmask_sh[c];
+                                m = f16vec4(mg, mg, mg, mg);
+                                max_mask = max(max_mask, float(mg));
+                            } else if (GATHER_KV) {
                                 // one mask row per token (m_stride == 0); the column is the gathered cache row
                                 const uint32_t gr = grow_sh[c];
                                 const float16_t mg = gr != 0xFFFFFFFFu ? data_m[m_offset + gr] : float16_t(uintBitsToFloat(0xFF800000));
@@ -316,6 +372,12 @@ void main() {
             barrier();
         }
 
+        uint32_t k_frag_base = 0;
+        if (GATHER_FRAG) {
+            const uint32_t kr = grow_sh[gl_SubgroupID * MatBc + gl_SubgroupInvocationID % MatBr];
+            k_frag_base = k_offset / 4 + kr * (k_stride / 4);
+        }
+
         // K * Q^T -> S^T: Bc x HSK_pad * HSK_pad x Br -> Bc x Br
         // Bc split across workgroup (four subgroups), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
         // This is written transposed in order to allow for N being 8 if implementations need it
@@ -329,6 +391,18 @@ void main() {
             // staged through a Bc * MatBr size staging buffer.
             // If K is a quant type, then it is always staged for dequantization.
             if (SHMEM_STAGING == 0) {
+            if (GATHER_FRAG) {
+                // A fragment: this lane's row is the block column gl_SubgroupID * MatBc + lane % 16, its 16
+                // elements are that cache row's dims d*16 .. d*16+15 (contiguous). A dropped column's score is
+                // replaced by -inf, so the K data it borrows never matters.
+                [[unroll]] for (uint32_t e4 = 0; e4 < 4; ++e4) {
+                    const FLOAT_TYPEV4 kf = FLOAT_TYPEV4(data_kv4[k_frag_base + d * 4 + e4]);
+                    KMat[e4 * 4 + 0] = kf.x;
+                    KMat[e4 * 4 + 1] = kf.y;
+                    KMat[e4 * 4 + 2] = kf.z;
+                    KMat[e4 * 4 + 3] = kf.w;
+                }
+            } else {
             // For quants we always need to dequant into kvsh; for f16/bf16 we can load
             // directly from global memory when alignment / bounds allow it.
             const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK || GATHER_KV;
@@ -368,6 +442,7 @@ void main() {
             } else {
                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
                 coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+            }
             }
             } else {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
@@ -439,11 +514,20 @@ void main() {
             Lf[r] = eMf[r]*Lf[r];
         }
 
+        if (GATHER_FRAG) {
+            // read after the Psh barrier below; the next block writes it only after its own S barriers
+            if (col_tid == 0) {
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    eMsh[tile_row(r)] = eMf[r];
+                }
+            }
+        } else {
         [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
             const uint d_local = d0 / threads_per_rowgroup;
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
             }
+        }
         }
 
         // Calculate and store Pf in Psh
@@ -501,6 +585,9 @@ void main() {
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
+        // GATHER_FRAG: lane c holds block column c's V row offset (Bc == subgroup size)
+        const uint v_row_off = GATHER_FRAG ? grow_sh[gl_SubgroupInvocationID] * v_stride : 0u;
+
         // Psh is not written again until the next KV block, so the P fragments are the same
         // for every hsv_tile. Load them once instead of re-reading LDS per tile.
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
@@ -524,6 +611,8 @@ void main() {
             // staged through a Bc * MatBr size staging buffer.
             // If V is a quant type, then it is always staged for dequantization.
             if (SHMEM_STAGING == 0) {
+            // GATHER_FRAG builds the V fragments from the cache rows below, nothing is staged
+            if (!GATHER_FRAG) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
             const bool stage_v = USE_DECODE_V || KV_bounds_check || dead_rows || GATHER_KV;
@@ -556,9 +645,30 @@ void main() {
                 }
             }
             }
-            barrier();
+            }
+            if (!GATHER_FRAG) {
+                barrier();
+            }
 
             const uint o_offset = gl_SubgroupID * MatBr / 4;
+
+            if (GATHER_FRAG) {
+                if (hsv_offset < HSV_pad) {
+                    [[unroll]] for (uint32_t i = 0; i < OAcc[hsv_tile].length(); ++i) {
+                        OAcc[hsv_tile][i] *= eMsh[gl_SubgroupInvocationID / 16 + 4 * i];
+                    }
+                    [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                        // B fragment: this lane's column is dim hsv_offset + lane % 16, element e is block column
+                        // bc_chunk * MatBc + e, whose row offset lane bc_chunk * MatBc + e holds (Bc == subgroup size)
+                        const uint v_lane = v_offset + hsv_offset + gl_SubgroupInvocationID % MatBc;
+                        [[unroll]] for (uint32_t e = 0; e < MatBc; ++e) {
+                            QMat[e] = data_v[v_lane + subgroupBroadcast(v_row_off, bc_chunk * MatBc + e)];
+                        }
+                        OAcc[hsv_tile] = coopMatMulAdd(PMat[bc_chunk], QMat, OAcc[hsv_tile]);
+                    }
+                }
+                continue;
+            }
 
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
@@ -609,7 +719,37 @@ void main() {
             }
         }
 
-        barrier();
+        // GATHER_FRAG: the next block's first barrier covers Psh / eMsh / grow_sh reuse
+        if (!GATHER_FRAG) {
+            barrier();
+        }
+    }
+
+    if (GATHER_FRAG) {
+        // drain the register-resident O tiles into Of through pvsh
+        const uint o_offset = gl_SubgroupID * MatBr / 4;
+        [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < o_num_tiles; ++hsv_tile) {
+            barrier();
+            const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+            if (hsv_offset < HSV_pad) {
+                coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> OTile =
+                    coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(OAcc[hsv_tile]);
+                coopMatStore(OTile, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+            const uint hsv_per_tile = row_split * MatBc;
+            const uint hsv_base = hsv_tile * hsv_per_tile;
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                const uint row = tile_row(r);
+                [[unroll]] for (uint32_t d_local = 0; d_local < d_per_thread; ++d_local) {
+                    const uint d = d_local * threads_per_rowgroup + col_tid;
+                    const uint hsv_col = 4 * d;
+                    if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
+                        Of[r][d_local] = pvsh[row * osh_stride + (hsv_col - hsv_base) / 4];
+                    }
+                }
+            }
+        }
     }
 
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {

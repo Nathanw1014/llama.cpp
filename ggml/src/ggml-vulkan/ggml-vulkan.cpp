@@ -1425,7 +1425,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool use_dynamic_kv, bool nan_safe_v, bool gather_kv) {
+                                                  bool use_dynamic_kv, bool nan_safe_v, bool gather_kv,
+                                                  bool gather_frag) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1435,7 +1436,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (old_amd_windows   ? 8 : 0) |
                      (use_dynamic_kv    ? 16 : 0) |
                      (nan_safe_v        ? 32 : 0) |
-                     (gather_kv         ? 64 : 0);
+                     (gather_kv         ? 64 : 0) |
+                     (gather_frag       ? 128 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -9776,9 +9778,20 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (gather_kv) {
         GGML_ASSERT(tuning_params.path == FA_COOPMAT1 && gqa_ratio > 1 && !nan_safe_v);
     }
+    // GATHER_FRAG: build the gathered K/V coopmat fragments in registers from the cache rows (no LDS staging,
+    // no per-d-chunk barriers). Relies on the gfx11 WMMA fragment layout, so RDNA3 only; the shader also needs
+    // a 64-wide subgroup (one lane per block column) and 16-aligned head sizes (whole 16-dim fragment rows).
+    // GGML_VK_FA_GATHER_FRAG=0 falls back to the LDS-staged GATHER_KV.
+    static const bool fa_gather_frag_env = [] { const char * e = getenv("GGML_VK_FA_GATHER_FRAG"); return !(e && e[0] == '0'); }();
+    const bool gather_frag = gather_kv && fa_gather_frag_env && mask != nullptr &&
+                             ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3 &&
+                             tuning_params.subgroup_size == 64 && tuning_params.block_cols == 64 &&
+                             tuning_params.shmem_staging == 0 && !tuning_params.disable_subgroups &&
+                             (ctx->device->subgroup_size_control || ctx->device->subgroup_size == 64) &&
+                             HSK % 16 == 0 && HSV % 16 == 0;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   fa_compact.dynamic_kv, nan_safe_v, gather_kv);
+                                                                   fa_compact.dynamic_kv, nan_safe_v, gather_kv, gather_frag);
 
     vk_pipeline pipeline = nullptr;
 
@@ -10019,8 +10032,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         kv_dyn_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
         static const bool gdbg = [] { const char * e = getenv("GGML_VK_FA_GATHER_DEBUG"); return e && atoi(e) != 0; }();
         if (gdbg) {
-            fprintf(stderr, "[vk-fa-qsa] gather-prefill N_tok=%u list=%u n_kv=%u gqa=%u wg=(%u,%u,%u) Br=%u Bc=%u aligned=%d nan_safe_v=%d\n",
-                    (uint32_t) neq1, KV, split_kv, gqa_ratio & 0xffff, workgroups_x, workgroups_y, workgroups_z, Br, Bc, (int) aligned, (int) nan_safe_v);
+            fprintf(stderr, "[vk-fa-qsa] gather-prefill N_tok=%u list=%u n_kv=%u gqa=%u wg=(%u,%u,%u) Br=%u Bc=%u aligned=%d nan_safe_v=%d frag=%d\n",
+                    (uint32_t) neq1, KV, split_kv, gqa_ratio & 0xffff, workgroups_x, workgroups_y, workgroups_z, Br, Bc, (int) aligned, (int) nan_safe_v,
+                    (int) gather_frag);
         }
     } else if (fa_compact.active) {
         static const bool gdbg = [] { const char * e = getenv("GGML_VK_FA_GATHER_DEBUG"); return e && atoi(e) != 0; }();
