@@ -98,9 +98,7 @@
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // PTQ1_0 has no arch-specific kernel on any target; always use the generic one.
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
-#define ggml_vec_dot_tq2_t_q8_0_generic ggml_vec_dot_tq2_t_q8_0
-#define ggml_vec_dot_tqk6_q8_0_generic ggml_vec_dot_tqk6_q8_0
-#define ggml_vec_dot_tqk7_q8_0_generic ggml_vec_dot_tqk7_q8_0
+// TQ2_T / TQK6 / TQK7: arch/x86/quants.c (AVX-512 VBMI or AVX2; generic otherwise)
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
