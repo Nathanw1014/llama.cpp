@@ -223,8 +223,9 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
-llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_kv_max) :
+    ctx_attn(n_kv_max == UINT32_MAX ? mem->get_mem_attn()->init_full() :
+        llama_memory_context_ptr(new llama_kv_cache_context(mem->get_mem_attn(), n_kv_max))),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }

@@ -377,9 +377,10 @@ public:
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
 
-    // used to create a full-cache context
+    // used to create a full-cache context (n_kv_max caps the cells the reserved graph spans)
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv,
+            uint32_t n_kv_max = UINT32_MAX);
 
     // used to create an update context
     llama_kv_cache_context(

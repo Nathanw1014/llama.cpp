@@ -738,6 +738,21 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // qwen4exp: below indexer_top_k + ratio cells the QSA layers attend dense with a KQ mask, which the maskless
+    // block-selection graph reserved above does not have; without this, every short-context ubatch grows the buffers
+    if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+        if (auto mctx_dense = qsa->init_full_dense()) {
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            if (!graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx_dense.get(), model.hparams.no_alloc,
+                    model.hparams.no_alloc ? sizes.data() : nullptr)) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+            for (size_t i = 0; model.hparams.no_alloc && i < sizes.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]);
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`

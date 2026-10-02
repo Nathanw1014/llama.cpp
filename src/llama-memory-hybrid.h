@@ -97,8 +97,8 @@ public:
     // init failure
     explicit llama_memory_hybrid_context(llama_memory_status status);
 
-    // init full
-    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+    // init full (n_kv_max caps the attention cells the reserved graph spans)
+    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_kv_max = UINT32_MAX);
 
     // init update
     explicit llama_memory_hybrid_context(

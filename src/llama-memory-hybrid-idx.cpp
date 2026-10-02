@@ -102,6 +102,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
             any = true;
+            qsa_dense_n_kv = std::max(qsa_dense_n_kv, model.hparams.indexer_top_k + model.hparams.dsv4_compress_ratios[il] - 1);
             all = all && (std::strcmp(reg, "ROCm") == 0 ||
                           (std::strcmp(reg, "CUDA") != 0 && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il)));
         }
@@ -204,6 +205,15 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_dense() {
+    // the masked top-k graph keeps the KQ mask at the full cache size, which covers the dense graphs
+    if (!mem_idx || !selected_key_attn) { return nullptr; }
+    // n_kv is padded to 256 cells, so the largest dense graph spans the bound rounded down to that
+    const uint32_t n_kv = std::max(256u, qsa_dense_n_kv/256*256);
+    if (n_kv >= mem_idx->get_size() || n_kv >= get_mem_attn()->get_size()) { return nullptr; }
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
@@ -926,15 +936,15 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
     llama_memory_hybrid_context(status) {}
 
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
-    llama_memory_hybrid_context(mem),
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv_max) :
+    llama_memory_hybrid_context(mem, n_kv_max),
     mem(mem),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        new llama_kv_cache_context(mem->get_mem_idx(), n_kv_max)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

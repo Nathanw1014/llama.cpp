@@ -55,6 +55,11 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // full context for the dense-shortcut graph (a cache of at most indexer_top_k + ratio - 1 cells), or nullptr when
+    // init_full already reserves it. The maskless graph that init_full reserves has no KQ mask, so a reserve with only
+    // that graph leaves the mask of the short-context graphs out of the compute buffers.
+    llama_memory_context_ptr init_full_dense();
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -121,6 +126,8 @@ private:
     bool incremental_qsa = false;
     // the QSA layers run where a kernel reads the maskless block selection (HIP on RDNA3.5, Vulkan); otherwise the masked top-k
     bool selected_key_attn = false;
+    // the largest cache the QSA layers attend dense (indexer_top_k + ratio - 1, max over the layers), 0 without QSA layers
+    uint32_t qsa_dense_n_kv = 0;
     bool qsa_recover_pending = false;
     bool qsa_recover(llama_seq_id seq);
     qsa_prefix_state qsa_prefix;
@@ -145,8 +152,8 @@ public:
     // used for errors
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
-    // used to create a full-cache context
-    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+    // used to create a full-cache context (n_kv_max caps the cells the reserved graph spans)
+    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv_max = UINT32_MAX);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

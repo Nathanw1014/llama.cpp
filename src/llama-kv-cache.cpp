@@ -2902,8 +2902,9 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv,
+        uint32_t n_kv_max) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    n_kv = std::min(kv->get_size(), n_kv_max);
 
     const uint32_t n_stream = kv->get_n_stream();
 
