@@ -531,8 +531,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
     if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32 &&
-        qwen4exp_takes_f16_b(model) &&
-        w_up->buffer != nullptr && !ggml_backend_buffer_is_host(w_up->buffer)) {   // a CPU matmul cannot take the f16 gate downstream
+        qwen4exp_takes_f16_b(model) &&                 // no bf16 consumer: there is no bf16 x f16 shader
+        llm_graph_weights_on_gpu(w_up->buffer)) {      // and a CPU matmul cannot take the f16 gate downstream
         // f16 gate logits: the up-GEMM writes its result as f16 through the MUL_MAT+CPY(f16) fusion and
         // DSV4_HC_MIX reads the f16 gate; the 84 MB f32 gate tensor is neither written nor read (prefill only)
         gate_logits = ggml_cast(ctx0, gate_logits, GGML_TYPE_F16);

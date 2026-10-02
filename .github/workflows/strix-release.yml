@@ -89,6 +89,21 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DLLAMA_BUILD_TESTS=OFF
           cmake --build build-vulkan -j "$(nproc)"
+      - name: RPC backend compile check
+        run: |
+          # The GGML_OP_COUNT tripwire in ggml/include/ggml-rpc.h is only compiled under
+          # -DGGML_RPC=ON, which neither arm of this workflow nor the toolbox image enables,
+          # so an op added to the enum breaks third-party RPC builds and nothing here notices.
+          # Separate build dir and no Vulkan: the packaged tarball above stays Vulkan-only and
+          # this costs a ggml-base + rpc compile, not a second full build.
+          cmake -S . -B build-rpc-check -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_RPC=ON \
+            -DGGML_VULKAN=OFF \
+            -DLLAMA_CURL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+          cmake --build build-rpc-check -j "$(nproc)" --target ggml-rpc
       - name: Package
         run: |
           echo "source: ${GITHUB_REF_NAME} @ ${GITHUB_SHA}" > build-vulkan/bin/MANIFEST.txt

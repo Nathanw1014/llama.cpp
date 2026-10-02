@@ -736,6 +736,13 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// True when a tensor's weights sit on a buffer a GPU backend will consume.
+//
+// ggml_backend_buffer_is_host() cannot answer this: a CPU REPACK buffer is host memory in a reordered
+// layout and reports is_host == false, so "!is_host" reads a CPU-resident repacked weight as device
+// resident. The f16 activation gates below need the consumer's device type, not host addressability.
+bool llm_graph_weights_on_gpu(ggml_backend_buffer_t buf);
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

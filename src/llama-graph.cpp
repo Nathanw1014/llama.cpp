@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <set>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1875,10 +1876,40 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+bool llm_graph_weights_on_gpu(ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (buft == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    // An integrated GPU is still a GPU for this purpose, and on gfx1151 it is the ONLY one: RADV reports
+    // GGML_BACKEND_DEVICE_TYPE_IGPU, so testing for _GPU alone silently disables the f16 chain on exactly
+    // the hardware this fork targets. ACCEL (BLAS, AMX) runs on the CPU backend and must stay excluded.
+    const enum ggml_backend_dev_type dt = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+    const bool on_gpu = dev != nullptr &&
+        (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU);
+    // LLAMA_MOE_F16_DEBUG=1: report every buffer this gate is asked about, with both predicates, so the
+    // classes where they disagree are read off a real model rather than reasoned about.
+    static const bool dbg = getenv("LLAMA_MOE_F16_DEBUG") != nullptr;
+    if (dbg) {
+        static std::set<const void *> seen;
+        if (seen.insert((const void *) buf).second) {
+            fprintf(stderr, "moe_f16_gate: buft=%-28s is_host=%d dev=%-12s dev_type=%d -> on_gpu=%d\n",
+                    ggml_backend_buft_name(buft), (int) ggml_backend_buffer_is_host(buf),
+                    dev ? ggml_backend_dev_name(dev) : "(none)", dev ? (int) ggml_backend_dev_type(dev) : -1,
+                    (int) on_gpu);
+        }
+    }
+    return on_gpu;
+}
+
 // LLAMA_MOE_F16 (default on): at prefill (n_tokens >= 32) keep the MoE expert activations and outputs in f16
 // between the projections, the GLU and the combine. Every consumer reads f16 natively on the Vulkan backend
 // (f16-B matmuls, f16 GLU, f16-source multi-add); other backends run the casts as plain conversions.
-// The expert weights must sit on a device buffer: a CPU mul_mat_id converts its B operand from f32 and
+// The expert weights must sit on a GPU buffer: a CPU mul_mat_id converts its B operand from f32 and
 // reads f16 activations as garbage (keep-320 PPL = nan with -ncmoe 8, 2026-09-14), so layers whose experts
 // are host-resident keep the f32 chain.
 static bool llm_graph_moe_f16(int64_t n_tokens, const ggml_tensor * exps) {
@@ -1886,7 +1917,7 @@ static bool llm_graph_moe_f16(int64_t n_tokens, const ggml_tensor * exps) {
         const char * e = getenv("LLAMA_MOE_F16");
         return e == nullptr || atoi(e) != 0;
     }();
-    return on && n_tokens >= 32 && exps != nullptr && exps->buffer != nullptr && !ggml_backend_buffer_is_host(exps->buffer);
+    return on && n_tokens >= 32 && exps != nullptr && llm_graph_weights_on_gpu(exps->buffer);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
