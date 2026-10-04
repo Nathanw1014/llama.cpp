@@ -547,7 +547,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
     // the dense shortcut graph reads neither of these, so ggml-alloc leaves them unallocated:
     // present as tensors with data still null. Same host-scratch fallback as cell_blk / bias.
-    if (blk_cells != nullptr && blk_cells->data != nullptr) {
+    // complete-block selection over the pooled-key cache reads the whole member table but only the
+    // window's positions, so there blk_cells is a graph tensor and blk_pos is not
+    if (blk_cells != nullptr && blk_cells->data != nullptr && blk_pos == nullptr && pool_cells != nullptr) {
+        blk_pos_host.resize((size_t) 4*n_blocks*n_ns);
+        dst_blk_cells = (int32_t *) blk_cells->data;
+        dst_blk_pos   = blk_pos_host.data();
+    } else if (blk_cells != nullptr && blk_cells->data != nullptr) {
         GGML_ASSERT(blk_pos != nullptr && blk_pos->data != nullptr);
         dst_blk_cells = (int32_t *) blk_cells->data;
         dst_blk_pos   = (int32_t *) blk_pos->data;
