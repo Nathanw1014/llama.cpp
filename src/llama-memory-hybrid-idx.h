@@ -109,10 +109,18 @@ public:
     //   pool_idxs  I64 [n_recomp]        rows of the pooled cache this ubatch rewrites
     //   pool_cells I32 [ratio*n_recomp]  cells making up each rewritten block
     //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
+    // tail_idxs is non-null only for complete-block selection (maskless, selected-key attention):
+    //   tail_idxs  I32 [ratio-1, n_tokens/ns, ns] cells of the query's own partial block whose
+    //              position is <= the query's, -1 padded. The own block and the spare block are
+    //              then -inf in the per-block bias: their cells come from the tail, not the score.
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
-                       ggml_tensor * pool_pos, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, int64_t n_kv_ctx, int64_t n_ns_ctx) const;
+                       ggml_tensor * pool_pos, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
+                       uint32_t ratio, bool blk_bias, int64_t n_kv_ctx, int64_t n_ns_ctx) const;
+
+    // every QSA layer runs on a device whose flash attention reads a selected-key list without a
+    // mask (probed with supports_op), or LLAMA_QSA_SELECTED_KEY=0/1 forced the answer
+    bool qsa_selected_key_attn() const { return selected_key_attn; }
 
 private:
     // forget seq_id (or, for seq_id < 0, everything) in every cache at once, so that a restore
@@ -140,6 +148,8 @@ private:
     // sequence's tail blocks sit mid-table where the recompute window cannot reach them.
     // So the cache is only trusted while a single sequence is present in the stream.
     bool qsa_pool_one_seq() const;
+
+    bool selected_key_attn = false;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -194,8 +204,14 @@ public:
     //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
-                       ggml_tensor * pool_pos, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       ggml_tensor * pool_pos, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
+                       uint32_t ratio, bool blk_bias) const;
+
+    bool qsa_selected_key_attn() const { return mem != nullptr && mem->qsa_selected_key_attn(); }
+
+    // single stream, one-axis positions below 2^24, and no block split across sequence sets
+    // (qsa_scalar_visibility_cells): the visibility complete-block selection encodes is exact
+    bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

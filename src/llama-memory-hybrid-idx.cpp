@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <cassert>
@@ -12,12 +13,89 @@
 #include <cstdlib>
 #include <iterator>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 
 //
 // llama_memory_hybrid_idx
 //
+
+// can dev run maskless selected-key attention with the shapes of QSA layer il? A probe op, as for
+// weight buffer types. Only a backend whose flash attention reads the list without a mask takes it:
+// the mask-reading kernels would attend every cell, so their supports_op refuses the op.
+static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il) {
+    ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    const int64_t d     = hp.n_embd_head_k(il);
+    const int64_t n_sel = hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1;
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 1, hp.n_head(il), 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * ids = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, n_sel, 1, 1, 1);
+    ggml_tensor * fa  = ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_add_top_k(fa, ids, 0);
+    return ggml_backend_dev_supports_op(dev, fa);
+}
+
+// Complete-block selection encodes visibility as "block start < the query's tail start" plus the
+// query's own partial block, per the first seq id of each query, as the attention mask does. That is
+// exact only when positions are one-axis and below 2^24 (the selection carries cells through f32),
+// and when no position block holds one sequence under two sequence sets (a seq_cp inside the block):
+// blocks are keyed on (sequence set, position block), so such a block has no complete group for the
+// sequence and the maskless path would drop its cells where the masked path keeps them.
+static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u) {
+    if (ratio == 0 || count > cells.size() || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id) {
+        return false;
+    }
+    llama_kv_cells::seq_set_t rows;
+    for (uint32_t i = 0; i < u.n_tokens; ++i) {
+        if (u.n_seq_id[i] < 1 || !u.seq_id[i] || u.seq_id[i][0] < 0 || u.seq_id[i][0] >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        if (u.pos[i] < 0 || u.pos[i] >= 16777216) {
+            return false;
+        }
+        for (uint32_t axis = 1; axis < u.n_pos; ++axis) {
+            if (u.pos[i + axis*u.n_tokens] != u.pos[i]) {
+                return false;
+            }
+        }
+        rows.set(u.seq_id[i][0]);
+    }
+    // a 2-D (image) cell past its linear position breaks the scalar test; only blocks with a shared cell can split
+    std::unordered_map<llama_pos, std::vector<llama_kv_cells::seq_set_t>> shared;
+    for (uint32_t j = 0; j < count; ++j) {
+        if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) {
+            continue;
+        }
+        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j))) {
+            return false;
+        }
+        if (cells.seq_get_all(j).count() > 1) {
+            shared[cells.pos_get(j)/ratio];
+        }
+    }
+    for (uint32_t j = 0; !shared.empty() && j < count; ++j) {
+        if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) {
+            continue;
+        }
+        const auto it = shared.find(cells.pos_get(j)/ratio);
+        if (it == shared.end()) {
+            continue;
+        }
+        const auto & set = cells.seq_get_all(j);
+        for (const auto & other : it->second) {
+            if (other != set && (other & set & rows).any()) {
+                return false;
+            }
+        }
+        if (std::find(it->second.begin(), it->second.end(), set) == it->second.end()) {
+            it->second.push_back(set);
+        }
+    }
+    return true;
+}
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
@@ -130,7 +208,29 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_pool, GGML_TYPE_F32, GGML_TYPE_F32, v_trans, offload, unified,
             n_blocks_max, n_seq_max, 1, 0, LLAMA_SWA_TYPE_NONE,
             nullptr, filter_idx, nullptr, nullptr, "pool_");
-    }()) {}
+    }()) {
+    if (mem_idx) {
+        // complete-block selection hands flash attention a selected-key list and no mask, so every
+        // QSA layer must sit on a device whose kernels read that list. Ask each layer's device with
+        // a probe op rather than by backend name: a backend without the kernels refuses the op.
+        bool all = true;
+        bool any = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] == 0) {
+                continue;
+            }
+            any = true;
+            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, (int) il);
+        }
+        selected_key_attn = any && all && offload;
+        // LLAMA_QSA_SELECTED_KEY=0 keeps the masked top-k everywhere, =1 forces the selection (validation)
+        if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) {
+            selected_key_attn = atoi(e) != 0;
+        }
+        LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
+            "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: this repeats llama_memory_hybrid::init_batch because the indexer cache needs the
@@ -396,6 +496,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * pool_idxs,
         ggml_tensor * pool_cells,
         ggml_tensor * pool_pos,
+        ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -456,6 +557,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
         blk_pos_host  .resize((size_t) 4*n_blocks*n_ns);
         dst_blk_cells = blk_cells_host.data();
         dst_blk_pos   = blk_pos_host  .data();
+    }
+
+    // complete-block selection: each query's own partial block goes out as a cell list
+    int32_t * dst_tail = nullptr;
+    if (tail_idxs != nullptr) {
+        GGML_ASSERT(blk_bias && r > 1 && tail_idxs->data != nullptr && ggml_backend_buffer_is_host(tail_idxs->buffer));
+        GGML_ASSERT(tail_idxs->ne[0] == r-1 && tail_idxs->ne[1] == n_tps && tail_idxs->ne[2] == n_ns);
+        dst_tail = (int32_t *) tail_idxs->data;
+        std::fill(dst_tail, dst_tail + ggml_nelements(tail_idxs), -1);
     }
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
@@ -672,6 +782,22 @@ void llama_memory_hybrid_idx::set_input_qsa(
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
+        // member cells per group, for the tails (a group's slot k holds the cell at position k within the block)
+        std::vector<int32_t> group_members;
+        if (dst_tail) {
+            group_members.assign(grp_first.size()*r, -1);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int32_t g = cell_grp[j];
+                if (g < 0) {
+                    continue;
+                }
+                const int64_t idx  = ranked ? rank[j] : cells.pos_get(j);
+                const int64_t slot = g*r + idx%r;
+                GGML_ASSERT(group_members[slot] < 0 || group_members[slot] == j);
+                group_members[slot] = (int32_t) j;
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -704,6 +830,27 @@ void llama_memory_hybrid_idx::set_input_qsa(
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
 
+            // the tail list: the cells of this sequence at positions tail_start..q
+            if (dst_tail && q + 1 > tail_start) {
+                const int64_t pb = tail_start/r;
+                if (pb >= 0 && pb < n_blocks) {
+                    int32_t * tail = dst_tail + i*(r-1);
+                    for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
+                        if (!cells.seq_has((uint32_t) grp_first[g], seq_id)) {
+                            continue;
+                        }
+                        for (int64_t slot = 0; slot < q + 1 - tail_start; ++slot) {
+                            const int32_t cell = group_members[g*r + slot];
+                            if (cell < 0 || !cells.seq_has((uint32_t) cell, seq_id)) {
+                                continue;
+                            }
+                            GGML_ASSERT(tail[slot] < 0 || tail[slot] == cell);
+                            tail[slot] = cell;
+                        }
+                    }
+                }
+            }
+
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and future cells
@@ -716,14 +863,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     }
 
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    // with tails the own block is never scored (its cells come from the tail), so it is
+                    // hidden, and so is any later block: no mask follows to drop its future cells
+                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? (dst_tail ? -INFINITY : 1e9f) : 0.0f;
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
                 // it gets the tail value. it must stay finite: a sequence with fewer than
                 // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                // with tails nothing takes a softmax over the scores and the tail list carries
+                // those cells, so the spare block is -inf there
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = dst_tail ? -INFINITY : 1e9f;
                 }
 
                 continue;
@@ -880,14 +1031,26 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * pool_idxs,
         ggml_tensor * pool_cells,
         ggml_tensor * pool_pos,
+        ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias,
-                       pool_idxs, pool_cells, pool_pos, ubatch, ratio, blk_bias,
+                       pool_idxs, pool_cells, pool_pos, tail_idxs, ubatch, ratio, blk_bias,
                        get_idx()->get_n_kv(), (int64_t) get_n_stream());
+}
+
+bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
+    if (mem == nullptr || mem->get_mem_idx() == nullptr || get_idx() == nullptr || i_cur >= ns_ubatch.size() ||
+            get_n_stream() != 1 || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
+            ubatch.n_seq_id[0] < 1 || !ubatch.seq_id[0]) {
+        return false;
+    }
+    // one stream: every seq id of the ubatch reads the same cells
+    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]),
+            get_idx()->get_n_kv(), ratio, ubatch);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx_context::get_mem_pool() const {

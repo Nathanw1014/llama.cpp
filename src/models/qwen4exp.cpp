@@ -834,7 +834,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias,
-                            pool_idxs, pool_cells, pool_pos, ubatch, ratio, blk_bias);
+                            pool_idxs, pool_cells, pool_pos, nullptr, ubatch, ratio, blk_bias);
     }
 
     bool can_reuse(const llm_graph_params & params) override;
