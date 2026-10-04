@@ -889,6 +889,8 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    // the logits row blocks when build_output_logits split them; empty when t_logits holds every row
+    const std::vector<ggml_tensor *> & get_logits_parts() const { return t_logits_parts; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -928,6 +930,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    std::vector<ggml_tensor *> t_logits_parts; // [n_vocab, rows] each, in row order; t_logits is the first
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1057,6 +1060,14 @@ struct llm_graph_context {
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * w_s = nullptr) const;
+
+    // the LM head over the output rows, as res->t_logits. When n_rows x n_vocab f32 passes LLAMA_LOGITS_PART_MB
+    // (default 1024, 0 = never) the rows are projected in even blocks, each its own output tensor, so no single
+    // tensor scales with the ubatch x vocabulary (RADV caps a buffer at 4 GiB: ub 4096 at a 248k vocabulary)
+    void build_output_logits(
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;

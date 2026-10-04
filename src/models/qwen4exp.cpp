@@ -1226,11 +1226,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
+    build_output_logits(model.output, cur, model.output_s);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
