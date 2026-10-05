@@ -22927,9 +22927,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && j >= 2 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_MUL_MAT_ID &&
                       graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
-                    // the hc gate cast followed by its DSV4_HC_MIX (HC_UP_MIX): keep the mix behind the cast
+                    // the hc gate cast followed by its DSV4_HC_MIX (HC_UP_MIX): keep the mix behind the cast. Only for the
+                    // hc-interleaved mixes the fusion can take (op param 1): on the default stream-major graph the extra
+                    // ordering moved allocation-dependent fusions and changed prefill rounding (PPL 3.8055 -> 3.8031)
                     !(ggml_vk_hc_up_mix_enabled() && j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_CPY &&
-                      graph->nodes[j]->op == GGML_OP_DSV4_HC_MIX && graph->nodes[j]->src[1] == graph->nodes[c]) &&
+                      graph->nodes[j]->op == GGML_OP_DSV4_HC_MIX && graph->nodes[j]->src[1] == graph->nodes[c] &&
+                      ggml_get_op_params_i32(graph->nodes[j], 1) != 0) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
