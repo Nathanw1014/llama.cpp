@@ -5583,11 +5583,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const auto &m_mmq_wg_denoms = m_mmq_wg_denoms_id128;
         const auto &l_warptile_mmq = l_warptile_mmq_idw;
 
-        // GGML_VK_MMID_REGA=1 (probe, default off): register-direct A on the aligned medium iq3_xxs tile
+        // GGML_VK_MMID_REGA: register-direct A on the aligned medium iq3_xxs / iq4_nl tile
         // (mul_mm.comp REG_A). Every wave32 subgroup owns 16 rows and all 64 columns, so WM = 16, WN = BN.
         // =1: 256 threads, 16 rows per subgroup; =2: 128 threads, 32 rows per subgroup (two A fragments share each B
-        // fragment); =3: as 2, each half-wave decodes one fragment's rows and they swap halves (xor-16 shuffle)
-        static const int mmid_rega = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : 0; }();
+        // fragment); =3 (default on AMD): as 2, each half-wave decodes one fragment's rows and they swap halves
+        // (xor-16 shuffle); =0 off. Same gfx11 fragment layout as the BUF_MANUAL loads. FN REAP-320 pp2048 ub2048:
+        // stock Mesa 25.2.8 843 -> 968 t/s d0, 686 -> 784 d8192; mesa-main 1109 -> 1145 / 883 -> 910 (2026-10-05).
+        const int mmid_rega = [&device] {
+            const char * e = getenv("GGML_VK_MMID_REGA");
+            return e ? atoi(e) : (device->vendor_id == VK_VENDOR_ID_AMD ? 3 : 0);
+        }();
         auto mmid_m_aligned_spec = [&](ggml_type t, std::vector<uint32_t> w) {
             if (!mmid_rega || (t != GGML_TYPE_IQ3_XXS && t != GGML_TYPE_IQ4_NL) || mmid_req_sgs != 32 || w[1] != 128 || w[2] != 64) {
                 return ggml_vk_mul_mm_spec(w, true);
