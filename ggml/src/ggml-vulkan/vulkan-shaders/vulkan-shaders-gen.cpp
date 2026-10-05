@@ -600,7 +600,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // For aligned matmul loads
         std::string load_vec_a = (coopmat2 || tname == "f32" || tname == "f16" || tname == "bf16") ? load_vec : load_vec_quant;
         // KHR coopmat q6_K / q3_K: 8 k-values per lane per load (whole-dword fetches + register prefetch, mul_mm_funcs.glsl)
-        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0" || tname == "iq4_nl" || tname == "iq4_xs")) {
+        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "iq3_xxs")) {
             load_vec_a = "8";
         }
 
