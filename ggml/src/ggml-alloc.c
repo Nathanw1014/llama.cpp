@@ -438,6 +438,33 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     return buf;
 }
 
+// Grow-only reallocation: re-create only the chunks the allocator now needs larger, with 1/16 headroom
+// (capped at the chunk limit) so a context that grows by a few cells per ubatch does not trip it every time.
+// Chunks that are already big enough, or no longer used, are kept.
+static bool ggml_vbuffer_grow(struct vbuffer * buf, ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+    for (int n = 0; n < talloc->n_chunks; n++) {
+        const size_t need = talloc->chunks[n]->max_size;
+        if (ggml_vbuffer_chunk_size(buf, n) >= need) {
+            continue;
+        }
+        size_t size = need + need / 16;
+        size = ((size + talloc->alignment - 1) / talloc->alignment) * talloc->alignment;
+        if (talloc->max_chunk_size > 0 && size > talloc->max_chunk_size) {
+            size = need > talloc->max_chunk_size ? need : talloc->max_chunk_size;
+        }
+        ggml_backend_buffer_free(buf->chunks[n]);
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, size);
+        if (buf->chunks[n] == NULL && size > need) {
+            buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need);
+        }
+        if (buf->chunks[n] == NULL) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf->chunks[n], usage);
+    }
+    return true;
+}
+
 static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
     void * base = ggml_backend_buffer_get_base(buf->chunks[buf_addr.chunk]);
     void * addr = (char *)base + buf_addr.offset;
@@ -922,6 +949,33 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            // Grow only the chunks that are too small (ggml_vbuffer_grow) and keep the rest. A reserve
+            // recomputes the layout for the current graph only, so the exact-size path below shrinks every
+            // other chunk to this graph's sizes and frees and re-creates the whole buffer: prefill at a
+            // growing context (n_kv changes every ubatch) re-created the multi-GB compute buffer on almost
+            // every ubatch (GTT page clearing, ~300-800 ms each on Strix Halo).
+            // GGML_ALLOC_GROW_ONLY=0 restores the exact-size reallocation; GGML_ALLOC_TRACE=1 logs reallocs.
+            static int grow_only = -1;
+            static int alloc_trace = -1;
+            if (grow_only < 0) {
+                const char * e = getenv("GGML_ALLOC_GROW_ONLY");
+                grow_only = e == NULL || atoi(e) != 0;
+                const char * t = getenv("GGML_ALLOC_TRACE");
+                alloc_trace = t != NULL && atoi(t) != 0;
+            }
+            if (alloc_trace) {
+                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                fprintf(stderr, "ggml_gallocr: realloc %s %.1f -> %.1f MiB (%d chunks, grow_only %d)\n",
+                    ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1048576.0, new_size / 1048576.0,
+                    galloc->buf_tallocs[i]->n_chunks, grow_only);
+            }
+            if (grow_only && galloc->buffers[i] != NULL && !no_alloc) {
+                if (!ggml_vbuffer_grow(galloc->buffers[i], galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+                    GGML_LOG_ERROR("%s: failed to grow %s buffer to %zu bytes\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    return false;
+                }
+                continue;
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
