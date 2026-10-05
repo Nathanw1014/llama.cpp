@@ -437,8 +437,8 @@ static void qwen4exp_keep_until(ggml_tensor * node, ggml_tensor * t) {
 // instead of through a consumer-less view, which pinned it to the end of the graph.
 static bool qwen4exp_hc_keep_srcs() {
     static const bool on = [] {
-        const char * e = getenv("LLAMA_HC_KEEP_SRCS");
-        return e != nullptr && atoi(e) != 0;
+        const char * e = getenv("LLAMA_HC_KEEP_SRCS");   // default on (2026-10-05); =0 restores the keep-alive view
+        return e == nullptr || atoi(e) != 0;
     }();
     return on;
 }
@@ -476,8 +476,8 @@ bool llama_model_qwen4exp::hc_up_interleaved() const {
         return hc_up_il;
     }
     [this] {
-        const char * e = getenv("LLAMA_HC_UP_IL");
-        if (e == nullptr || atoi(e) == 0 || !qwen4exp_hc_fastpath(*this) || !qwen4exp_hc_mixop()) {
+        const char * e = getenv("LLAMA_HC_UP_IL");   // default on (2026-10-05); =0 keeps the stream-major rows
+        if ((e != nullptr && atoi(e) == 0) || !qwen4exp_hc_fastpath(*this) || !qwen4exp_hc_mixop()) {
             hc_up_il_tried = true;
             return;
         }
