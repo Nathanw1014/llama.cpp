@@ -310,26 +310,38 @@ void mm_compute_tile() {
 // as elements 0..15, lanes 16..31 a copy), so A never goes through shared memory and needs no barrier. B is staged
 // through shared memory as before. Aligned (prefetch) pipelines only; iq3_xxs for now.
 layout(constant_id = 15) const uint REG_A = 0;
-#if defined(MUL_MAT_ID) && defined(COOPMAT) && defined(BUF_MANUAL) && defined(A_PREFETCH) && LOAD_VEC_A == 8 && defined(DATA_A_IQ3_XXS)
+#if defined(MUL_MAT_ID) && defined(COOPMAT) && defined(BUF_MANUAL) && defined(A_PREFETCH) && LOAD_VEC_A == 8 && (defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ4_NL))
 #define MMID_REGA 1
-// x: grid bytes 0..3, y: grid bytes 4..7, z: sign/scale dword, w: d bits (the lane's row, sub-block ib32)
-uvec4 rega_fetch(const uint pos_a, const uint row_off) {
+struct rega_raw_t { uvec4 q; uint d; };
+#if defined(DATA_A_IQ3_XXS)
+#define REGA_BLK_K 256
+// q.x: grid bytes 0..3, q.y: grid bytes 4..7, q.z: sign/scale dword, q.w: d bits (the lane's row, sub-block ib32)
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
     const uint sb   = (pos_a / 32 + row_off) * 98;
     const uint ib32 = (pos_a / 4) % 8;
     const uint q    = (sb + 2 + 8 * ib32) / 2;
     const uint so   = (sb + 66 + 4 * ib32) / 2;
-    return uvec4(uint(data_a_u16[q])      | (uint(data_a_u16[q + 1]) << 16),
-                 uint(data_a_u16[q + 2])  | (uint(data_a_u16[q + 3]) << 16),
-                 uint(data_a_u16[so])     | (uint(data_a_u16[so + 1]) << 16),
-                 uint(data_a_u16[sb / 2]));
+    return rega_raw_t(uvec4(uint(data_a_u16[q])      | (uint(data_a_u16[q + 1]) << 16),
+                            uint(data_a_u16[q + 2])  | (uint(data_a_u16[q + 3]) << 16),
+                            uint(data_a_u16[so])     | (uint(data_a_u16[so + 1]) << 16),
+                            uint(data_a_u16[sb / 2])), 0u);
 }
-// k 16*h .. 16*h+15 of the sub-block into the A fragment
+#else
+#define REGA_BLK_K 32
+// q: the block's 16 nibble bytes (low nibbles k 0..15, high k 16..31), d: d bits
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
+    const uint base = (pos_a / 4 + row_off) * 18;
+    const bool odd  = ((base + 2) & 2) != 0;
+    return rega_raw_t(uvec4(unpack8b(fetch8(base + 2), odd), unpack8b(fetch8(base + 10), odd)), uint(data_a_u16[base / 2]));
+}
+#endif
 // k 16*h .. 16*h+15 of the sub-block into an A fragment
-void rega_build(const uvec4 raw, const uint h, inout coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a) {
-    const float db = unpackHalf2x16(raw.w).x * 0.5 * (0.5 + float(raw.z >> 28));
-    const uint g = h == 0 ? raw.x : raw.y;
+void rega_build(const rega_raw_t raw, const uint h, inout coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a) {
+#if defined(DATA_A_IQ3_XXS)
+    const float db = unpackHalf2x16(raw.q.w).x * 0.5 * (0.5 + float(raw.q.z >> 28));
+    const uint g = h == 0 ? raw.q.x : raw.q.y;
     [[unroll]] for (uint j = 0; j < 2; j++) {
-        const uint s7 = bitfieldExtract(raw.z, int(7 * (2 * h + j)), 7);
+        const uint s7 = bitfieldExtract(raw.q.z, int(7 * (2 * h + j)), 7);
         const uint s8 = s7 | ((bitCount(s7) & 1) << 7);
         const vec4 v0 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j)) & 0xFF]));
         const vec4 v1 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j + 8)) & 0xFF]));
@@ -342,10 +354,20 @@ void rega_build(const uvec4 raw, const uint h, inout coopmat<FLOAT_TYPE, gl_Scop
         a[8 * j + 4] = FLOAT_TYPE(a1.x); a[8 * j + 5] = FLOAT_TYPE(a1.y);
         a[8 * j + 6] = FLOAT_TYPE(a1.z); a[8 * j + 7] = FLOAT_TYPE(a1.w);
     }
+#else
+    const float d = unpackHalf2x16(raw.d).x;
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint nb = (raw.q[w] >> (4 * h)) & 0x0F0F0F0F;
+        a[4 * w + 0] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb & 0xFF]));
+        a[4 * w + 1] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 8) & 0xFF]));
+        a[4 * w + 2] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 16) & 0xFF]));
+        a[4 * w + 3] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb >> 24]));
+    }
+#endif
 }
 // cm_rows (WM / 16) A fragments per subgroup share every B fragment read from shared memory
 #define REGA_MAX_ROWS 2
-void rega_compute(const uvec4 raw[REGA_MAX_ROWS]) {
+void rega_compute(const rega_raw_t raw[REGA_MAX_ROWS]) {
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ar[REGA_MAX_ROWS];
     [[unroll]] for (uint h = 0; h < 2; h++) {
         [[unroll]] for (uint r = 0; r < cm_rows; r++) {
@@ -368,7 +390,7 @@ void rega_compute(const uvec4 raw[REGA_MAX_ROWS]) {
 // REG_A == 3 (two A fragments per subgroup): lanes 0..15 decode the first fragment's row, lanes 16..31 the
 // second's, and the halves are swapped with one xor-16 shuffle per packed pair (v_permlanex16 territory), so every
 // lane loads and dequantizes one row instead of two.
-void rega_compute_split(const uvec4 raw) {
+void rega_compute_split(const rega_raw_t raw) {
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ar[2];
     const bool lo = gl_SubgroupInvocationID < 16;
     [[unroll]] for (uint h = 0; h < 2; h++) {
@@ -691,14 +713,14 @@ void main() {
         if (REG_A == 3) {
             // WM == 32: lane half selects which of the subgroup's two 16-row blocks it loads
             const uint rl = warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
-            const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / 256) - ir * BM * (p.stride_a / 256);
-            uvec4 a1 = rega_fetch(pos_a, row_off1);
+            const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / REGA_BLK_K) - ir * BM * (p.stride_a / REGA_BLK_K);
+            rega_raw_t a1 = rega_fetch(pos_a, row_off1);
             for (uint block = start_k; block < end_k; block += BK) {
                 [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
                 const bool more = block + BK < end_k;
                 pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
                 pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
-                const uvec4 a1n = rega_fetch(pos_a, row_off1);
+                const rega_raw_t a1n = rega_fetch(pos_a, row_off1);
                 [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
                 barrier();
                 rega_compute_split(a1);
@@ -708,10 +730,10 @@ void main() {
         } else {
         // BN == WN: one subgroup owns WM = 16 * cm_rows rows and every column; see rega_fetch
         uint row_off[REGA_MAX_ROWS];
-        uvec4 a_cur[REGA_MAX_ROWS];
+        rega_raw_t a_cur[REGA_MAX_ROWS];
         [[unroll]] for (uint r = 0; r < cm_rows; r++) {
-            row_off[r] = min(ir * BM + warp_r * WM + r * TM + gl_SubgroupInvocationID % 16, p.M - 1) * (p.stride_a / 256)
-                       - ir * BM * (p.stride_a / 256);
+            row_off[r] = min(ir * BM + warp_r * WM + r * TM + gl_SubgroupInvocationID % 16, p.M - 1) * (p.stride_a / REGA_BLK_K)
+                       - ir * BM * (p.stride_a / REGA_BLK_K);
             a_cur[r] = rega_fetch(pos_a, row_off[r]);
         }
         for (uint block = start_k; block < end_k; block += BK) {
@@ -719,7 +741,7 @@ void main() {
             const bool more = block + BK < end_k;
             pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
             pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
-            uvec4 a_next[REGA_MAX_ROWS];
+            rega_raw_t a_next[REGA_MAX_ROWS];
             [[unroll]] for (uint r = 0; r < cm_rows; r++) { a_next[r] = rega_fetch(pos_a, row_off[r]); }
             [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
             barrier();

@@ -5589,7 +5589,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // fragment); =3: as 2, each half-wave decodes one fragment's rows and they swap halves (xor-16 shuffle)
         static const int mmid_rega = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : 0; }();
         auto mmid_m_aligned_spec = [&](ggml_type t, std::vector<uint32_t> w) {
-            if (!mmid_rega || t != GGML_TYPE_IQ3_XXS || mmid_req_sgs != 32 || w[1] != 128 || w[2] != 64) {
+            if (!mmid_rega || (t != GGML_TYPE_IQ3_XXS && t != GGML_TYPE_IQ4_NL) || mmid_req_sgs != 32 || w[1] != 128 || w[2] != 64) {
                 return ggml_vk_mul_mm_spec(w, true);
             }
             if (mmid_rega >= 2) {
