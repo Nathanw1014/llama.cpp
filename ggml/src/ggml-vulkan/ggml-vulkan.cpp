@@ -9291,7 +9291,21 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (ctx->device->coopmat_support) {
         vk_matmul_pipeline2 & p = (src1_type == GGML_TYPE_F16) ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
                                                               : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? p.f16acc : p.f32acc;
+        // The f16-B dense pipelines (GGML_VK_DENSE_F16B) are only instantiated for a subset of the quant
+        // types (Q4_0..Q6_K, IQ4_NL), yet with the conversion enabled this getter accepts src1 == F16 for
+        // every type. An f16 B operand also arrives from the graph itself once the f16 MoE / hc activation
+        // chains are on (n_tokens >= 32). For a type without f16-B kernels (IQ4_XS: the published
+        // Qwen3.8-Flash-Next IQ4_XS files) the struct is empty and the caller dereferenced a null
+        // pipeline in ggml_vk_guess_matmul_pipeline_align (SIGSEGV at ->align). Return nullptr instead so
+        // ggml_vk_mul_mat_q_f16 takes its dequant + f16 x f16 fallback, exactly what GGML_VK_DENSE_F16B=0 does.
+        if (p.f16acc->is_empty() && p.f32acc->is_empty()) {
+            return nullptr;
+        }
+        vk_matmul_pipeline pipe = (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? p.f16acc : p.f32acc;
+        if (pipe->is_empty()) {
+            pipe = p.f16acc->is_empty() ? p.f32acc : p.f16acc;   // only one accumulator variant was built
+        }
+        return pipe;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -9467,6 +9481,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     bool support_fp16acc = !mmp.f16acc->is_empty();
     bool support_fp32acc = !mmp.f32acc->is_empty();
 
+    if (!support_fp16acc && !support_fp32acc) {
+        // no f16-B mul_mat_id kernel for this type on this path (e.g. KHR coopmat disabled): let the
+        // caller fall back to dequant + f16 x f16 instead of aborting
+        return nullptr;
+    }
     if (support_fp16acc && (prefer_fp16acc || !support_fp32acc)) {
         return mmp.f16acc;
     } else {
