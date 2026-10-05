@@ -5585,13 +5585,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // GGML_VK_MMID_REGA=1 (probe, default off): register-direct A on the aligned medium iq3_xxs tile
         // (mul_mm.comp REG_A). Every wave32 subgroup owns 16 rows and all 64 columns, so WM = 16, WN = BN.
-        // =1: 256 threads, 16 rows per subgroup; =2: 128 threads, 32 rows per subgroup (two A fragments share each B fragment)
+        // =1: 256 threads, 16 rows per subgroup; =2: 128 threads, 32 rows per subgroup (two A fragments share each B
+        // fragment); =3: as 2, each half-wave decodes one fragment's rows and they swap halves (xor-16 shuffle)
         static const int mmid_rega = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : 0; }();
         auto mmid_m_aligned_spec = [&](ggml_type t, std::vector<uint32_t> w) {
             if (!mmid_rega || t != GGML_TYPE_IQ3_XXS || mmid_req_sgs != 32 || w[1] != 128 || w[2] != 64) {
                 return ggml_vk_mul_mm_spec(w, true);
             }
-            if (mmid_rega == 2) {
+            if (mmid_rega >= 2) {
                 w[0] = 128; // BLOCK_SIZE: 4 subgroups
                 w[4] = 32;  // WM
             } else {
@@ -5607,7 +5608,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (spec.size() == 14) {
                 spec.push_back(0);                                          // constantID=14
             }
-            spec.push_back(1);                                              // constantID=15: REG_A
+            spec.push_back(mmid_rega == 3 ? 3u : 1u);                      // constantID=15: REG_A (3 = lane-split, WM 32)
             return spec;
         };
         // Same expansion as CREATE_MM above, plus a trailing required subgroup

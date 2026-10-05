@@ -23,6 +23,9 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #endif
+#if defined(COOPMAT) && defined(MUL_MAT_ID)
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 #ifdef MUL_MAT_ID
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
@@ -362,6 +365,36 @@ void rega_compute(const uvec4 raw[REGA_MAX_ROWS]) {
         }
     }
 }
+// REG_A == 3 (two A fragments per subgroup): lanes 0..15 decode the first fragment's row, lanes 16..31 the
+// second's, and the halves are swapped with one xor-16 shuffle per packed pair (v_permlanex16 territory), so every
+// lane loads and dequantizes one row instead of two.
+void rega_compute_split(const uvec4 raw) {
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ar[2];
+    const bool lo = gl_SubgroupInvocationID < 16;
+    [[unroll]] for (uint h = 0; h < 2; h++) {
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> mine;
+        rega_build(raw, h, mine);
+        [[unroll]] for (uint e = 0; e < 8; e++) {
+            const uint pm = packFloat2x16(f16vec2(mine[2 * e], mine[2 * e + 1]));
+            const uint po = subgroupShuffleXor(pm, 16);
+            const f16vec2 v0 = unpackFloat2x16(lo ? pm : po);
+            const f16vec2 v1 = unpackFloat2x16(lo ? po : pm);
+            ar[0][2 * e] = v0.x; ar[0][2 * e + 1] = v0.y;
+            ar[1][2 * e] = v1.x; ar[1][2 * e + 1] = v1.y;
+        }
+        const uint frag_lane = gl_SubgroupInvocationID % 16;
+        [[unroll]] for (uint cm_col = 0; cm_col < cm_cols; cm_col++) {
+            const uint base = (cm_warp_c * WN + cm_col * TN + frag_lane) * SHMEM_STRIDE + 8 * h;
+            [[unroll]] for (uint e = 0; e < 8; e++) {
+                const FLOAT_TYPEV2 v = FROM_BUF(buf_b[base + e]);
+                cm_b[2 * e]     = v.x;
+                cm_b[2 * e + 1] = v.y;
+            }
+            cm_sums[cm_col * cm_rows]     = coopMatMulAdd(ar[0], cm_b, cm_sums[cm_col * cm_rows]);
+            cm_sums[cm_col * cm_rows + 1] = coopMatMulAdd(ar[1], cm_b, cm_sums[cm_col * cm_rows + 1]);
+        }
+    }
+}
 #endif
 
 #if defined(ABL_NO_DEQUANT)
@@ -655,6 +688,24 @@ void main() {
 #endif
 #if defined(MMID_REGA)
     if (REG_A != 0 && prefetch) {
+        if (REG_A == 3) {
+            // WM == 32: lane half selects which of the subgroup's two 16-row blocks it loads
+            const uint rl = warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
+            const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / 256) - ir * BM * (p.stride_a / 256);
+            uvec4 a1 = rega_fetch(pos_a, row_off1);
+            for (uint block = start_k; block < end_k; block += BK) {
+                [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
+                const bool more = block + BK < end_k;
+                pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
+                pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
+                const uvec4 a1n = rega_fetch(pos_a, row_off1);
+                [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
+                barrier();
+                rega_compute_split(a1);
+                barrier();
+                a1 = a1n;
+            }
+        } else {
         // BN == WN: one subgroup owns WM = 16 * cm_rows rows and every column; see rega_fetch
         uint row_off[REGA_MAX_ROWS];
         uvec4 a_cur[REGA_MAX_ROWS];
@@ -675,6 +726,7 @@ void main() {
             rega_compute(a_cur);
             barrier();
             a_cur = a_next;
+        }
         }
     } else
 #endif
