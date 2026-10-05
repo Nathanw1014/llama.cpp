@@ -5583,6 +5583,33 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const auto &m_mmq_wg_denoms = m_mmq_wg_denoms_id128;
         const auto &l_warptile_mmq = l_warptile_mmq_idw;
 
+        // GGML_VK_MMID_REGA=1 (probe, default off): register-direct A on the aligned medium iq3_xxs tile
+        // (mul_mm.comp REG_A). Every wave32 subgroup owns 16 rows and all 64 columns, so WM = 16, WN = BN.
+        // =1: 256 threads, 16 rows per subgroup; =2: 128 threads, 32 rows per subgroup (two A fragments share each B fragment)
+        static const int mmid_rega = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : 0; }();
+        auto mmid_m_aligned_spec = [&](ggml_type t, std::vector<uint32_t> w) {
+            if (!mmid_rega || t != GGML_TYPE_IQ3_XXS || mmid_req_sgs != 32 || w[1] != 128 || w[2] != 64) {
+                return ggml_vk_mul_mm_spec(w, true);
+            }
+            if (mmid_rega == 2) {
+                w[0] = 128; // BLOCK_SIZE: 4 subgroups
+                w[4] = 32;  // WM
+            } else {
+                w[4] = 16;  // WM
+            }
+            w[5] = 64;  // WN
+            GGML_ASSERT(w[0] / w[10] == (w[1] / w[4]) * (w[2] / w[5]));
+            std::vector<uint32_t> spec = ggml_vk_mul_mm_spec(w, true);
+            if (spec.size() == 12) {
+                spec.push_back(ggml_vk_coopmat_shmem_pad(device, w[3]));  // constantID=12
+                spec.push_back(0);                                          // constantID=13
+            }
+            if (spec.size() == 14) {
+                spec.push_back(0);                                          // constantID=14
+            }
+            spec.push_back(1);                                              // constantID=15: REG_A
+            return spec;
+        };
         // Same expansion as CREATE_MM above, plus a trailing required subgroup
         // size (0 = driver default) for the GGML_VK_MMID_WAVE32 probe. Scoped to
         // the mmid quant pipelines below; dense pipelines are untouched.
@@ -5597,7 +5624,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->mul_mat ## ID ## _l[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, mmid_m_aligned_spec(TYPE, m_ ## WARPTILE), m_align, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
 

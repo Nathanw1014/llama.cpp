@@ -10318,6 +10318,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    // medium aligned MUL_MAT_ID tile (~64 rows per expert): the shape that takes the register-direct A probe
+    // (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile
+    for (int64_t m : {256, 320}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, false, m, 256, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, true,  m, 256, 512));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 10, false, 64, 17, 64));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 10, false, 64, 17, 256, 2));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
@@ -11711,6 +11717,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 10, false, 2560, n,  640));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, false, 2560, n,  640));
+    }
+    // the same expert GEMM as a batched dense MUL_MAT (320 weight matrices, n tokens each, no gather): the
+    // ceiling the MUL_MAT_ID kernel could reach at that per-expert token count (fn-sweep 2026-10-05)
+    for (int64_t n : {64, 256}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  640, n, 2560, {320, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 640, n, 2560, {320, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,    GGML_TYPE_F32,  640, n, 2560, {320, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  640, n * 320, 2560, {1, 1}, {1, 1}));
+    }
+    // FN REAP-320 expert GEMMs vs tokens per ubatch (fn-sweep 2026-10-05): does MMID efficiency scale with ub?
+    for (int64_t n : {512, 2048, 4096, 8192}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS,  GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,    GGML_TYPE_F32, 320, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,     GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
     }
     // quant-KV probes at the two model geometries. The quant path takes the dequant-once
     // scratch and stages V through shared memory, so it is not represented by the f16 probes.
