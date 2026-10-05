@@ -15247,6 +15247,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    // (local test, #29591 adapted) flash attention may write prealloc_y (mask opt bits, compaction scratch): drop the cached matmul B
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
 
     // Dequant+transpose quant K/V directly into a per-head-contiguous [HS, KV, n_head_kv, ns] f16
     // scratch (dequant_*_transpose shader) so the f16 FA reads KV coalesced. One pass, no temp.
@@ -18584,6 +18587,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
+
+        // the partial results overwrite a matmul input converted into prealloc_y
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
 
