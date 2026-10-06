@@ -22252,6 +22252,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
+            // GGML_VK_SUBMIT_TRACE_MS=<ms>: log every serialized submission whose fence wait (~its GPU time,
+            // the previous one has already drained) exceeds <ms>, to find submissions near the driver timeout
+            static const double trace_ms = getenv("GGML_VK_SUBMIT_TRACE_MS") ? atof(getenv("GGML_VK_SUBMIT_TRACE_MS")) : -1.0;
+            const auto t_wait = std::chrono::steady_clock::now();
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
@@ -22264,6 +22268,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         ctx->device->name.c_str(), start, end);
                 ggml_vk_print_node_list(cgraph, start, end);
                 throw;
+            }
+            if (trace_ms >= 0.0) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_wait).count();
+                if (ms > trace_ms) {
+                    fprintf(stderr, "ggml_vulkan: submit %.1f ms nodes %d..%d (%.1f GFLOP, %.2f GiB):\n", ms, start, end,
+                            batch_flops / 1e9, batch_bytes / 1073741824.0);
+                    for (int j = start; j <= end && j < cgraph->n_nodes; j++) {
+                        const ggml_tensor * t = cgraph->nodes[j];
+                        fprintf(stderr, "    %s %s [%lld,%lld,%lld,%lld]\n", ggml_op_name(t->op), t->name,
+                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                    }
+                }
             }
             ctx->device->device.resetFences({ ctx->fence });
             ctx->submit_pending = false;
