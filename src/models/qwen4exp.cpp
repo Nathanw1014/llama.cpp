@@ -476,8 +476,10 @@ bool llama_model_qwen4exp::hc_up_interleaved() const {
         return hc_up_il;
     }
     [this] {
-        const char * e = getenv("LLAMA_HC_UP_IL");   // default on (2026-10-05); =0 keeps the stream-major rows
-        if ((e != nullptr && atoi(e) == 0) || !qwen4exp_hc_fastpath(*this) || !qwen4exp_hc_mixop()) {
+        // default OFF again (2026-10-06): with the HC_UP_MIX epilogue the cached multi-turn path and a full re-prefill
+        // diverged beyond the release gate's tie threshold (FN REAP-320, Mesa 26.2.4 and mesa-main, deterministic); =1 enables
+        const char * e = getenv("LLAMA_HC_UP_IL");
+        if (e == nullptr || atoi(e) == 0 || !qwen4exp_hc_fastpath(*this) || !qwen4exp_hc_mixop()) {
             hc_up_il_tried = true;
             return;
         }
