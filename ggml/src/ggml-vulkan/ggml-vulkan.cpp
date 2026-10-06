@@ -18188,8 +18188,12 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         // gather scratch is n_kv * n_tps floats and n_kv grows with every prefill ubatch, so sizing
         // it exactly drained the GPU once per ubatch at depth (micro-qwen4exp at 32k: -11.6% e2e
         // with the fusion on). Grow in 256 MiB steps instead.
-        const size_t step = size_t{ 256 } << 20;
-        ctx->prealloc_size_x = ((scratch_need + step - 1) / step) * step;
+        // The step must not round past the single-buffer limit: a gather just under it was rounded to
+        // exactly 4 GiB and the allocation threw (ub 2048 at 512k).
+        const size_t step  = size_t{ 256 } << 20;
+        const size_t limit = std::max(scratch_need, (size_t) std::min<uint64_t>(
+                ctx->device->properties.limits.maxStorageBufferRange, ctx->device->max_buffer_size));
+        ctx->prealloc_size_x = std::min(((scratch_need + step - 1) / step) * step, limit);
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
     if (ctx->prealloc_x_need_sync) {
@@ -21548,6 +21552,22 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
         top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
         n_blocks <= 0 || n_kv <= 0 || width <= 0 || width > n_kv) {
         return false;
+    }
+
+    // rows too long for the register variant gather the masked scores into prealloc_x (4 B per cell and row).
+    // Past the single-buffer limit that allocation throws ErrorOutOfDeviceMemory (ub 2048 at 512k), so leave
+    // them to the unfused chain, whose oversized tensors the scheduler places elsewhere.
+    {
+        const uint32_t bs  = ctx->device->pipeline_topk_radix_qsa->wg_denoms[0];
+        const uint64_t npt = (uint64_t(n_kv) + bs - 1) / bs;
+        const bool reg = npt <= 64 && ctx->device->pipeline_topk_radix_qsa_reg[3] &&
+            !(getenv("GGML_VK_TOPK_QSA_REG") && atoi(getenv("GGML_VK_TOPK_QSA_REG")) == 0);
+        const uint64_t gather = uint64_t(n_kv) * n_tps * n_stream * sizeof(float);
+        const uint64_t limit  = std::min<uint64_t>(ctx->device->properties.limits.maxStorageBufferRange,
+                                                   ctx->device->max_buffer_size);
+        if (!reg && gather > limit) {
+            return false;
+        }
     }
 
     // only worth it in the radix regime; small k uses the faster tournament unfused
