@@ -74,6 +74,8 @@ shared float   scale_sh[ROWS];
 shared float   lsh[ROWS];
 
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+const float MASK_DEAD = -65504.0;
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 void main() {
@@ -196,6 +198,19 @@ void main() {
         }
         barrier();
 
+        // a key hidden from every token of the group (msh is -inf past T and N) gets a zero V row: its P
+        // is 0, but 0 * NaN is not. The S phase below reads only the K rows; the S barrier orders this.
+        [[unroll]] for (uint idx = tid; idx < BC * HS4; idx += 256) {
+            const uint key = idx / HS4;
+            bool alive = false;
+            [[unroll]] for (uint t = 0; t < 16; ++t) {
+                alive = alive || msh[t * BC + key] > MASK_DEAD;
+            }
+            if (!alive) {
+                kvsh[(BC + key) * KSTR + idx % HS4] = f16vec4(0);
+            }
+        }
+
         if (j + 1 < n_tiles) {
             PREFETCH(j + 1);
         }
@@ -232,7 +247,9 @@ void main() {
                 [[unroll]] for (uint s2 = 0; s2 < NSG; ++s2) {
                     acc += spart[(s2 * RF + rf) * 256 + key * 16 + r16];
                 }
-                s[c] = acc + msh[t * BC + key];
+                // a masked key scores -inf outright, so non-finite K data cannot turn it into NaN
+                const float m = msh[t * BC + key];
+                s[c] = m <= MASK_DEAD ? uintBitsToFloat(0xFF800000u) : acc + m;
             }
             float mx = max(max(s[0], s[1]), max(s[2], s[3]));
             mx = subgroupClusteredMax(mx, 4);

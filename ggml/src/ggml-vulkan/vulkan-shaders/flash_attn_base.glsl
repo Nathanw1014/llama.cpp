@@ -52,6 +52,10 @@ const bool SLOTTED          = (Flags & 256) != 0;
 // gathered the same way, so causality and invalid entries fall out of the mask. Work per token
 // is n_top_k rows, the per-query selection itself: 11% / 6% of dense at 16k / 32k on Flash-Next.
 const bool GATHER_KV        = (Flags & 512) != 0;
+// Masked keys contribute nothing even where their K/V rows hold NaN/inf (P is 0, but 0 * NaN is not):
+// set for selected-key (src[5]) attention, whose selections can name any cell. V rows of keys hidden
+// from every row of the tile are staged as zero, which costs the cm1 / multi-row paths a branch.
+const bool NAN_SAFE_V       = (Flags & 2048) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -112,6 +116,8 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+#define FA_MASK_DEAD (-65504.0)
 #define MASK_OPT_ALL_ZERO 2
 
 #define BINDING_IDX_K 0

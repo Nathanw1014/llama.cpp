@@ -47,6 +47,10 @@ layout(push_constant) uniform Parameters {
 
 const uint LANES = 64;
 
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+const float MASK_DEAD = -65504.0;
+shared uint row_alive;
+
 void main() {
     const uint row  = gl_WorkGroupID.x;
     const uint head = gl_WorkGroupID.y;
@@ -64,6 +68,25 @@ void main() {
         src = row;
     } else if (row - p.n_kv_raw < n_uni) {
         src = p.n_kv_raw + data_u[row - p.n_kv_raw];
+    }
+
+    // A row hidden from every token is gathered as an invalid one (zero row, -inf mask): its P is 0 in
+    // every softmax, but its K/V data may not be finite (0 * NaN), so it must not be copied.
+    if (tid == 0) {
+        row_alive = 0;
+    }
+    barrier();
+    if (src < p.n_kv) {
+        for (uint t = tid; t < p.n_batch; t += LANES) {
+            if (float(data_m[t * p.nbm1 + src]) > MASK_DEAD) {
+                row_alive = 1;
+                break;
+            }
+        }
+    }
+    barrier();
+    if (row_alive == 0) {
+        src = p.n_kv;
     }
 
     // Zeroing an unused row writes zero BYTES, which decode to zero for every block-quantised

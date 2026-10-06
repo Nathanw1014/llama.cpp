@@ -4360,7 +4360,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
                                                   bool use_dynamic_kv = false, bool use_vt = false, bool o_in_regs = false, bool slotted = false, bool gather_kv = false,
-                                                  bool use_mr = false) {
+                                                  bool use_mr = false, bool nan_safe_v = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4373,7 +4373,8 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (o_in_regs         ? 64 : 0) |
                      (slotted           ? 256 : 0) |
                      (gather_kv         ? 512 : 0) |
-                     (use_mr            ? 1024 : 0);
+                     (use_mr            ? 1024 : 0) |
+                     (nan_safe_v        ? 2048 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -12909,7 +12910,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    // alive_stamp[Bc] + dead_blk (hidden-key tracking; only NAN_SAFE_V pipelines use it, counted for all)
+    const uint32_t live = (Bc + 1) * sizeof(uint32_t);
+
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + live;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
@@ -13241,8 +13245,10 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
         const uint32_t q_stride = (uint32_t) (q->nb[1] / sizeof(float));
         const bool aligned = raw_kv % tuning.block_cols == 0 && (q_stride & 7) == 0 && (k_stride & 7) == 0;
+        // selected-key attention: masked keys must not leak NaN/inf from their K/V rows (see NAN_SAFE_V)
         const vk_fa_pipeline_state raw_state = get_fa_pipeline_state(ctx->device, tuning, D, D, aligned, f32acc,
-                                                                     true, false, false, GGML_TYPE_F16, GGML_TYPE_F16);
+                                                                     true, false, false, GGML_TYPE_F16, GGML_TYPE_F16,
+                                                                     false, false, false, false, false, false, true);
         if (raw_state.path == FA_COOPMAT1 && ctx->device->pipeline_flash_attn_split_k_reduce) {
             vk_pipeline raw_pipeline;
             {
@@ -14827,10 +14833,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                     CEIL_DIV((uint32_t)neq1, 64 / mr_h), workgroups_y, workgroups_z);
         }
     }
+    // Selected-key attention (src[5]) may name any cell, so masked keys must not leak NaN/inf from their K/V
+    // rows (NAN_SAFE_V); dense attention relies on the KV cache zeroing freed cells. GGML_VK_FA_NAN_SAFE=1
+    // hardens every masked FA (e.g. a unified multi-sequence cache, whose masked cells belong to live sequences).
+    static const bool fa_nan_safe_all = [] { const char * e = getenv("GGML_VK_FA_NAN_SAFE"); return e && atoi(e) != 0; }();
+    const bool nan_safe_v = mask != nullptr && (dst->src[5] != nullptr || fa_nan_safe_all);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
                                                                    fa_compact.dynamic_kv, use_vt, o_in_regs && !use_mr, fa_compact.slotted, gather_kv,
-                                                                   use_mr);
+                                                                   use_mr, nan_safe_v);
     // Multi-row FA schedule knobs, each default on (=0 disables), Qwen3.8-27B pp2048 @ d32768, FA op time:
     //   GGML_VK_FA_MR_LAZY:  skip the O rescale of row blocks whose running max did not move   1171 -> 1095 ms
     //   GGML_VK_FA_MR_NOEB:  drop the loop-end barrier (no LDS hazard needs it)                 1099 -> 1008 ms

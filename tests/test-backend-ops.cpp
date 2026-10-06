@@ -11140,6 +11140,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill(128,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(128,512,17,true,true));
     test_cases.emplace_back(new test_qsa_prefill(129,4096,257,true,true));
+    // poisoned masked keys on the deep-cache and GQA 4 paths (Vulkan: compact decode gather at 2051 picks,
+    // per-token / union / multi-token prefill gathers, multi-row FA with two heads per workgroup)
+    for (int q : {1,4,16}) test_cases.emplace_back(new test_qsa_decode(q,40064,2051,true));
+    test_cases.emplace_back(new test_qsa_prefill(128,40064,2051,true,true));
+    test_cases.emplace_back(new test_qsa_prefill(128,512,17,true,true,1,4));
+    test_cases.emplace_back(new test_qsa_prefill(128,512,17,false,true));
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));

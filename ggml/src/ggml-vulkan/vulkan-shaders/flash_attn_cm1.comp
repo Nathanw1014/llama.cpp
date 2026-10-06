@@ -71,6 +71,11 @@ shared ACC_TYPE slope[Br];
 // K chunk / V tile / mask column (the index reload was 250 of the 320 buffer loads per block)
 shared uint32_t grow_sh[Bc];
 
+// NAN_SAFE_V: alive_stamp[c] == j + 1 when key c of block j is visible to some row of the tile, and
+// dead_blk == j + 1 when block j has a key hidden from every row. Stamps, so nothing is reset per block.
+shared uint32_t alive_stamp[Bc];
+shared uint32_t dead_blk;
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -108,6 +113,12 @@ void main() {
             i * Br + r < N) {
             Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row(i * Br + r) / 4 + d] * p.scale);
         }
+    }
+    if (NAN_SAFE_V && tid < Bc) {
+        alive_stamp[tid] = 0;
+    }
+    if (NAN_SAFE_V && tid == 0) {
+        dead_blk = 0;
     }
     barrier();
 
@@ -168,6 +179,7 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        bool dead_rows = false;
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -176,7 +188,13 @@ void main() {
         if (GATHER_KV) {
             barrier();   // the previous block's V staging may still read grow_sh
             if (tid < Bc) {
-                grow_sh[tid] = gather_row(j * Bc + tid);
+                uint32_t gr = gather_row(j * Bc + tid);
+                // a masked selection is dropped like an invalid entry: its K/V rows stay zero, so non-finite
+                // data in a masked cell reaches neither the softmax nor P x V
+                if (MASK_ENABLE && gr != 0xFFFFFFFFu && float(data_m[m_offset + gr]) <= FA_MASK_DEAD) {
+                    gr = 0xFFFFFFFFu;
+                }
+                grow_sh[tid] = gr;
             }
             barrier();
         }
@@ -237,6 +255,16 @@ void main() {
                                 m = f16vec4(0.0);
                             }
                             mask_cache[idx / WorkGroupSize] = m;
+                            // key c is alive when some real row of the tile sees it (rows past N are padding)
+                            if (NAN_SAFE_V && !GATHER_KV) {
+                                bool alive = false;
+                                [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                    alive = alive || (i * Br + r * 4 + k < N && float(m[k]) > FA_MASK_DEAD);
+                                }
+                                if (alive) {
+                                    alive_stamp[c] = j + 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -252,6 +280,11 @@ void main() {
                 }
                 if (max_mask <= NEG_FLT_MAX_OVER_2) {
                     continue;
+                }
+                // the stamps are ordered by the barriers above; dead_blk is read after the S barrier below
+                if (NAN_SAFE_V && !GATHER_KV && tid < Bc && (!KV_bounds_check || j * Bc + tid < KV) &&
+                    alive_stamp[tid] != j + 1) {
+                    dead_blk = j + 1;
                 }
             }
         }
@@ -361,6 +394,7 @@ void main() {
         uint coord = gl_SubgroupID * MatBc * sfshstride;
         coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
+        dead_rows = NAN_SAFE_V && !GATHER_KV && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO && dead_blk == j + 1;
 
         if (LOGIT_SOFTCAP) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
@@ -382,7 +416,9 @@ void main() {
                         // Mask nem1 bounds check is handled when loading masks
                         ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
-                        sfsh[c * sfshstride + r] += slopes * masks;
+                        // a masked key scores -inf outright, so non-finite K data cannot turn it into NaN
+                        sfsh[c * sfshstride + r] = mix(sfsh[c * sfshstride + r] + slopes * masks,
+                            ACC_TYPEV4(uintBitsToFloat(0xFF800000)), lessThanEqual(vec4(masks), vec4(FA_MASK_DEAD)));
                     }
                 }
             }
@@ -460,7 +496,9 @@ void main() {
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                    // keys hidden from every row stay zero: P is 0 there, but 0 * NaN is not
+                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4) &&
+                        !(dead_rows && alive_stamp[c] != j + 1)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -507,7 +545,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check || GATHER_KV;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || GATHER_KV || dead_rows;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -522,13 +560,19 @@ void main() {
                     const uint iqs = coord % BLOCK_SIZE_V;
 
                     const bool v_ok = GATHER_KV ? (v_row != 0xFFFFFFFFu && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV));
-                    if (v_ok) {
+                    if (v_ok && !(dead_rows && alive_stamp[row] != j + 1)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else
 #endif
-                        {
+                        if (V_TRANSPOSED) {
+                            // V^T scratch [HSV][v_stride]: the four dims of this kv row are v_stride apart
+                            kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(data_v[v_offset + (v_col    ) * v_stride + v_row],
+                                                                        data_v[v_offset + (v_col + 1) * v_stride + v_row],
+                                                                        data_v[v_offset + (v_col + 2) * v_stride + v_row],
+                                                                        data_v[v_offset + (v_col + 3) * v_stride + v_row]);
+                        } else {
                             kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
                         }
                     } else {
@@ -550,7 +594,7 @@ void main() {
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV) {   // GATHER_KV: V rows were staged by index; never read them directly
+                    if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV && !dead_rows) {   // GATHER_KV / dead_rows: V rows were staged; never read them directly
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         if (V_TRANSPOSED) {

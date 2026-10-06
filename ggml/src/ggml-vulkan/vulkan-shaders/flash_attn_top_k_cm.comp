@@ -102,8 +102,11 @@ void main() {
                     key = p.n_kv_raw + uint(compressed);
                 }
             }
-            key_idx[tid] = key;
-            key_mask[tid] = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
+            const float mask = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
+            // a masked key is dropped like an invalid one: its K/V tiles stage as zero, since its weight is 0
+            // but 0 * NaN in P x V is not
+            key_idx[tid] = mask < MASK_NEG_INF ? p.n_kv : key;
+            key_mask[tid] = mask;
         }
         barrier();
 
