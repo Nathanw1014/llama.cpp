@@ -1310,30 +1310,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-
-    // the heads sit side by side on ne[1] and there are only a few of them
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
-    }
-
-    score = summed;
-    cb(score, "indexer_score", il);
-
-    // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
-        score = ggml_add(ctx0, score, inp->bias);
-    }
-
+    // the maskless selection scores whole blocks: n_blocks x rows, a quarter of the masked chain, so it stays untiled
     if (inp->maskless) {
+        // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+        // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+        ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+
+        // the heads sit side by side on ne[1] and there are only a few of them
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+        cb(score, "indexer_score", il);
+
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        if (blk_bias) {
+            score = ggml_add(ctx0, score, inp->bias);
+        }
+
         ggml_tensor * tail = ggml_reshape_4d(ctx0, inp->tail_idxs, r-1, n_tps, 1, n_stream);
         ggml_tensor * top_k = qwen4exp_select_complete_blocks(ctx0, score, inp->blk_cells, tail,
                 (int64_t) hparams.indexer_top_k/r, r);
@@ -1341,25 +1342,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return top_k;
     }
 
-    // give every token of a block the block score; the budget is a whole number of
-    // blocks, so the top-k cut still lands on a block boundary
-    ggml_tensor * expanded = ggml_get_rows(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-
-    if (blk_bias) {
-        // flash attention keeps the mask in f16; the scores are f32
-        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-        expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
-    } else {
-        expanded = ggml_add(ctx0, expanded, inp->bias);
-    }
-    cb(expanded, "indexer_score_tokens", il);
-
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
+
+    // score, expand, mask and select for query rows [t0, t0 + nt) of every stream
+    auto select_rows = [&](int64_t t0, int64_t nt) {
+        const bool all = t0 == 0 && nt == n_tps;
+        ggml_tensor * qr = all ? q3 : ggml_view_3d(ctx0, q3, idx_dim, n_idx_h*nt, n_stream,
+                q3->nb[1], q3->nb[2], t0*n_idx_h*q3->nb[1]);
+        ggml_tensor * bias = all ? inp->bias : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], nt, n_stream,
+                inp->bias->nb[1], inp->bias->nb[2], t0*inp->bias->nb[1]);
+        ggml_tensor * mask_rows = !blk_bias || all ? kq_mask : ggml_view_4d(ctx0, kq_mask, n_kv, nt, 1, n_stream,
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t0*kq_mask->nb[1]);
+        if (!all) {
+            // put the row views in the graph ahead of the chain: Vulkan fuses the scorer (QSA_SCORE) and the
+            // selection (TOPK_QSA) by matching the exact node order of the untiled chain, and a view visited in
+            // the middle of either breaks the match (-12% pp at 32k with two tiles, measured 2026-10-04)
+            ggml_build_forward_expand(gf, bias);
+            if (blk_bias) {
+                ggml_build_forward_expand(gf, mask_rows);
+            }
+        }
+
+        // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+        // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+        ggml_tensor * score = ggml_mul_mat(ctx0, pooled, qr);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, nt, n_stream);
+        score = ggml_relu(ctx0, score);
+
+        // the heads sit side by side on ne[1] and there are only a few of them
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, nt, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+        cb(score, "indexer_score", il);
+
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        if (blk_bias) {
+            score = ggml_add(ctx0, score, bias);
+        }
+
+        // give every token of a block the block score; the budget is a whole number of
+        // blocks, so the top-k cut still lands on a block boundary
+        ggml_tensor * expanded = ggml_get_rows(ctx0,
+                ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
+
+        if (blk_bias) {
+            // flash attention keeps the mask in f16; the scores are f32
+            ggml_tensor * mask = mask_rows->type == GGML_TYPE_F32 && all ? mask_rows : ggml_cast(ctx0, mask_rows, GGML_TYPE_F32);
+            expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, nt, n_stream));
+        } else {
+            expanded = ggml_add(ctx0, expanded, bias);
+        }
+        cb(expanded, "indexer_score_tokens", il);
+
+        return ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    };
+
+    // Every query row selects on its own, so a large ubatch is scored in row tiles: the f32 tensors
+    // above are n_kv x rows (4 B per cell and query, six of them), which passes the 4 GiB single
+    // buffer limit of RADV at ub x n_kv = 2^30 (ub 8192 at 128k) and sets the compute-buffer peak.
+    // Tiles keep each one under LLAMA_QSA_IDX_TILE_MB (default 1024, 0 = off), split evenly: a short tail tile
+    // costs a whole pass of the chain (ub 2048 at 32k as 1927 + 121 rows was -4.4% pp). The selection is the same.
+    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 1024; }();
+    int64_t tile = n_tps;
+    if (tile_mb > 0 && n_stream == 1) {
+        const int64_t max_rows = std::max<int64_t>(256, (tile_mb << 20) / (4*n_kv));
+        const int64_t n_tiles  = (n_tps + max_rows - 1)/max_rows;
+        tile = (n_tps + n_tiles - 1)/n_tiles;
+    }
+
+    ggml_tensor * top_k = nullptr;
+    if (tile >= n_tps) {
+        top_k = select_rows(0, n_tps);
+    } else {
+        std::vector<ggml_tensor *> parts;
+        for (int64_t t0 = 0; t0 < n_tps; t0 += tile) {
+            parts.push_back(select_rows(t0, std::min(tile, n_tps - t0)));
+        }
+        // pairwise, so each row is copied log2(tiles) times rather than once per later tile
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts.swap(next);
+        }
+        top_k = parts[0];
+    }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
