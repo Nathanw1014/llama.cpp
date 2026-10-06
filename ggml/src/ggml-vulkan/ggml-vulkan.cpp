@@ -4989,6 +4989,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             if (!pipeline->compile_pending) {
                 pipeline->compile_pending = true;
+                pipeline->name = name;  // the first walk ran before the layout probe (see cm1_name)
                 claimed_task.pipeline = pipeline;
                 claimed_task.spv_size = spv_size;
                 claimed_task.spv_data = spv_data;
@@ -5406,22 +5407,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return warp;
         };
 
+        // The default cm1 matmuls build their A/B fragments by hand in the RDNA3 layout (mul_mm.comp BUF_MANUAL), which
+        // the KHR spec does not guarantee; a device that fails ggml_vk_check_coopmat_rdna3_layout gets the coopMatLoad
+        // "_cml" build instead. The probe runs between the first walk and any compile, and a pipeline takes the name
+        // and SPIR-V of the walk that compiles it, so both follow the probe result.
+        auto cm1_name = [&device](const char * name) { return std::string(name) + (device->coopmat_rdna3_layout ? "" : "_cml"); };
+#define CM1_SPV(N) (device->coopmat_rdna3_layout ? N ## _cm1_len : N ## _cm1_cml_len), (device->coopmat_rdna3_layout ? N ## _cm1_data : N ## _cm1_cml_data)
+
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, dense_req_sgs(l_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, cm1_name(#NAMELC #F16ACC "_l"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, dense_req_sgs(l_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, dense_req_sgs(m_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, cm1_name(#NAMELC #F16ACC "_m"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, dense_req_sgs(m_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, dense_req_sgs(s_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, cm1_name(#NAMELC #F16ACC "_s"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, dense_req_sgs(s_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(l_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, cm1_name(#NAMELC #F16ACC "_aligned_l"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(l_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, dense_req_sgs(m_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, cm1_name(#NAMELC #F16ACC "_aligned_m"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, dense_req_sgs(m_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, cm1_name(#NAMELC #F16ACC "_aligned_s"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
         if (xl_ok(TYPE, xl_ ## WARPTILE)) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_xl, #NAMELC #F16ACC "_aligned_xl", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), xl_ ## WG_DENOMS, ggml_vk_mul_mm_spec(xl_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(xl_ ## WARPTILE));   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_xl, cm1_name(#NAMELC #F16ACC "_aligned_xl"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), xl_ ## WG_DENOMS, ggml_vk_mul_mm_spec(xl_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(xl_ ## WARPTILE));   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -5599,7 +5607,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // fragment); =3 (default on AMD): as 2, each half-wave decodes one fragment's rows and they swap halves
         // (xor-16 shuffle); =0 off. Same gfx11 fragment layout as the BUF_MANUAL loads. FN REAP-320 pp2048 ub2048:
         // stock Mesa 25.2.8 843 -> 968 t/s d0, 686 -> 784 d8192; mesa-main 1109 -> 1145 / 883 -> 910 (2026-10-05).
+        // Off without the manual-fragment build (layout probe failed: "_cml" pipelines); the env cannot override that.
         const int mmid_rega = [&device] {
+            if (!device->coopmat_rdna3_layout) {
+                return 0;
+            }
             const char * e = getenv("GGML_VK_MMID_REGA");
             return e ? atoi(e) : (device->vendor_id == VK_VENDOR_ID_AMD ? 3 : 0);
         }();
@@ -5632,17 +5644,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef CREATE_MM
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, cm1_name(#NAMELC #F16ACC "_l"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, cm1_name(#NAMELC #F16ACC "_m"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, cm1_name(#NAMELC #F16ACC "_s"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, cm1_name(#NAMELC #F16ACC "_aligned_l"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, mmid_m_aligned_spec(TYPE, m_ ## WARPTILE), m_align, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, cm1_name(#NAMELC #F16ACC "_aligned_m"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, mmid_m_aligned_spec(TYPE, m_ ## WARPTILE), m_align, false, true, mmid_req_sgs);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, cm1_name(#NAMELC #F16ACC "_aligned_s"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -5768,6 +5780,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif  // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
 #undef CREATE_MM2
 #undef CREATE_MM
+#undef CM1_SPV
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->fp16) {
@@ -7385,11 +7398,18 @@ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev)
 static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx);
 static void ggml_vk_ctx_end(vk_context& ctx);
 
-// Runs coopmat_layout_check.comp at wave32 and wave64 and compares its output with the exact product: the chunked GDN
-// scan and the selected-key WMMA attention build cooperative-matrix fragments by hand in RADV's gfx11 layout, which the
-// spec does not guarantee, so a driver that lays them out differently must not get those kernels.
+// Runs coopmat_layout_check.comp at wave32 and wave64 and compares its output with the exact product: the cm1 matmuls
+// (BUF_MANUAL, REG_A), the chunked GDN scan and the selected-key WMMA attention build cooperative-matrix fragments by
+// hand in RADV's gfx11 layout, which the spec does not guarantee, so a driver that lays them out differently must not
+// get those kernels.
 static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
     if (!device->pipeline_coopmat_layout_check[0] || !device->pipeline_coopmat_layout_check[1]) {
+        return false;
+    }
+    // test hook: behave as a device that fails the probe (coopMatLoad matmuls, no REG_A, scalar GDN / selected-key)
+    if (getenv("GGML_VK_FORCE_NO_MANUAL_FRAG")) {
+        GGML_LOG_WARN("ggml_vulkan: %s: GGML_VK_FORCE_NO_MANUAL_FRAG set, treating the cooperative-matrix layout check as failed\n",
+                      device->name.c_str());
         return false;
     }
     float ref[256];
@@ -7450,7 +7470,7 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
         }
         if (!(lengths && store && lanes)) {
             GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout at wave%u is not the expected RDNA3 one "
-                          "(lengths %.0f/%.0f/%.0f, product %s, lane layout %s); using the scalar GDN and selected-key kernels\n",
+                          "(lengths %.0f/%.0f/%.0f, product %s, lane layout %s); using coopMatLoad matmuls and the scalar GDN and selected-key kernels\n",
                           device->name.c_str(), sg, out[512], out[513], out[514], store ? "ok" : "wrong", lanes ? "ok" : "wrong");
             ok = false;
         }
