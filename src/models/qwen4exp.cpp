@@ -1503,43 +1503,89 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
-
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
-
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // Hand the selection to flash attention as well as to the mask. The mask alone still makes
-    // the backend attend over the whole cache and merely discard what it read, which is O(n_kv)
-    // per token; with top_k attached, a backend that can compact the active set (the Vulkan
-    // gather-compact path) costs O(n_top_k) instead. n_kv_raw is 0: unlike DeepSeek V4 this
-    // cache has no dense prefix, every attended cell comes from the selection. Backends without
-    // that path ignore the extra argument and read the same mask they do today.
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il, top_k, 0);
+    // rebuild the mask and attend for query rows [t0, t0 + nt) of every stream
+    auto attn_rows = [&](int64_t t0, int64_t nt) {
+        const bool all = t0 == 0 && nt == q_cur->ne[2];
+        ggml_tensor * q      = all ? q_cur : ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], nt,
+                q_cur->nb[1], q_cur->nb[2], t0*q_cur->nb[2]);
+        ggml_tensor * mask   = all ? kq_mask : ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], nt, 1, kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t0*kq_mask->nb[1]);
+        ggml_tensor * sel    = all ? top_k : ggml_view_4d(ctx0, top_k, top_k->ne[0], nt, 1, top_k->ne[3],
+                top_k->nb[1], top_k->nb[2], top_k->nb[3], t0*top_k->nb[1]);
+
+        // prepare new kq mask - starts filled with -INFINITY
+        ggml_tensor * kq_mask_all = ggml_fill(ctx0, mask, -INFINITY);
+
+        // reshape KQ mask into tensor with rows of size 1:
+        // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+        kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+
+        // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, sel, sel->ne[0], sel->ne[1], sel->ne[3], 1, sel->nb[1], sel->nb[2], sel->ne[3]*sel->nb[3], 0);
+
+        // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
+        // this will be our source of zero values for unmasking top k mask elements
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        // modify KQ mask by unmasking elements that are in top_k indices
+        // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+        ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+
+        // reshape to restore the original shape of KQ mask:
+        // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
+        kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+
+        // combine with the original kq mask
+        kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, mask);
+
+        // Hand the selection to flash attention as well as to the mask. The mask alone still makes
+        // the backend attend over the whole cache and merely discard what it read, which is O(n_kv)
+        // per token; with top_k attached, a backend that can compact the active set (the Vulkan
+        // gather-compact path) costs O(n_top_k) instead. n_kv_raw is 0: unlike DeepSeek V4 this
+        // cache has no dense prefix, every attended cell comes from the selection. Backends without
+        // that path ignore the extra argument and read the same mask they do today.
+        return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il, sel, 0);
+    };
+
+    // The rebuilt mask is n_kv x rows (2 B per cell and query for flash attention's f16, three of them), and
+    // passes the 4 GiB single-buffer limit of RADV at ub x n_kv = 2^31 (ub 8192 at 256k), where the chain and
+    // the attention fall back to the CPU. Query rows attend on their own, so a large ubatch runs in row tiles
+    // under the indexer's LLAMA_QSA_IDX_TILE_MB budget, split evenly; the result is the same.
+    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 1024; }();
+    const int64_t n_rows = q_cur->ne[2];
+    const int64_t n_kv   = kq_mask->ne[0];
+    int64_t tile = n_rows;
+    if (tile_mb > 0 && kq_mask->ne[3] == 1 && (int64_t) ggml_row_size(kq_mask->type, n_kv)*n_rows > (tile_mb << 20)) {
+        const int64_t max_rows = std::max<int64_t>(256, (tile_mb << 20) / (int64_t) ggml_row_size(kq_mask->type, n_kv));
+        const int64_t n_tiles  = (n_rows + max_rows - 1)/max_rows;
+        tile = (n_rows + n_tiles - 1)/n_tiles;
+    }
+
+    ggml_tensor * cur = nullptr;
+    if (tile >= n_rows) {
+        cur = attn_rows(0, n_rows);
+    } else {
+        std::vector<ggml_tensor *> parts;
+        for (int64_t t0 = 0; t0 < n_rows; t0 += tile) {
+            parts.push_back(attn_rows(t0, std::min(tile, n_rows - t0)));
+        }
+        // pairwise, so each row is copied log2(tiles) times rather than once per later tile
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts.swap(next);
+        }
+        cur = parts[0];
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
