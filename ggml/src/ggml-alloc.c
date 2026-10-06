@@ -441,28 +441,33 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 // Grow-only reallocation: re-create only the chunks the allocator now needs larger, with 1/16 headroom
 // (capped at the chunk limit) so a context that grows by a few cells per ubatch does not trip it every time.
 // Chunks that are already big enough, or no longer used, are kept.
+// Grow-only reallocation: re-create only the chunks the allocator now needs larger, at exactly the size it needs;
+// chunks that are already big enough, or no longer used, are kept. The caller bounds the total (ggml_vbuffer_grown_size).
 static bool ggml_vbuffer_grow(struct vbuffer * buf, ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     for (int n = 0; n < talloc->n_chunks; n++) {
         const size_t need = talloc->chunks[n]->max_size;
         if (ggml_vbuffer_chunk_size(buf, n) >= need) {
             continue;
         }
-        size_t size = need + need / 16;
-        size = ((size + talloc->alignment - 1) / talloc->alignment) * talloc->alignment;
-        if (talloc->max_chunk_size > 0 && size > talloc->max_chunk_size) {
-            size = need > talloc->max_chunk_size ? need : talloc->max_chunk_size;
-        }
         ggml_backend_buffer_free(buf->chunks[n]);
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, size);
-        if (buf->chunks[n] == NULL && size > need) {
-            buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need);
-        }
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need);
         if (buf->chunks[n] == NULL) {
             return false;
         }
         ggml_backend_buffer_set_usage(buf->chunks[n], usage);
     }
     return true;
+}
+
+// total size of the buffer after ggml_vbuffer_grow: every existing chunk at max(current, needed), plus kept extra chunks
+static size_t ggml_vbuffer_grown_size(struct vbuffer * buf, const struct ggml_dyn_tallocr * talloc) {
+    size_t total = 0;
+    for (int n = 0; n < GGML_VBUFFER_MAX_CHUNKS; n++) {
+        const size_t cur  = ggml_vbuffer_chunk_size(buf, n);
+        const size_t need = n < talloc->n_chunks ? talloc->chunks[n]->max_size : 0;
+        total += cur > need ? cur : need;
+    }
+    return total;
 }
 
 static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
@@ -509,6 +514,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
+    size_t * buf_cap; // [n_buffers] largest exact size any reserve has required (bounds grow-only reallocation)
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -532,6 +538,8 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     GGML_ASSERT(galloc->buffers != NULL);
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
+    galloc->buf_cap = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->buf_cap != NULL);
     GGML_ASSERT(galloc->buf_tallocs != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
@@ -599,6 +607,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->hash_values);
     free(galloc->bufts);
     free(galloc->buffers);
+    free(galloc->buf_cap);
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
@@ -949,7 +958,8 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-            // Grow only the chunks that are too small (ggml_vbuffer_grow) and keep the rest. A reserve
+            // Grow only the chunks that are too small (ggml_vbuffer_grow) and keep the rest, while the grown total stays
+            // within buf_cap; past it, fall back to the exact-size path (frees everything first, so no extra peak). A reserve
             // recomputes the layout for the current graph only, so the exact-size path below shrinks every
             // other chunk to this graph's sizes and frees and re-creates the whole buffer: prefill at a
             // growing context (n_kv changes every ubatch) re-created the multi-GB compute buffer on almost
@@ -969,7 +979,13 @@ static bool ggml_gallocr_reserve_n_impl(
                     ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1048576.0, new_size / 1048576.0,
                     galloc->buf_tallocs[i]->n_chunks, grow_only);
             }
-            if (grow_only && galloc->buffers[i] != NULL && !no_alloc) {
+            // the cap: the largest exact requirement seen (in practice the scheduler's worst-case reserve at startup),
+            // so a grown buffer never holds more memory than the exact-size policy already allocated once
+            if (new_size > galloc->buf_cap[i]) {
+                galloc->buf_cap[i] = new_size;
+            }
+            if (grow_only && galloc->buffers[i] != NULL && !no_alloc &&
+                ggml_vbuffer_grown_size(galloc->buffers[i], galloc->buf_tallocs[i]) <= galloc->buf_cap[i]) {
                 if (!ggml_vbuffer_grow(galloc->buffers[i], galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
                     GGML_LOG_ERROR("%s: failed to grow %s buffer to %zu bytes\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;

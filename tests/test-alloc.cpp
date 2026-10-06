@@ -579,14 +579,9 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        // exact-size reallocation (GGML_ALLOC_GROW_ONLY=0) re-creates both chunks at 20; the default grow-only
-        // reallocation keeps the 24-byte chunk and grows the 16-byte one with headroom
-        const char * g = getenv("GGML_ALLOC_GROW_ONLY");
-        if (g != nullptr && atoi(g) == 0) {
-            GGML_ASSERT(backend.context->allocated_total() == 40);
-        } else {
-            GGML_ASSERT(backend.context->allocated_total() >= 44 && backend.context->allocated_total() <= 56);
-        }
+        // both policies end at 40: exact-size reallocation re-creates both chunks at 20, and grow-only would need
+        // max(24, 20) + max(16, 20) = 44 > the 40 any reserve has required, so it falls back to the exact path
+        GGML_ASSERT(backend.context->allocated_total() == 40);
     }
 }
 
