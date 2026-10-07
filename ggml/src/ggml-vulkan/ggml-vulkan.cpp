@@ -1573,6 +1573,9 @@ struct vk_op_mmid_row_lists_push_constants {
     uint32_t nb01;
     uint32_t a_offset;
     uint32_t n_as;
+    uint32_t args_off;   // GGML_VK_MMID_INDIRECT: where to write the matmul's dispatch args (0 = off)
+    uint32_t gx;
+    uint32_t bn;
 };
 
 struct vk_op_glu_push_constants {
@@ -3817,7 +3820,9 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         return buf;
     }
 
-    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    // eIndirectBuffer: GGML_VK_MMID_INDIRECT reads its dispatch args from prealloc_split_k
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+                                       vk::BufferUsageFlagBits::eIndirectBuffer;
     vk::MemoryAllocateFlags mem_flags {};
     if (device->buffer_device_address) {
         usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
@@ -4042,6 +4047,22 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
           { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
           { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
         } },
+        {},
+        {}
+    );
+}
+
+// a compute write that a later vkCmdDispatchIndirect reads as its arguments (and other shaders read)
+static void ggml_vk_sync_indirect(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    if (ctx) {
+        ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    }
+    subctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eComputeShader,
+        {},
+        { { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead,
+            vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite } },
         {},
         {}
     );
@@ -9670,6 +9691,25 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
 }
 
+// as ggml_vk_dispatch_pipeline, the workgroup counts read from args (a VkDispatchIndirectCommand) on the GPU
+template <typename T>
+static void ggml_vk_dispatch_pipeline_indirect(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, const vk_subbuffer & args) {
+    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
+    GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
+    GGML_ASSERT(args.offset % 4 == 0);
+
+    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+
+    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { descriptor_set }, {});
+    subctx->s->buffer->buf.dispatchIndirect(args.buffer->buffer, args.offset);
+}
+
 static void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
     if (ctx->s == nullptr) {
@@ -10471,7 +10511,7 @@ static void ggml_vk_matmul_id(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
         uint32_t padded_n, uint32_t use_row_lists, const vk_subbuffer & fused_scale, uint32_t fusion_flags,
-        uint32_t a2_boff = 0, uint32_t m_dispatch = 0) {
+        uint32_t a2_boff = 0, uint32_t m_dispatch = 0, const vk_subbuffer * indirect_args = nullptr) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
@@ -10483,6 +10523,10 @@ static void ggml_vk_matmul_id(
     // persistent tile walk) could recover from early-exiting workgroups. Experts above N tiles lose their tail.
     static const uint32_t ycap = [] { const char * e = getenv("GGML_VK_MMID_YCAP"); return e ? (uint32_t) atoi(e) : 0u; }();
     const uint32_t y = ycap ? std::min(nei1, ycap * pipeline->wg_denoms[1]) : nei1;
+    if (indirect_args) {
+        ggml_vk_dispatch_pipeline_indirect(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, *indirect_args);
+        return;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m_dispatch ? m_dispatch : m, y, n_as });
 }
 
@@ -12119,9 +12163,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const char * mmid_row_lists_env = getenv("GGML_VK_MMID_ROWLISTS");
     const bool use_row_lists = !(mmid_row_lists_env && atoi(mmid_row_lists_env) == 0) && !ctx->device->coopmat2;
 
+    // GGML_VK_MMID_INDIRECT=1: the row-list pass also writes the matmul's dispatch args (the token-tile grid sized by
+    // the busiest expert, not by every token landing on one expert), read by vkCmdDispatchIndirect. Exact: every
+    // tile with rows still runs. Off by default until validated.
+    static const bool mmid_indirect = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT"); return e && atoi(e) != 0; }();
+    const bool use_indirect = mmid_indirect && use_row_lists;
+    const uint32_t args_off = (uint32_t)(3 * n_as + 1 + nei0 * nei1);
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
     if (use_row_lists) {
-        expert_count_size = sizeof(uint32_t) * (uint32_t)(3 * n_as + 1 + nei0 * nei1);
+        expert_count_size = sizeof(uint32_t) * (args_off + 4);
     }
 
     {
@@ -12278,11 +12328,24 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
                                            (uint32_t)(nbi1 / ggml_type_size(ids->type)),
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
-                                           (uint32_t)n_as };
+                                           (uint32_t)n_as,
+                                           use_indirect ? args_off : 0u,
+                                           CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]),
+                                           pipeline->wg_denoms[1] };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
-        ggml_vk_sync_buffers(ctx, subctx);
+        if (use_indirect) {
+            ggml_vk_sync_indirect(ctx, subctx);
+        } else {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        static bool logged = false;
+        if (use_indirect && !logged) {
+            logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID indirect dispatch engaged (GGML_VK_MMID_INDIRECT)\n");
+        }
     }
+    const vk_subbuffer indirect_args = { expert_count_buf.buffer, expert_count_buf.offset + sizeof(uint32_t) * args_off, sizeof(uint32_t) * 3 };
 
     uint32_t stride_batch_x = ne00*ne01;
     uint32_t stride_b_y = y_decode_vector_staging ? y_staged_row_stride : ne10;
@@ -12307,7 +12370,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         use_row_lists ? 1u : 0u,
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
         fused_scale ? 1u : 0u,
-        swiglu_boff, src0_up ? 2 * (uint32_t) ne01 : 0u
+        swiglu_boff, src0_up ? 2 * (uint32_t) ne01 : 0u,
+        use_indirect ? &indirect_args : nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {

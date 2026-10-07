@@ -23,6 +23,12 @@ layout (push_constant) uniform parameter
     uint nb01;
     uint a_offset;
     uint n_as;
+    // GGML_VK_MMID_INDIRECT: when args_off != 0, write the matmul's VkDispatchIndirectCommand at data_rl[args_off]:
+    // (gx, ceil(largest expert count / bn), n_as), so its token-tile grid covers the busiest expert instead of
+    // every token on one expert
+    uint args_off;
+    uint gx;
+    uint bn;
 } p;
 
 #define BLOCK_SIZE 256
@@ -34,6 +40,7 @@ layout (binding = 1) buffer RL {uint data_rl[];};
 
 shared uint sh[BLOCK_SIZE];
 shared uint sh_carry;
+shared uint sh_max;
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
@@ -44,11 +51,14 @@ void main() {
     // Exclusive prefix sum of counts -> offsets, cursors start at the offsets
     if (tid == 0) {
         sh_carry = 0;
+        sh_max = 0;
     }
     barrier();
+    uint my_max = 0;
     for (uint base = 0; base < p.n_as; base += BLOCK_SIZE) {
         const uint i = base + tid;
         const uint v = (i < p.n_as) ? data_rl[i] : 0;
+        my_max = max(my_max, v);
         sh[tid] = v;
         barrier();
         [[unroll]] for (uint s = 1; s < BLOCK_SIZE; s <<= 1) {
@@ -69,8 +79,15 @@ void main() {
         }
         barrier();
     }
+    atomicMax(sh_max, my_max);
+    barrier();
     if (tid == 0) {
         data_rl[off_base + p.n_as] = sh_carry;
+        if (p.args_off != 0) {
+            data_rl[p.args_off]     = p.gx;
+            data_rl[p.args_off + 1] = (sh_max + p.bn - 1) / p.bn;
+            data_rl[p.args_off + 2] = p.n_as;
+        }
     }
 
     // offsets/cursors must be visible to the atomics below
