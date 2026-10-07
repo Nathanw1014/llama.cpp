@@ -5378,7 +5378,9 @@ struct test_mul_mat_id_swiglu : public test_case {
         if (n_used != n_mats) {
             ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
         }
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, 1, n);
+        // f32 B: the CPU reference takes no f16 B for MUL_MAT_ID; Vulkan converts it to f16 (MMID f16-B) and so runs
+        // the same f16-B, f16-out REG_A pipeline the model's f16 B does
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         ggml_set_name(b, "b");
 
         ggml_tensor * up   = ggml_cast(ctx, ggml_mul_mat_id(ctx, up_w, b, ids), GGML_TYPE_F16);
