@@ -12183,10 +12183,18 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // GGML_VK_MMID_TILELIST=1 (implies the indirect dispatch): the pass also writes one (expert, token tile) entry per
     // tile that has rows, and the grid walks that list: no empty workgroups at all, however the routing is skewed.
     // mul_mm only (quantize_y takes the mmq shader, which reads its expert from z).
-    static const bool mmid_indirect = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT"); return e && atoi(e) != 0; }();
-    static const bool mmid_tilelist = [] { const char * e = getenv("GGML_VK_MMID_TILELIST"); return e && atoi(e) != 0; }();
-    const bool use_tile_list = mmid_tilelist && use_row_lists && !quantize_y;
-    const bool use_indirect = (mmid_indirect || use_tile_list) && use_row_lists;
+    // =1 gates both by the row-tile count: what they save scales with it (every empty token-tile row skipped once per
+    // row tile), what they cost (the barrier before the indirect read) is fixed per dispatch. 2026-10-07 op-level,
+    // Flash-Next experts, uniform routing: the down GEMMs (m 2560, 20 row tiles) +2..11%, the REG_A gate/up (m 640,
+    // 5 row tiles) -8..-10% at n 256..512, -1..-5% at 1024..4096. GGML_VK_MMID_INDIRECT_MIN_GX (default 16) moves the
+    // cut; =2 applies them everywhere.
+    static const int mmid_indirect = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT"); return e ? atoi(e) : 0; }();
+    static const int mmid_tilelist = [] { const char * e = getenv("GGML_VK_MMID_TILELIST"); return e ? atoi(e) : 0; }();
+    static const uint32_t mmid_ind_min_gx = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT_MIN_GX"); return e ? (uint32_t) atoi(e) : 16u; }();
+    const uint32_t mmid_gx = CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]);
+    auto mmid_gate = [&](int mode) { return mode == 2 || (mode == 1 && mmid_gx >= mmid_ind_min_gx); };
+    const bool use_tile_list = mmid_gate(mmid_tilelist) && use_row_lists && !quantize_y;
+    const bool use_indirect = (mmid_gate(mmid_indirect) || use_tile_list) && use_row_lists;
     const uint32_t args_off = (uint32_t)(3 * n_as + 1 + nei0 * nei1);
     const uint32_t tile_off = args_off + 4;
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
