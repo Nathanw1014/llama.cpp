@@ -17546,10 +17546,18 @@ static void ggml_vk_ssm_conv_direct_l2(ggml_backend_vk_context * ctx, vk_context
     static const bool write_all = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_WRITEALL"); return e && atoi(e) != 0; }();
     pc.l2_write_all = write_all ? 1u : 0u;
 
+    // DEBUG GGML_VK_SSM_CONV_L2_SYNC=1: full barriers around the fused dispatch (is the in-model NaN a missing barrier?)
+    static const bool dbg_sync = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_SYNC"); return e && atoi(e) != 0; }();
+    if (dbg_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, xt), ggml_vk_tensor_subbuffer(ctx, kern),
          ggml_vk_tensor_subbuffer(ctx, state), ggml_vk_tensor_subbuffer(ctx, dst), ggml_vk_tensor_subbuffer(ctx, qk)},
         pc, {nr, n_t, n_s});
+    if (dbg_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -21921,6 +21929,16 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
     if (!enabled || node_idx + 5 >= cgraph->n_nodes || !ggml_vk_can_fuse_ssm_conv_direct(ctx, cgraph, node_idx)) {
         return false;
     }
+    // DEBUG GGML_VK_SSM_CONV_L2_MAXLAYERS=N: fuse only the first N matches of each graph (localise the in-model NaN)
+    static const int dbg_max = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_MAXLAYERS"); return e ? atoi(e) : -1; }();
+    static thread_local const ggml_cgraph * dbg_graph = nullptr;
+    static thread_local int dbg_count = 0;
+    if (dbg_max >= 0) {
+        if (cgraph != dbg_graph || node_idx == 0) {
+            dbg_graph = cgraph;
+            dbg_count = 0;
+        }
+    }
     const ggml_tensor * silu  = cgraph->nodes[node_idx + 2];
     const ggml_tensor * view  = cgraph->nodes[node_idx + 3];
     const ggml_tensor * rms   = cgraph->nodes[node_idx + 4];
@@ -21948,6 +21966,9 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
     if (ctx->device->subgroup_size < 32 || (256 % ctx->device->subgroup_size) != 0) {
         return false;
     }
+    if (dbg_max >= 0 && dbg_count >= dbg_max) {
+        return false;
+    }
     // the kernel leaves the silu's q|k columns unwritten, so every later reader must be a view past them
     // (the GDN v view); a direct use or an overlapping view keeps the unfused form
     if (silu->flags & GGML_TENSOR_FLAG_OUTPUT) {
@@ -21964,6 +21985,9 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
                 return false;
             }
         }
+    }
+    if (dbg_max >= 0) {
+        dbg_count++;
     }
     return true;
 }
