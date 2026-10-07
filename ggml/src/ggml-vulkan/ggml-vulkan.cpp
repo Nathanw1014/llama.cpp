@@ -17546,6 +17546,34 @@ static void ggml_vk_ssm_conv_direct_l2(ggml_backend_vk_context * ctx, vk_context
     static const bool write_all = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_WRITEALL"); return e && atoi(e) != 0; }();
     pc.l2_write_all = write_all ? 1u : 0u;
 
+    // DEBUG GGML_VK_SSM_CONV_L2_DUMP=1: the first dispatch's tensors and push constants (tbo passes, the model NaNs)
+    static const bool dump = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_DUMP"); return e && atoi(e) != 0; }();
+    static bool dumped = false;
+    if (dump && !dumped) {
+        dumped = true;
+        auto d = [&](const char * nm, const ggml_tensor * t) {
+            fprintf(stderr, "ggml_vulkan: CONV_L2 DUMP %-6s %-24s op %-10s type %s ne [%lld %lld %lld %lld] nb [%zu %zu %zu %zu] view_offs %zu off %llu misalign %u\n",
+                    nm, t->name, ggml_op_name(t->op), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                    (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->view_offs,
+                    (unsigned long long) (vk_tensor_offset(t) + t->view_offs), get_misalign_bytes(ctx, t));
+        };
+        d("concat", concat); d("xt", xt); d("state", state); d("kern", kern); d("conv", conv); d("silu", dst);
+        d("view", view); d("rms", rms); d("qk", qk);
+        fprintf(stderr, "ggml_vulkan: CONV_L2 DUMP pc nb01 %u nb02 %u nb11 %u dst_nb %u %u %u nc %u ncs %u nr %u n_t %u n_s %u n_l2 %u eps %g post %g wa %u\n",
+                pc.nb01, pc.nb02, pc.nb11, pc.dst_nb0, pc.dst_nb1, pc.dst_nb2, pc.nc, pc.ncs, pc.nr, pc.n_t, pc.n_s, pc.n_l2,
+                (double) pc.l2_eps, (double) pc.l2_post, pc.l2_write_all);
+        for (int j = node_idx + 6; j < cgraph->n_nodes && j < node_idx + 40; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const ggml_tensor * sr = n->src[k];
+                if (sr && (sr == qk || sr->view_src == qk || sr == dst || sr->view_src == dst || sr == rms || sr->view_src == rms)) {
+                    fprintf(stderr, "ggml_vulkan: CONV_L2 DUMP reader node %d %s (%s) src[%d] = %s view_src %s offs %zu\n", j, n->name,
+                            ggml_op_desc(n), k, sr->name, sr->view_src ? sr->view_src->name : "-", sr->view_offs);
+                }
+            }
+        }
+    }
+
     // DEBUG GGML_VK_SSM_CONV_L2_SYNC=1: full barriers around the fused dispatch (is the in-model NaN a missing barrier?)
     static const bool dbg_sync = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_SYNC"); return e && atoi(e) != 0; }();
     if (dbg_sync) {
