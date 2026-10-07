@@ -257,6 +257,7 @@ struct vk_matmul_pipeline_struct {
     vk_pipeline a_l, a_m, a_s;
     // aligned-only extra-large tier above l (dense quantized coopmat1 on AMD, see ggml_vk_mm_xl_ok)
     vk_pipeline a_xl;
+    vk_pipeline a_hcd;   // GGML_VK_MM_HCD: 160x160 tile for skinny m = 160 / 320 / 480 (the hc down projection)
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
@@ -970,6 +971,7 @@ struct vk_device_struct {
     bool mul_mat_id_m[GGML_TYPE_COUNT];
     bool mul_mat_id_s[GGML_TYPE_COUNT];
     bool mul_mat_xl[GGML_TYPE_COUNT] = {};   // dense quantized XL tier (a_xl), coopmat1 on AMD only
+    bool mul_mat_hcd[GGML_TYPE_COUNT] = {};  // dense quantized 160x160 tier (a_hcd), opt-in
 
     // Separate flags for the q8_1 (integer dot) mmq path, whose shader uses
     // a different shared-memory layout than the float matmul shaders.
@@ -4828,6 +4830,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // an empty warptile means no XL pipelines are created for that family.
     std::vector<uint32_t> xl_warptile, xl_warptile_mmq;
     std::array<uint32_t, 3> xl_wg_denoms {}, xl_mmq_wg_denoms {};
+    std::vector<uint32_t> hcd_warptile, hcd_warptile_mmq;
+    std::array<uint32_t, 3> hcd_wg_denoms {}, hcd_mmq_wg_denoms {};
 
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
@@ -5505,16 +5509,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 warptile_env("GGML_VK_WARPTILE_MMQ_XL", xl_warptile_mmq);
                 xl_mmq_wg_denoms = { xl_warptile_mmq[1], xl_warptile_mmq[2], 1 };
             }
+            // GGML_VK_MM_HCD=1: a 160x160 tile (10 wave32 subgroups, each 32 rows x 80 columns) so m = 320 (Flash-Next's hc
+            // down projection, k 10240) is two row tiles instead of three 128-row ones with a third of the last one idle
+            // (Strata covers the same 320 with two 160-row blocks). 320 threads stride the A and B loads by 80 rows, which
+            // divides 160. Opt-in; chosen per shape in ggml_vk_guess_matmul_pipeline.
+            static const int mm_hcd_env = [] { const char * e = getenv("GGML_VK_MM_HCD"); return e ? atoi(e) : 0; }();
+            if (mm_hcd_env != 0 && device->coopmat_m == 16 && device->coopmat_n == 16 && device->coopmat_k == 16) {
+                hcd_warptile_mmq = { 320, 160, 160, 32, 32, 80, 2, 16, 16, 16, 32 };
+                hcd_mmq_wg_denoms = { hcd_warptile_mmq[1], hcd_warptile_mmq[2], 1 };
+            }
         }
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             const ggml_type t = (ggml_type) i;
             device->mul_mat_xl[i] = !xl_warptile_mmq.empty() && device->mul_mat_l[i] &&
                                     t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
                                     ggml_vk_matmul_shmem_support(device, xl_warptile_mmq, false, t);
+            device->mul_mat_hcd[i] = !hcd_warptile_mmq.empty() && device->mul_mat_l[i] &&
+                                     t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
+                                     ggml_vk_matmul_shmem_support(device, hcd_warptile_mmq, false, t);
         }
         // only the dense quantized families (warptile_mmq) get XL pipelines; the float and mul_mat_id
         // expansions see an empty xl_warptile and create none
         auto xl_ok = [&device](ggml_type t, const std::vector<uint32_t> & w) { return !w.empty() && device->mul_mat_xl[t]; };
+        auto hcd_ok = [&device](ggml_type t, const std::vector<uint32_t> & w) { return !w.empty() && device->mul_mat_hcd[t]; };
 
         // WARP -> required subgroup size, or 0 where the device cannot honor one.
         auto dense_req_sgs = [dense_sgs_scope, &device](const std::vector<uint32_t> & w) -> uint32_t {
@@ -5548,6 +5565,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, cm1_name(#NAMELC #F16ACC "_aligned_s"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
         if (xl_ok(TYPE, xl_ ## WARPTILE)) \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_xl, cm1_name(#NAMELC #F16ACC "_aligned_xl"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), xl_ ## WG_DENOMS, ggml_vk_mul_mm_spec(xl_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(xl_ ## WARPTILE));   \
+        if (hcd_ok(TYPE, hcd_ ## WARPTILE)) \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_hcd, cm1_name(#NAMELC #F16ACC "_aligned_hcd"), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), hcd_ ## WG_DENOMS, ggml_vk_mul_mm_spec(hcd_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(hcd_ ## WARPTILE));   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -10418,6 +10437,15 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     }
     if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
+    }
+    // GGML_VK_MM_HCD: m a multiple of 160 up to 480 with a long k (Flash-Next's hc down, 320 x k 10240)
+    if (aligned && !is_q8_1 && mmp->a_hcd && ctx->device->mul_mat_hcd[src0_type] && m % 160 == 0 && m <= 480 && k >= 4096) {
+        static bool hcd_logged = false;
+        if (!hcd_logged) {
+            hcd_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT 160x160 tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0_type), m, n, k);
+        }
+        return mmp->a_hcd;
     }
     if (aligned && !is_q8_1 && mmp->a_xl && ctx->device->mul_mat_xl[src0_type] && ggml_vk_mm_xl_ok(ctx, src0_type, m, n, k)) {
         static bool xl_logged = false;
