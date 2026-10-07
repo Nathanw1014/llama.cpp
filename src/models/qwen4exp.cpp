@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <numeric>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1043,6 +1044,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_build_forward_expand(gf, gate);   // keep gate's own view nodes ahead of the chain
         ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
+        // LLAMA_GDN_NORM_PAD=N (default 128, 0 off): write the f16 rows with a stride of value_dim + N. value_dim 6144 f16 is
+        // 48 x 256 B, so packed every token row starts on the same DRAM channel for the ssm_out GEMM (Flash-Next q8_0
+        // 2560x2048x6144: 40.8 TFLOPS from the padded staging copy, 31.7 reading the packed f16 rows directly)
+        static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 128; }();
+        const int64_t row = out->ne[0] * out->ne[1];
+        if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, row + pad, out->ne[2]);
+            ggml_tensor * dst = ggml_view_4d(ctx0, buf, out->ne[0], out->ne[1], out->ne[2], 1,
+                    out->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * out->ne[2], 0);
+            return ggml_cpy(ctx0, out, dst);
+        }
         return ggml_cast(ctx0, out, GGML_TYPE_F16);
     }
     // The sigmoid is expanded first so the graph reads RMS_NORM, MUL(gamma), MUL(gate) back to back
@@ -1943,7 +1955,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // a padded f16 norm output (LLAMA_GDN_NORM_PAD) is viewed, not reshaped: ssm_out reads its rows through the stride
+    ggml_tensor * final_output = ggml_is_contiguous(attn_out_norm)
+            ? ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs)
+            : ggml_view_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs,
+                    attn_out_norm->nb[2], attn_out_norm->nb[3], 0);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);

@@ -47,7 +47,10 @@ void main() {
 
     const uint a_offset = samp*p.nb03 + channel*p.nb02 + row*p.nb01 + get_aoffset();
     const uint b_offset = src1_idx(0, row, channel, samp) + get_boffset();
-    const uint d_offset = ((samp*p.ne02 + channel)*p.ne01 + row)*ncols + get_doffset();
+    // the destination through its strides (packed unless LLAMA_GDN_NORM_PAD pads the f16 rows); the second
+    // multiplier is packed and dst-shaped, so it keeps the packed index
+    const uint d_offset = samp*p.nb23 + channel*p.nb22 + row*p.nb21 + get_doffset();
+    const uint c_offset = ((samp*p.ne02 + channel)*p.ne01 + row)*ncols;
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
     for (uint col = lane; col < ncols; col += sgsize) {
@@ -62,7 +65,7 @@ void main() {
     if (do_multiply2) {
         for (uint col = lane; col < ncols; col += sgsize) {
             const FLOAT_TYPE g = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
-            float c = data_c[d_offset + col - get_doffset()];
+            float c = data_c[c_offset + col];
             if (do_sigmoid_c) {
                 c = 1.0f / (1.0f + exp(-c));
             }

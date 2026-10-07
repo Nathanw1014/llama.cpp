@@ -3761,8 +3761,10 @@ struct test_rms_norm_mul_sigmul_cpy : public test_case {
         return VARS_TO_STR2(ne, eps);
     }
 
-    test_rms_norm_mul_sigmul_cpy(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f)
-        : ne(ne), eps(eps) {}
+    const int64_t pad;   // LLAMA_GDN_NORM_PAD: the f16 rows land in a view of [ne0*ne1 + pad, ne2] (read back packed)
+
+    test_rms_norm_mul_sigmul_cpy(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, int64_t pad = 0)
+        : ne(ne), eps(eps), pad(pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -3773,7 +3775,16 @@ struct test_rms_norm_mul_sigmul_cpy : public test_case {
         ggml_set_name(z, "z");
 
         ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
-        ggml_tensor * out = ggml_cast(ctx, ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z)), GGML_TYPE_F16);
+        ggml_tensor * gated = ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z));
+        ggml_tensor * out;
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne[0] * ne[1] + pad, ne[2]);
+            ggml_tensor * dst = ggml_view_4d(ctx, buf, ne[0], ne[1], ne[2], 1, ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * ne[2], 0);
+            ggml_tensor * c = ggml_cpy(ctx, gated, dst);
+            out = ggml_cast(ctx, ggml_view_2d(ctx, c, ne[0] * ne[1], ne[2], c->nb[2], 0), GGML_TYPE_F32);
+        } else {
+            out = ggml_cast(ctx, gated, GGML_TYPE_F16);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -9616,6 +9627,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_direct_l2(32, 6144, 33, 1));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({100, 3, 5, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 2048, 1}));   // the Flash-Next shape
+    test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 33, 1}, 1e-6f, 128));     // LLAMA_GDN_NORM_PAD
+    test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 2048, 1}, 1e-6f, 128));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({256, 8, 3, 1}));
     test_cases.emplace_back(new test_mul_add_bcast({2560, 33, 1, 1}));
     test_cases.emplace_back(new test_mul_add_bcast({2560, 33, 1, 1}, true));

@@ -21409,7 +21409,9 @@ static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, c
             cpy->src[0] != mul2 || cpy->type != GGML_TYPE_F16 || z->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32) {
             return false;
         }
-        if (!ggml_is_contiguous(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) || !ggml_is_contiguous(cpy) ||
+        // the f16 destination: rows packed, outer strides may be padded (LLAMA_GDN_NORM_PAD); rms_norm_small stores through them
+        if (!ggml_is_contiguous(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) ||
+            cpy->nb[0] != sizeof(ggml_fp16_t) || !ggml_is_contiguous_rows(cpy) ||
             !ggml_are_same_shape(z, mul2) || !ggml_are_same_shape(mul, mul2) || !ggml_are_same_shape(cpy, mul2)) {
             return false;
         }
