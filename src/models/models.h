@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2337,6 +2338,19 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable bool       hc_up_il_tried = false;
     mutable bool       hc_up_il       = false;
     bool hc_up_interleaved() const;
+
+    // LLAMA_HC_DOWN_INJECT=1: per hc down weight, a q8_0 [hc_dim, n_down + hc] copy with that block's inject rows
+    // (quantized) appended, built on the first graph build with loaded weights, so one GEMM reads xn once for both
+    // (Strata's PF_HCDOWN). See qwen4exp.cpp.
+    struct hc_down_inject_cache {
+        std::mutex mutex;
+        bool tried = false;
+        struct ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> merged;   // w_down -> merged
+    };
+    mutable hc_down_inject_cache hc_dinj;
+    struct ggml_tensor * hc_down_inject(const struct ggml_tensor * w_down) const;
 
     class llm_graph_input_qsa;
     class llm_graph_input_hc_consts;

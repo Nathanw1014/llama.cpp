@@ -470,6 +470,84 @@ static bool qwen4exp_hc_fastpath(const llama_model & model) {
 // [n_embd*hc, nt] gate: 84 MB of traffic per mix at ub2048, 95 mixes per graph. Needs the mix op path and
 // every hc up weight in a device buffer that is not a host mapping (the rows are rewritten in place);
 // otherwise it stays off. Default off.
+// LLAMA_HC_DOWN_INJECT=1: the hc inject projection (f32 [hc_dim, hc]) reads xn a second time through a mat-vec
+// (Flash-Next REAP-320 pp2048 ub2048: 95 calls, 42.8 ms per ubatch at ~94 GB/s). Appending its rows, quantized to
+// q8_0, to the q8_0 down weight makes the down GEMM produce both: m 320 -> 324 fits the same 128-row tiles. The down
+// rows and their outputs are unchanged; the inject weights are q8_0-rounded (and multiply the f16 xn like the down
+// rows do), so the scatter weights differ at that rounding. Built once, on the first build with loaded weights.
+ggml_tensor * llama_model_qwen4exp::hc_down_inject(const ggml_tensor * w_down) const {
+    std::lock_guard<std::mutex> lock(hc_dinj.mutex);
+    if (!hc_dinj.tried) {
+        [this] {
+            const char * e = getenv("LLAMA_HC_DOWN_INJECT");
+            if (e == nullptr || atoi(e) == 0) {
+                hc_dinj.tried = true;
+                return;
+            }
+            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+            for (const auto & layer : layers) {
+                if (layer.hc_attn_down && layer.hc_attn_inject) { pairs.emplace_back(layer.hc_attn_down, layer.hc_attn_inject); }
+                if (layer.hc_ffn_down  && layer.hc_ffn_inject)  { pairs.emplace_back(layer.hc_ffn_down,  layer.hc_ffn_inject);  }
+            }
+            for (const auto & pr : pairs) {
+                if (pr.first->data == nullptr || pr.second->data == nullptr) {
+                    return;   // a no-alloc model (the -fit probe): decide on a later build, with the weights loaded
+                }
+            }
+            hc_dinj.tried = true;
+            if (pairs.empty()) {
+                return;
+            }
+            for (const auto & pr : pairs) {
+                const ggml_tensor * d = pr.first, * inj = pr.second;
+                if (d->type != GGML_TYPE_Q8_0 || inj->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || !ggml_is_contiguous(inj) ||
+                    d->ne[0] != inj->ne[0] || d->ne[2] != 1 || inj->ne[2] != 1 || d->buffer == nullptr) {
+                    LLAMA_LOG_WARN("%s: LLAMA_HC_DOWN_INJECT: %s / %s are not q8_0 / f32 [hc_dim, *] weights, keeping the inject mat-vec\n",
+                            __func__, ggml_get_name(d), ggml_get_name(inj));
+                    return;
+                }
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(pairs[0].first->buffer));
+            if (dev == nullptr) {
+                return;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            ggml_init_params ip = { pairs.size() * ggml_tensor_overhead(), nullptr, true };
+            hc_dinj.ctx = ggml_init(ip);
+            std::vector<ggml_tensor *> out;
+            for (const auto & pr : pairs) {
+                out.push_back(ggml_new_tensor_2d(hc_dinj.ctx, GGML_TYPE_Q8_0, pr.first->ne[0], pr.first->ne[1] + pr.second->ne[1]));
+            }
+            hc_dinj.buf = ggml_backend_alloc_ctx_tensors_from_buft(hc_dinj.ctx, buft);
+            if (hc_dinj.buf == nullptr) {
+                LLAMA_LOG_WARN("%s: LLAMA_HC_DOWN_INJECT: buffer allocation failed, keeping the inject mat-vec\n", __func__);
+                ggml_free(hc_dinj.ctx);
+                hc_dinj.ctx = nullptr;
+                return;
+            }
+            ggml_backend_buffer_set_usage(hc_dinj.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<uint8_t> dbytes, qbytes;
+            std::vector<float>   inj;
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                const ggml_tensor * d = pairs[i].first, * w = pairs[i].second;
+                dbytes.resize(ggml_nbytes(d));
+                ggml_backend_tensor_get(d, dbytes.data(), 0, dbytes.size());
+                inj.resize(ggml_nelements(w));
+                ggml_backend_tensor_get(w, inj.data(), 0, inj.size() * sizeof(float));
+                qbytes.resize(ggml_row_size(GGML_TYPE_Q8_0, w->ne[0]) * w->ne[1]);
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, inj.data(), qbytes.data(), 0, w->ne[1], w->ne[0], nullptr);
+                ggml_backend_tensor_set(out[i], dbytes.data(), 0, dbytes.size());
+                ggml_backend_tensor_set(out[i], qbytes.data(), dbytes.size(), qbytes.size());
+                hc_dinj.merged[d] = out[i];
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_HC_DOWN_INJECT: %zu hc down weights merged with their inject rows (%.1f MiB, %s)\n", __func__,
+                    pairs.size(), ggml_backend_buffer_get_size(hc_dinj.buf) / 1048576.0, ggml_backend_buffer_name(hc_dinj.buf));
+        }();
+    }
+    auto it = hc_dinj.merged.find(w_down);
+    return it == hc_dinj.merged.end() ? nullptr : it->second;
+}
+
 bool llama_model_qwen4exp::hc_up_interleaved() const {
     std::lock_guard<std::mutex> lock(hc_up_il_mutex);
     if (hc_up_il_tried) {
@@ -652,7 +730,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    // LLAMA_HC_DOWN_INJECT: one GEMM for the down rows and the inject rows (prefill, no LoRA)
+    ggml_tensor * w_dinj = (inject && qwen4exp_hc_fastpath(model) && loras->empty() && nt >= 32)
+            ? static_cast<const llama_model_qwen4exp &>(model).hc_down_inject(w_down) : nullptr;
+    ggml_tensor * dinj = nullptr;
+    ggml_tensor * lo;
+    if (w_dinj) {
+        dinj = ggml_mul_mat(ctx0, w_dinj, xn);   // [n_down + hc, nt]
+        lo = ggml_view_2d(ctx0, dinj, w_down->ne[1], nt, dinj->nb[1], 0);
+    } else {
+        lo = build_lora_mm(w_down, xn);
+    }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
     if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32 &&
@@ -722,7 +810,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
 
     if (inject) {
-        if (qwen4exp_hc_fastpath(model) && loras->empty()) {
+        if (dinj) {
+            *inject = ggml_cont(ctx0, ggml_view_2d(ctx0, dinj, hc, nt, dinj->nb[1], w_down->ne[1] * ggml_element_size(dinj)));   // [hc, nt]
+        } else if (qwen4exp_hc_fastpath(model) && loras->empty()) {
             ggml_tensor * w_rows = ggml_get_rows(ctx0, w_inject, build_hc_consts()->iota); // f32 [hc_dim, hc]
             ggml_tensor * inj_t  = ggml_mul_mat(ctx0, xn, w_rows);              // [nt, hc]
             *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));             // [hc, nt]
@@ -1918,6 +2008,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 llama_model_qwen4exp::~llama_model_qwen4exp() {
     if (ple_hot.buf) { ggml_backend_buffer_free(ple_hot.buf); }
     if (ple_hot.ctx) { ggml_free(ple_hot.ctx); }
+    if (hc_dinj.buf) { ggml_backend_buffer_free(hc_dinj.buf); }
+    if (hc_dinj.ctx) { ggml_free(hc_dinj.ctx); }
 }
 
 // LLAMA_PLE_HOT=<sidecar> (scripts/flash-next/make_ple_hot.py): load the hot rows into a buffer of
