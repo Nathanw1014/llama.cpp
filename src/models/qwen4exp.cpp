@@ -738,7 +738,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * lo;
     if (w_dinj) {
         dinj = ggml_mul_mat(ctx0, w_dinj, xn);   // [n_down + hc, nt]
-        lo = ggml_view_2d(ctx0, dinj, w_down->ne[1], nt, dinj->nb[1], 0);
+        // the down rows are a strided view (row stride n_down + hc): SCALE needs a contiguous source on Vulkan (and
+        // the CPU fallback asserts), so copy the 2.6 MB out first
+        lo = ggml_cont(ctx0, ggml_view_2d(ctx0, dinj, w_down->ne[1], nt, dinj->nb[1], 0));
     } else {
         lo = build_lora_mm(w_down, xn);
     }
