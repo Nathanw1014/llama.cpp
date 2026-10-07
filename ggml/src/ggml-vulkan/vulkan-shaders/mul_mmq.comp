@@ -61,6 +61,9 @@ layout (push_constant) uniform parameter
     uint padded_N;
     uint use_row_lists;
     uint fusion_flags;
+    uint a2_boff;           // mul_mm.comp's MUL_MAT_ID_SWIGLU field: the layout of vk_mat_mat_id_push_constants
+    uint tile_list_off;     // GGML_VK_MMID_TILELIST: read by mul_mm_id_funcs.glsl (0 here: the tile list is mul_mm only)
+    uint n_as;
 #else
     uint base_work_group_z;
     uint num_batches;
