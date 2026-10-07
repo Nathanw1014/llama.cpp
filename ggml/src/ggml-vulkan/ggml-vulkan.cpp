@@ -22974,6 +22974,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 for (int k = 0; k < 5; ++k) {
                     op_srcs_fused_elementwise[k] = false;
                 }
+                // the casts' src[1] is their own (never written) destination, which the GLU may share: without this the
+                // overlap check silently disabled the fusion on every graph (the CPY src[1] trap)
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[3] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
