@@ -9656,14 +9656,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mul({100, 3, 5, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 9, 1}));
-    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q8_0, 320, 64, 1024, 128));
+    // mode 0 uses an f16 A: the CPU reference has no quantized x f16 matmul (vec_dot_type), and the padded B
+    // load is the same mul_mm code for every A type
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_F16, 320, 64, 1024, 128));
     // GGML_VK_MM_HCD 160x160 tile: m = 160 / 320 / 480 with k >= 4096, n not a multiple of 160
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 512, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 300, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 160, 97, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 480, 200, 4096, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q8_0, 320, 512, 10240, 128));  // the hc down shape
-    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q4_K, 256, 33, 2048, 64));
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_F16, 320, 512, 10240, 128));  // the hc down shape
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_F16, 256, 33, 2048, 64));
     test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 64, 1024, 128));       // the hc inject shape
     test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 300, 10240, 128));
     test_cases.emplace_back(new test_rowpad_f16(2, GGML_TYPE_F32, 0, 33, 1024, 128));
