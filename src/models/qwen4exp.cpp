@@ -688,11 +688,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8): give the f16 xn rows a stride of hc_dim + N. hc_dim 10240 f16 is
+    // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8; default 64, 0 off): give the f16 xn rows a stride of hc_dim + N. hc_dim 10240 f16 is
     // 80 x 256 B, so unpadded every token row starts on the same DRAM channel of 16 for the down GEMM, the inject
     // mat-vec and the mix, which all read xn row-strided (Strata pads the same buffer: K + 64). The norm writes the
     // padded rows directly (RMS_NORM_MUL_CPY with a row-strided destination); the consumers take the stride.
-    static const int64_t xn_pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 0; }();
+    static const int64_t xn_pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 64; }();
     bool xn_padded = false;
     if (qwen4exp_hc_norm3d()) {
         // Apply gamma in the [n_embd, hc, nt] shape so the graph is RMS_NORM directly followed by MUL
@@ -1037,12 +1037,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu.
-    // LLAMA_GDN_NORM_F16=1: emit RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan
+    // LLAMA_GDN_NORM_F16 (default on, =0 off): emit RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan
     // backend runs as one pass (RMS_NORM_MUL_SIGMUL_CPY) writing only the f16 B operand of ssm_out: no sigmoid
     // pass, no f32 norm output and no B conversion in the GEMM (Strata's GDN_NOY). The GEMM's B was rounded to
-    // f16 before either way. Needs a backend that takes f16 B for the out projection (not the CPU).
-    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e != nullptr && atoi(e) != 0; }();
-    if (norm_f16) {
+    // f16 before either way. Prefill only (nt >= 32: the f16-B mat-vec paths are slower at decode), and only when
+    // the out projection is a GPU weight, not bf16 (no bf16 x f16 shader) and has no LoRA (the CPU and a LoRA
+    // delta take no f16 B). FN REAP-320 10-07: +2-3% prefill with the xn pad, PPL 3.7972 vs 3.7973.
+    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * w_out = model.layers[layer].ssm_out;
+    if (norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
+        llm_graph_weights_on_gpu(w_out->buffer)) {
         ggml_build_forward_expand(gf, gate);   // keep gate's own view nodes ahead of the chain
         ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
