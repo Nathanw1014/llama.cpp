@@ -1484,6 +1484,8 @@ struct vk_mat_mat_id_push_constants {
     uint32_t use_row_lists;
     uint32_t fusion_flags;
     uint32_t a2_boff;   // MUL_MAT_ID_SWIGLU: byte offset from the gate weights to the up weights in binding 0
+    uint32_t tile_list_off;   // GGML_VK_MMID_TILELIST: where the (expert << 16 | tile) list starts, 0 = off
+    uint32_t n_as;            // expert count, needed when the grid is a tile list (z = 1)
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -1576,6 +1578,7 @@ struct vk_op_mmid_row_lists_push_constants {
     uint32_t args_off;   // GGML_VK_MMID_INDIRECT: where to write the matmul's dispatch args (0 = off)
     uint32_t gx;
     uint32_t bn;
+    uint32_t tile_off;   // GGML_VK_MMID_TILELIST: where to write the tile list (0 = off)
 };
 
 struct vk_op_glu_push_constants {
@@ -10512,13 +10515,13 @@ static void ggml_vk_matmul_id(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
         uint32_t padded_n, uint32_t use_row_lists, const vk_subbuffer & fused_scale, uint32_t fusion_flags,
-        uint32_t a2_boff = 0, uint32_t m_dispatch = 0, const vk_subbuffer * indirect_args = nullptr) {
+        uint32_t a2_boff = 0, uint32_t m_dispatch = 0, const vk_subbuffer * indirect_args = nullptr, uint32_t tile_list_off = 0) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, padded_n, use_row_lists, fusion_flags, a2_boff };
+                                              nei0, nei1, nbi1, ne11, padded_n, use_row_lists, fusion_flags, a2_boff, tile_list_off, n_as };
     // TIMING PROBE ONLY (wrong results): GGML_VK_MMID_YCAP=N dispatches at most N token tiles per expert instead of
     // the worst case (every token on one expert). The time it saves bounds what a GPU-built tile list (Strata's
     // persistent tile walk) could recover from early-exiting workgroups. Experts above N tiles lose their tail.
@@ -12176,12 +12179,18 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // GGML_VK_MMID_INDIRECT=1: the row-list pass also writes the matmul's dispatch args (the token-tile grid sized by
     // the busiest expert, not by every token landing on one expert), read by vkCmdDispatchIndirect. Exact: every
     // tile with rows still runs. Off by default until validated.
+    // GGML_VK_MMID_TILELIST=1 (implies the indirect dispatch): the pass also writes one (expert, token tile) entry per
+    // tile that has rows, and the grid walks that list: no empty workgroups at all, however the routing is skewed.
+    // mul_mm only (quantize_y takes the mmq shader, which reads its expert from z).
     static const bool mmid_indirect = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT"); return e && atoi(e) != 0; }();
-    const bool use_indirect = mmid_indirect && use_row_lists;
+    static const bool mmid_tilelist = [] { const char * e = getenv("GGML_VK_MMID_TILELIST"); return e && atoi(e) != 0; }();
+    const bool use_tile_list = mmid_tilelist && use_row_lists && !quantize_y;
+    const bool use_indirect = (mmid_indirect || use_tile_list) && use_row_lists;
     const uint32_t args_off = (uint32_t)(3 * n_as + 1 + nei0 * nei1);
+    const uint32_t tile_off = args_off + 4;
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
     if (use_row_lists) {
-        expert_count_size = sizeof(uint32_t) * (args_off + 4);
+        expert_count_size = sizeof(uint32_t) * (use_tile_list ? tile_off + n_as + CEIL_DIV((uint32_t)(nei0 * nei1), pipeline->wg_denoms[1]) : args_off + 4);
     }
 
     {
@@ -12341,7 +12350,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)n_as,
                                            use_indirect ? args_off : 0u,
                                            CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]),
-                                           pipeline->wg_denoms[1] };
+                                           pipeline->wg_denoms[1],
+                                           use_tile_list ? tile_off : 0u };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
         if (use_indirect) {
@@ -12352,7 +12362,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         static bool logged = false;
         if (use_indirect && !logged) {
             logged = true;
-            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID indirect dispatch engaged (GGML_VK_MMID_INDIRECT)\n");
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID indirect dispatch engaged (%s)\n", use_tile_list ? "GGML_VK_MMID_TILELIST" : "GGML_VK_MMID_INDIRECT");
         }
     }
     const vk_subbuffer indirect_args = { expert_count_buf.buffer, expert_count_buf.offset + sizeof(uint32_t) * args_off, sizeof(uint32_t) * 3 };
@@ -12381,7 +12391,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
         fused_scale ? 1u : 0u,
         swiglu_boff, src0_up ? 2 * (uint32_t) ne01 : 0u,
-        use_indirect ? &indirect_args : nullptr
+        use_indirect ? &indirect_args : nullptr,
+        use_tile_list ? tile_off : 0u
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {

@@ -127,6 +127,8 @@ layout (push_constant) uniform parameter
     uint use_row_lists;
     uint fusion_flags;
     uint a2_boff;           // SWIGLU: byte offset from the gate weights (binding 0 base) to the up weights
+    uint tile_list_off;     // GGML_VK_MMID_TILELIST: index in the counts buffer of the (expert << 16 | tile) list, 0 = off
+    uint n_as;              // the expert count when the grid is a tile list (z is 1 then)
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -453,7 +455,13 @@ void main() {
     uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
+    uint expert_idx = gl_WorkGroupID.z;
+    if (p.tile_list_off != 0) {
+        // tile-list grid: y walks only the tiles that have rows, each entry naming its expert and token tile
+        const uint te = uint(data_expert_count[p.tile_list_off + gl_WorkGroupID.y]);
+        expert_idx = te >> 16;
+        ic = te & 0xFFFFu;
+    }
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }

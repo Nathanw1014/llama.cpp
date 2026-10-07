@@ -29,6 +29,9 @@ layout (push_constant) uniform parameter
     uint args_off;
     uint gx;
     uint bn;
+    // GGML_VK_MMID_TILELIST: when tile_off != 0, also write one (expert << 16 | token tile) entry per tile that has
+    // rows at data_rl[tile_off...], and dispatch args (gx, number of tiles, 1)
+    uint tile_off;
 } p;
 
 #define BLOCK_SIZE 256
@@ -83,11 +86,45 @@ void main() {
     barrier();
     if (tid == 0) {
         data_rl[off_base + p.n_as] = sh_carry;
-        if (p.args_off != 0) {
-            data_rl[p.args_off]     = p.gx;
-            data_rl[p.args_off + 1] = (sh_max + p.bn - 1) / p.bn;
-            data_rl[p.args_off + 2] = p.n_as;
+    }
+
+    // tile list: exclusive prefix sum of ceil(count / bn), then one entry per tile
+    uint n_tiles = 0;
+    if (p.tile_off != 0) {
+        if (tid == 0) {
+            sh_carry = 0;
         }
+        barrier();
+        for (uint base = 0; base < p.n_as; base += BLOCK_SIZE) {
+            const uint i = base + tid;
+            const uint v = (i < p.n_as) ? (data_rl[i] + p.bn - 1) / p.bn : 0;
+            sh[tid] = v;
+            barrier();
+            [[unroll]] for (uint s = 1; s < BLOCK_SIZE; s <<= 1) {
+                const uint t = (tid >= s) ? sh[tid - s] : 0;
+                barrier();
+                sh[tid] += t;
+                barrier();
+            }
+            const uint carry = sh_carry;
+            if (i < p.n_as) {
+                const uint first = carry + sh[tid] - v;
+                for (uint j = 0; j < v; ++j) {
+                    data_rl[p.tile_off + first + j] = (i << 16) | j;
+                }
+            }
+            barrier();
+            if (tid == BLOCK_SIZE - 1) {
+                sh_carry = carry + sh[tid];
+            }
+            barrier();
+        }
+        n_tiles = sh_carry;
+    }
+    if (tid == 0 && p.args_off != 0) {
+        data_rl[p.args_off]     = p.gx;
+        data_rl[p.args_off + 1] = p.tile_off != 0 ? n_tiles : (sh_max + p.bn - 1) / p.bn;
+        data_rl[p.args_off + 2] = p.tile_off != 0 ? 1u : p.n_as;
     }
 
     // offsets/cursors must be visible to the atomics below

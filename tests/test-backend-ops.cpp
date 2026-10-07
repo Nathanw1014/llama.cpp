@@ -12028,7 +12028,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  640, n * 320, 2560, {1, 1}, {1, 1}));
     }
     // FN REAP-320 expert GEMMs vs tokens per ubatch (fn-sweep 2026-10-05): does MMID efficiency scale with ub?
-    for (int64_t n : {512, 2048, 4096, 8192}) {
+    for (int64_t n : {256, 512, 1024, 2048, 4096, 8192}) {
+        // f16 B is what the model feeds (the hc mix writes f16); the swiglu case is MUL_MAT_ID_SWIGLU's five nodes
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 320, 10, 640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS,  GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, false, 2560, n,  640));
