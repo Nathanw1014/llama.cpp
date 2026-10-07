@@ -17551,10 +17551,33 @@ static void ggml_vk_ssm_conv_direct_l2(ggml_backend_vk_context * ctx, vk_context
     if (dbg_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {ggml_vk_tensor_subbuffer(ctx, xt), ggml_vk_tensor_subbuffer(ctx, kern),
-         ggml_vk_tensor_subbuffer(ctx, state), ggml_vk_tensor_subbuffer(ctx, dst), ggml_vk_tensor_subbuffer(ctx, qk)},
-        pc, {nr, n_t, n_s});
+    const vk_subbuffer b_xt = ggml_vk_tensor_subbuffer(ctx, xt), b_kern = ggml_vk_tensor_subbuffer(ctx, kern),
+                       b_state = ggml_vk_tensor_subbuffer(ctx, state), b_dst = ggml_vk_tensor_subbuffer(ctx, dst),
+                       b_qk = ggml_vk_tensor_subbuffer(ctx, qk);
+    // DEBUG: an input sharing memory with an output races inside the one dispatch (the allocator may reuse a
+    // buffer the unfused graph had finished reading): log every such overlap
+    {
+        auto ov = [](const vk_subbuffer & a, const vk_subbuffer & b) {
+            return a.buffer == b.buffer && a.offset < b.offset + b.size && b.offset < a.offset + a.size;
+        };
+        const vk_subbuffer * in[3]  = { &b_xt, &b_kern, &b_state };
+        const char * in_n[3]        = { "xt", "kern", "state" };
+        const vk_subbuffer * out[2] = { &b_dst, &b_qk };
+        const char * out_n[2]       = { "dst", "qk" };
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                if (ov(*in[a], *out[b])) {
+                    fprintf(stderr, "ggml_vulkan: CONCAT_SSM_CONV_SILU_L2 ALIAS %s [%zu,+%zu) overlaps %s [%zu,+%zu) at %s\n",
+                            in_n[a], (size_t) in[a]->offset, (size_t) in[a]->size, out_n[b], (size_t) out[b]->offset,
+                            (size_t) out[b]->size, dst->name);
+                }
+            }
+        }
+        if (ov(b_dst, b_qk)) {
+            fprintf(stderr, "ggml_vulkan: CONCAT_SSM_CONV_SILU_L2 ALIAS dst overlaps qk at %s\n", dst->name);
+        }
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {b_xt, b_kern, b_state, b_dst, b_qk}, pc, {nr, n_t, n_s});
     if (dbg_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
