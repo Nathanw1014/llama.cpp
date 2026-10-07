@@ -1,0 +1,173 @@
+#version 450
+
+// Sequential gated delta net for prefill with the state in registers (GGML_VK_GDN_SCAN=1), after Strata's
+// gdn_rec_quad_kernel (STRATA_GDN_HEAD): one workgroup is one value head x 32 state columns, four lanes per
+// column, lane g holding the column's rows 32g .. 32g + 31. A token's two reductions (k.S and q.S) meet through
+// a 4-lane clustered add, so the token loop has no barrier. The q/k rows, v, gate and beta are staged in LDS
+// HT tokens at a time, double-buffered, the next chunk loaded into registers while this one computes: one
+// barrier per HT tokens. S_v 128, scalar gate, final state only (K == 1); wave32 required.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+#define S_V 128
+#define COLS 32                 // state columns per workgroup
+#define NTH (COLS * 4)          // 128 threads: four lanes per column
+#define HT 4                    // tokens per staged chunk
+#define RS 36                   // row-group stride in LDS (32 rows + 4 pad: the four groups' reads hit different banks)
+
+layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint n_tokens;
+    uint n_seqs;
+    uint s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+};
+
+layout(binding = 0) readonly  buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly  buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly  buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly  buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly  buffer StateBuf { float data_state[]; };
+layout(binding = 6)           buffer DstBuf   { float data_dst[];   };
+
+shared float sk[2][HT][4 * RS];
+shared float sq[2][HT][4 * RS];
+shared float sv[2][HT][COLS];
+shared float sg[2][HT];
+shared float sb[2][HT];
+
+// per thread and chunk: 8 of the 2 x HT x 128 q/k values, one of the HT x 32 v values, gate / beta for HT threads
+float pf_qk[8];
+float pf_v;
+float pf_gb;
+
+void load_chunk(uint t0, uint head_id, uint seq_id, uint colblk, uint iq1, uint iq3, uint tid) {
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        const uint idx = tid + j * NTH;             // over [HT][q|k][128]
+        const uint tt  = idx / (2 * S_V);
+        const uint row = idx % S_V;
+        const uint t   = t0 + tt;
+        pf_qk[j] = 0.0f;
+        if (t < n_tokens) {
+            const uint off = iq3 * sq3 + t * sq2 + iq1 * sq1 + row;
+            pf_qk[j] = ((idx / S_V) % 2 == 0) ? data_k[off] : data_q[off];
+        }
+    }
+    {
+        const uint tt = tid / COLS;
+        const uint c  = tid % COLS;
+        const uint t  = t0 + tt;
+        pf_v = t < n_tokens ? data_v[seq_id * sv3 + t * sv2 + head_id * sv1 + colblk * COLS + c] : 0.0f;
+    }
+    pf_gb = 0.0f;
+    if (tid < 2 * HT) {
+        const uint tt = tid % HT;
+        const uint t  = t0 + tt;
+        if (t < n_tokens) {
+            const uint off = seq_id * sb3 + t * sb2 + head_id * sb1;
+            pf_gb = tid < HT ? exp(data_g[off]) : data_beta[off];
+        }
+    }
+}
+
+void store_chunk(uint buf, uint tid) {
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        const uint idx = tid + j * NTH;
+        const uint tt  = idx / (2 * S_V);
+        const uint row = idx % S_V;
+        const uint at  = (row / 32) * RS + row % 32;
+        if ((idx / S_V) % 2 == 0) {
+            sk[buf][tt][at] = pf_qk[j];
+        } else {
+            sq[buf][tt][at] = pf_qk[j];
+        }
+    }
+    sv[buf][tid / COLS][tid % COLS] = pf_v;
+    if (tid < HT) {
+        sg[buf][tid] = pf_gb;
+    } else if (tid < 2 * HT) {
+        sb[buf][tid - HT] = pf_gb;
+    }
+}
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint seq_id  = gl_WorkGroupID.y;
+    const uint colblk  = gl_WorkGroupID.z;
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint g       = tid % 4;               // row group
+    const uint cl      = tid / 4;               // column within the block
+    const uint col     = colblk * COLS + cl;
+
+    const uint iq1 = head_id % neq1;
+    const uint iq3 = seq_id / rq3;
+
+    const uint state_size = S_V * S_V;
+    const uint state_base = (seq_id * H + head_id) * state_size;
+
+    float s[32];
+    [[unroll]] for (uint r = 0; r < 32; r++) {
+        s[r] = data_state[state_base + col * S_V + g * 32 + r];
+    }
+
+    load_chunk(0, head_id, seq_id, colblk, iq1, iq3, tid);
+    store_chunk(0, tid);
+    barrier();
+
+    uint attn_off = (seq_id * n_tokens * H + head_id) * S_V + col;
+    const uint n_chunks = (n_tokens + HT - 1) / HT;
+
+    for (uint c = 0; c < n_chunks; c++) {
+        const uint buf = c % 2;
+        if (c + 1 < n_chunks) {
+            load_chunk((c + 1) * HT, head_id, seq_id, colblk, iq1, iq3, tid);
+        }
+        const uint nt = min(HT, n_tokens - c * HT);
+        for (uint tt = 0; tt < nt; tt++) {
+            const float gexp = sg[buf][tt];
+            const float beta = sb[buf][tt];
+            const float v    = sv[buf][tt][cl];
+
+            float k[32];
+            [[unroll]] for (uint r = 0; r < 32; r++) {
+                k[r] = sk[buf][tt][g * RS + r];
+            }
+            float kv = 0.0f;
+            [[unroll]] for (uint r = 0; r < 32; r++) {
+                s[r] *= gexp;
+                kv += s[r] * k[r];
+            }
+            kv = subgroupClusteredAdd(kv, 4);
+            const float delta = (v - kv) * beta;
+
+            float o = 0.0f;
+            [[unroll]] for (uint r = 0; r < 32; r++) {
+                s[r] += k[r] * delta;
+                o += s[r] * sq[buf][tt][g * RS + r];
+            }
+            o = subgroupClusteredAdd(o, 4);
+            if (g == 0) {
+                data_dst[attn_off] = o * scale;
+            }
+            attn_off += S_V * H;
+        }
+        if (c + 1 < n_chunks) {
+            store_chunk(1 - buf, tid);
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0; r < 32; r++) {
+        data_dst[s_off + state_base + col * S_V + g * 32 + r] = s[r];
+    }
+}

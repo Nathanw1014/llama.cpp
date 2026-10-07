@@ -24,6 +24,11 @@ layout (binding = 3) readonly buffer C {float data_c[];};
 // RMS_NORM + SCALE (the GDN q/k l2 norm): multiply by p.param2 on the store. The product is
 // rounded to f32 first, then scaled, the same two roundings as the separate SCALE op.
 layout (constant_id = 3) const bool do_post_scale = false;
+// RMS_NORM + MUL + SIGMOID + MUL + CPY(f16) (Flash-Next GDN output norm, GGML_VK_GDN_NORM_F16 / LLAMA_GDN_NORM_F16):
+// the second multiplier is read raw (z) and passed through sigmoid here, with unary.comp's op_sigmoid
+// expression, and the f16 variant of this shader stores the ssm_out GEMM's B operand directly. Idea from
+// Strata's GDN_NOY (only the f16 image the out projection consumes is written).
+layout (constant_id = 4) const bool do_sigmoid_c = false;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -57,7 +62,11 @@ void main() {
     if (do_multiply2) {
         for (uint col = lane; col < ncols; col += sgsize) {
             const FLOAT_TYPE g = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * g * FLOAT_TYPE(data_c[d_offset + col - get_doffset()]));
+            float c = data_c[d_offset + col - get_doffset()];
+            if (do_sigmoid_c) {
+                c = 1.0f / (1.0f + exp(-c));
+            }
+            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * g * FLOAT_TYPE(c));
         }
     } else if (do_multiply) {
         if (ncols > p.ne10) {

@@ -927,6 +927,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu.
+    // LLAMA_GDN_NORM_F16=1: emit RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan
+    // backend runs as one pass (RMS_NORM_MUL_SIGMUL_CPY) writing only the f16 B operand of ssm_out: no sigmoid
+    // pass, no f32 norm output and no B conversion in the GEMM (Strata's GDN_NOY). The GEMM's B was rounded to
+    // f16 before either way. Needs a backend that takes f16 B for the out projection (not the CPU).
+    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e != nullptr && atoi(e) != 0; }();
+    if (norm_f16) {
+        ggml_build_forward_expand(gf, gate);   // keep gate's own view nodes ahead of the chain
+        ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+        ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
+        return ggml_cast(ctx0, out, GGML_TYPE_F16);
+    }
     // The sigmoid is expanded first so the graph reads RMS_NORM, MUL(gamma), MUL(gate) back to back
     // and the Vulkan backend fuses the three (RMS_NORM_MUL_MUL) instead of a separate 50 MB pass.
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
@@ -1749,12 +1760,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // while writing the conv output, so the allocator must not hand the output the projection's freed bytes
     // (the backend's overlap check otherwise disables the fusion on every layer)
     ggml_build_forward_expand(gf, conv_output_silu);
-    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 1, 0));
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+
+    // LLAMA_GDN_CONV_L2=1: one l2 norm over the q and k heads together (they are the leading columns of the conv
+    // output), expanded right after the conv so the Vulkan backend runs conv + silu + norm as one pass
+    // (CONCAT_SSM_CONV_SILU_L2, Strata's GDN_CONVL2): the q/k columns are never written out and read back.
+    // q and k are then views of the normalised tensor. Same arithmetic as the two separate norms.
+    static const bool conv_l2 = [] { const char * e = getenv("LLAMA_GDN_CONV_L2"); return e != nullptr && atoi(e) != 0; }();
+    ggml_tensor * qk_norm = nullptr;
+    if (conv_l2) {
+        ggml_tensor * qk_view = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+        qk_norm = build_gdn_l2_norm(ctx0, qk_view, hparams.f_norm_rms_eps);
+        ggml_build_forward_expand(gf, qk_norm);
+    }
+    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 1, 0));
 
     // Extract the convolved Q, K, V from conv_output
     ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
@@ -1782,8 +1806,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (qk_norm) {
+        q_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], 0);
+        k_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], num_k_heads * qk_norm->nb[1]);
+    } else {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
 
 

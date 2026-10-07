@@ -4,6 +4,11 @@
 
 #include "types.glsl"
 
+#ifdef SSM_CONV_L2
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
@@ -27,9 +32,107 @@ layout(push_constant) uniform PushConstants {
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    // SSM_CONV_L2 only: channels [0, n_l2) are the GDN q/k heads (128 wide), written l2-normalised to qk
+    uint n_l2; float l2_eps; float l2_post;
 };
 
+#ifdef SSM_CONV_L2
+// CONCAT + SSM_CONV + SILU + VIEW(q|k) + RMS_NORM + SCALE (LLAMA_GDN_CONV_L2, Strata's GDN_CONVL2): one workgroup
+// is one 128-channel head by 16 tokens. q/k heads go only to qk ([128, n_l2/128, n_t, n_s], contiguous), already
+// scale(rms_norm(x, eps/n), 1/sqrt(n)); v channels go to dst as before and dst's q/k columns are left unwritten.
+// The per-token sum is rms_norm_small.comp's (lane-strided, then subgroupAdd), so the result is bit-identical.
+layout(binding = 4) writeonly buffer QK { float qk[]; };
+#define L2_TOKENS 16
+#define L2_HEAD 128
+shared float ysh[L2_TOKENS * L2_HEAD];
+shared float ssh[L2_TOKENS];
+#endif
+
 void main() {
+#ifdef SSM_CONV_L2
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const uint c  = gl_GlobalInvocationID.x;
+        const uint s  = gl_WorkGroupID.z;
+        const uint t0 = (gl_WorkGroupID.y * TOKENS_PER_WG + ly) * TOKENS_PER_THREAD;
+        const bool l2 = gl_WorkGroupID.x * L2_HEAD < n_l2;   // uniform per workgroup: n_l2 is a multiple of 128
+
+        float y[TOKENS_PER_THREAD];
+        [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+            y[i] = 0.0f;
+        }
+        if (c < nr && s < n_s) {
+            const uint xs      = nb01 / 4;
+            const uint x_base  = s * (nb02 / 4) + c;
+            const uint st_base = s * ncs * nr + c * ncs;
+            const uint k_base  = c * (nb11 / 4);
+            const vec4 w = vec4(src1[k_base], src1[k_base + 1], src1[k_base + 2], src1[k_base + 3]);
+            float win[3];
+            [[unroll]] for (uint i = 0; i < 3; i++) {
+                const int t = int(t0) + int(i) - 3;
+                if (t < 0) {
+                    win[i] = bias[st_base + uint(t + int(ncs))];
+                } else if (uint(t) < n_t) {
+                    win[i] = src0[x_base + uint(t) * xs];
+                } else {
+                    win[i] = 0.0f;
+                }
+            }
+            [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+                const uint t = t0 + i;
+                if (t >= n_t) {
+                    break;
+                }
+                const float v = src0[x_base + t * xs];
+                float sum = dot(vec4(win[0], win[1], win[2], v), w);
+                sum = sum / (1.0f + exp(-sum));
+                y[i] = sum;
+                if (!l2) {
+                    dst[s * (dst_nb2 / 4) + c + t * (dst_nb1 / 4)] = sum;
+                }
+                win[0] = win[1];
+                win[1] = win[2];
+                win[2] = v;
+            }
+        }
+        if (!l2) {
+            return;
+        }
+
+        [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+            ysh[(ly * TOKENS_PER_THREAD + i) * L2_HEAD + lx] = y[i];
+        }
+        barrier();
+        const uint ntok = TOKENS_PER_WG * TOKENS_PER_THREAD;
+        for (uint tt = gl_SubgroupID; tt < ntok; tt += gl_NumSubgroups) {
+            float sum = 0.0f;
+            for (uint col = gl_SubgroupInvocationID; col < L2_HEAD; col += gl_SubgroupSize) {
+                const float xi = ysh[tt * L2_HEAD + col];
+                sum += xi * xi;
+            }
+            sum = subgroupAdd(sum);
+            if (gl_SubgroupInvocationID == 0) {
+                ssh[tt] = sum;
+            }
+        }
+        barrier();
+        if (c >= nr || s >= n_s) {
+            return;
+        }
+        [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+            const uint t = t0 + i;
+            if (t >= n_t) {
+                break;
+            }
+            const float mean  = ssh[ly * TOKENS_PER_THREAD + i] / float(L2_HEAD);
+            const float scale = inversesqrt(mean + l2_eps);
+            const float yn = float(scale * y[i]);
+            qk[(s * n_t + t) * n_l2 + c] = yn * l2_post;
+        }
+        return;
+    }
+#endif
     if (DIRECT) {
         // one thread per (channel, TOKENS_PER_THREAD tokens); lanes run along channels so every x load and
         // dst store is a contiguous row segment. Kernel width is 4 (ncs = 3), checked by the fusion.

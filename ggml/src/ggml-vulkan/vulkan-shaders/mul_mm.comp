@@ -126,6 +126,7 @@ layout (push_constant) uniform parameter
     uint padded_N;
     uint use_row_lists;
     uint fusion_flags;
+    uint a2_boff;           // SWIGLU: byte offset from the gate weights (binding 0 base) to the up weights
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -326,14 +327,19 @@ void mm_compute_tile() {
 // as elements 0..15, lanes 16..31 a copy), so A never goes through shared memory and needs no barrier. B is staged
 // through shared memory as before. Aligned (prefetch) pipelines only; iq3_xxs for now.
 layout(constant_id = 15) const uint REG_A = 0;
+// SWIGLU (MUL_MAT_ID gate + up + GLU, REG_A == 3 only; host gate GGML_VK_MMID_SWIGLU): fragment 0 of a subgroup is
+// 16 gate rows, fragment 1 the same 16 rows of the up weights (a2_boff bytes further into binding 0), so the two
+// accumulators hold gate and up of the same outputs in the same layout. The epilogue stores silu(gate) * up only:
+// a tile covers BM / 2 output rows. After Strata's fused gate/up expert kernel.
+layout(constant_id = 16) const uint SWIGLU = 0;
 #if defined(MUL_MAT_ID) && defined(COOPMAT) && defined(BUF_MANUAL) && defined(A_PREFETCH) && LOAD_VEC_A == 8 && (defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ4_NL))
 #define MMID_REGA 1
 struct rega_raw_t { uvec4 q; uint d; };
 #if defined(DATA_A_IQ3_XXS)
 #define REGA_BLK_K 256
 // q.x: grid bytes 0..3, q.y: grid bytes 4..7, q.z: sign/scale dword, q.w: d bits (the lane's row, sub-block ib32)
-rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
-    const uint sb   = (pos_a / 32 + row_off) * 98;
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off, const uint boff) {
+    const uint sb   = (pos_a / 32 + row_off) * 98 + boff;
     const uint ib32 = (pos_a / 4) % 8;
     const uint q    = (sb + 2 + 8 * ib32) / 2;
     const uint so   = (sb + 66 + 4 * ib32) / 2;
@@ -345,8 +351,8 @@ rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
 #else
 #define REGA_BLK_K 32
 // q: the block's 16 nibble bytes (low nibbles k 0..15, high k 16..31), d: d bits
-rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
-    const uint base = (pos_a / 4 + row_off) * 18;
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off, const uint boff) {
+    const uint base = (pos_a / 4 + row_off) * 18 + boff;
     const bool odd  = ((base + 2) & 2) != 0;
     return rega_raw_t(uvec4(unpack8b(fetch8(base + 2), odd), unpack8b(fetch8(base + 10), odd)), uint(data_a_u16[base / 2]));
 }
@@ -468,7 +474,12 @@ void main() {
     const uint batch_idx_a = i03 * p.ne02 + i02;
 #endif
 
-    const uint blocks_m = (p.M + BM - 1) / BM;
+#ifdef MUL_MAT_ID
+    const uint BMR = SWIGLU != 0 ? BM / 2 : BM;   // rows of each A tensor per tile
+#else
+    const uint BMR = BM;
+#endif
+    const uint blocks_m = (p.M + BMR - 1) / BMR;
     uint ir = gl_WorkGroupID.x % blocks_m;
     uint ik = gl_WorkGroupID.x / blocks_m;
 #ifndef MUL_MAT_ID
@@ -574,7 +585,7 @@ void main() {
 #else
         batch_idx_a * (p.batch_stride_a / LOAD_VEC_A_EFF) +
 #endif
-        (ir * BM * p.stride_a + start_k) / LOAD_VEC_A_EFF;
+        (ir * BMR * p.stride_a + start_k) / LOAD_VEC_A_EFF;
 #ifdef MUL_MAT_ID
     uint pos_b = 0;
 #else
@@ -728,15 +739,18 @@ void main() {
     if (REG_A != 0 && prefetch) {
         if (REG_A == 3) {
             // WM == 32: lane half selects which of the subgroup's two 16-row blocks it loads
-            const uint rl = warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
-            const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / REGA_BLK_K) - ir * BM * (p.stride_a / REGA_BLK_K);
-            rega_raw_t a1 = rega_fetch(pos_a, row_off1);
+            // SWIGLU: both halves load the same 16 rows, lanes 16..31 from the up weights
+            const uint rl = SWIGLU != 0 ? warp_r * (WM / 2) + gl_SubgroupInvocationID % 16
+                                        : warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
+            const uint row_off1 = min(ir * BMR + rl, p.M - 1) * (p.stride_a / REGA_BLK_K) - ir * BMR * (p.stride_a / REGA_BLK_K);
+            const uint boff1 = (SWIGLU != 0 && gl_SubgroupInvocationID >= 16) ? p.a2_boff : 0u;
+            rega_raw_t a1 = rega_fetch(pos_a, row_off1, boff1);
             for (uint block = start_k; block < end_k; block += BK) {
                 [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
                 const bool more = block + BK < end_k;
                 pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
                 pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
-                const rega_raw_t a1n = rega_fetch(pos_a, row_off1);
+                const rega_raw_t a1n = rega_fetch(pos_a, row_off1, boff1);
                 [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
                 barrier();
                 rega_compute_split(a1);
@@ -750,7 +764,7 @@ void main() {
         [[unroll]] for (uint r = 0; r < cm_rows; r++) {
             row_off[r] = min(ir * BM + warp_r * WM + r * TM + gl_SubgroupInvocationID % 16, p.M - 1) * (p.stride_a / REGA_BLK_K)
                        - ir * BM * (p.stride_a / REGA_BLK_K);
-            a_cur[r] = rega_fetch(pos_a, row_off[r]);
+            a_cur[r] = rega_fetch(pos_a, row_off[r], 0u);
         }
         for (uint block = start_k; block < end_k; block += BK) {
             [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
@@ -758,7 +772,7 @@ void main() {
             pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
             pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
             rega_raw_t a_next[REGA_MAX_ROWS];
-            [[unroll]] for (uint r = 0; r < cm_rows; r++) { a_next[r] = rega_fetch(pos_a, row_off[r]); }
+            [[unroll]] for (uint r = 0; r < cm_rows; r++) { a_next[r] = rega_fetch(pos_a, row_off[r], 0u); }
             [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
             barrier();
             rega_compute(a_cur);
@@ -874,7 +888,11 @@ void main() {
 #endif
 #endif
 
+#ifdef MUL_MAT_ID
+    const uint dr = ir * BMR + warp_r * (SWIGLU != 0 ? WM / 2 : WM);
+#else
     const uint dr = ir * BM + warp_r * WM;
+#endif
     const uint dc = ic * BN + warp_c * WN;
 
 #ifndef MUL_MAT_ID
@@ -883,7 +901,20 @@ void main() {
 
 #ifdef COOPMAT
 #ifdef MUL_MAT_ID
-    [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+    if (SWIGLU != 0) {
+        // fragment 0 = gate, fragment 1 = up of the same rows: keep silu(gate) * up in fragment 0 (f32 math, the
+        // unfused GLU's expression)
+        [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> g = sums[cm_col * cms_per_row];
+            const coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> u = sums[cm_col * cms_per_row + 1];
+            [[unroll]] for (uint e = 0; e < g.length(); e++) {
+                const float gv = float(g[e]);
+                g[e] = ACC_TYPE(gv / (1.0f + exp(-gv)) * float(u[e]));
+            }
+            sums[cm_col * cms_per_row] = g;
+        }
+    }
+    [[unroll]] for (uint cm_row = 0; cm_row < (SWIGLU != 0 ? 1 : cms_per_row); cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
             coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
