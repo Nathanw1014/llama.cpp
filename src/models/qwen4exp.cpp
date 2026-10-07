@@ -1046,10 +1046,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_build_forward_expand(gf, gate);   // keep gate's own view nodes ahead of the chain
         ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
-        // LLAMA_GDN_NORM_PAD=N (default 128, 0 off): write the f16 rows with a stride of value_dim + N. value_dim 6144 f16 is
+        // LLAMA_GDN_NORM_PAD=N (default 0 = off; 10-07: 32/64/128 each win the K6144 GEMM by 15 ms but lose 2-4% e2e): write the f16 rows with a stride of value_dim + N. value_dim 6144 f16 is
         // 48 x 256 B, so packed every token row starts on the same DRAM channel for the ssm_out GEMM (Flash-Next q8_0
         // 2560x2048x6144: 40.8 TFLOPS from the padded staging copy, 31.7 reading the packed f16 rows directly)
-        static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 128; }();
+        static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 0; }();
         const int64_t row = out->ne[0] * out->ne[1];
         if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
             ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, row + pad, out->ne[2]);
