@@ -43,7 +43,7 @@ layout(push_constant) uniform PushConstants {
 // scale(rms_norm(x, eps/n), 1/sqrt(n)); v channels go to dst as before and dst's q/k columns are left unwritten.
 // The per-token sum is rms_norm_small.comp's (lane-strided, then subgroupAdd), so the result is bit-identical.
 layout(binding = 4) writeonly buffer QK { float qk[]; };
-#define L2_TOKENS 16
+#define L2_TOKENS 32   // the most tokens a workgroup covers (TOKENS_PER_WG * TOKENS_PER_THREAD: 16 or 32)
 #define L2_HEAD 128
 shared float ysh[L2_TOKENS * L2_HEAD];
 shared float ssh[L2_TOKENS];

@@ -1223,6 +1223,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;   // CONCAT(state, x^T) + SSM_CONV + SILU: reads x and the state directly
     vk_pipeline pipeline_ssm_conv_direct_silu_l2_f32;   // + the GDN q/k l2 norm, written to its own tensor
+    vk_pipeline pipeline_ssm_conv_direct_silu_l2w4_f32; // the same, 128 x 4 threads and 32 tokens per workgroup
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -7312,6 +7313,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 1, 8}, 1);
     // one 128-channel head x 16 tokens per workgroup (the shader's L2_HEAD / L2_TOKENS)
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_l2_f32, "ssm_conv_direct_silu_l2_f32", ssm_conv_l2_f32_len, ssm_conv_l2_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {128, 16, 1}, {128, 2, 0, 1, 1, 8}, 1);
+    // GGML_VK_SSM_CONV_L2_WG=4: 32 tokens per workgroup, the plain direct conv's token blocking (16 KB of shared memory)
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_l2w4_f32, "ssm_conv_direct_silu_l2w4_f32", ssm_conv_l2_f32_len, ssm_conv_l2_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {128, 32, 1}, {128, 4, 0, 1, 1, 8}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -17519,7 +17522,8 @@ static void ggml_vk_ssm_conv_direct_l2(ggml_backend_vk_context * ctx, vk_context
     const uint32_t n_t = (uint32_t) dst->ne[1];
     const uint32_t n_s = (uint32_t) dst->ne[2];
 
-    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_direct_silu_l2_f32;
+    static const int l2_wg = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_WG"); return e ? atoi(e) : 2; }();
+    vk_pipeline pipeline = l2_wg == 4 ? ctx->device->pipeline_ssm_conv_direct_silu_l2w4_f32 : ctx->device->pipeline_ssm_conv_direct_silu_l2_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     static bool logged = false;
     if (!logged) {
