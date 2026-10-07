@@ -47,6 +47,17 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // LLAMA_MERGE_GATE_UP: a tensor assembled from two file tensors, n_blk blocks of blk bytes each, interleaved
+        // [a block 0 | b block 0 | a block 1 | ...] (per expert: the gate rows, then the up rows)
+        uint16_t idx2   = 0;
+        size_t   offs2  = 0;
+        size_t   blk    = 0;
+        int64_t  n_blk  = 0;
+        bool     merged = false;
+
+        llama_tensor_weight(ggml_tensor * tensor, const llama_tensor_weight & a, const llama_tensor_weight & b, size_t blk, int64_t n_blk)
+            : idx(a.idx), offs(a.offs), tensor(tensor), idx2(b.idx), offs2(b.offs), blk(blk), n_blk(n_blk), merged(true) {}
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -106,6 +117,7 @@ struct llama_model_loader {
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
+    ggml_context_ptr merged_meta_ctx;   // LLAMA_MERGE_GATE_UP: the merged tensors' metadata
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);

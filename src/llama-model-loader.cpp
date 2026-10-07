@@ -710,6 +710,44 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // LLAMA_MERGE_GATE_UP=1: present each layer's separate gate / up expert tensors as one ffn_gate_up_exps
+    // (per expert the gate rows, then the up rows), so build_moe_ffn takes its merged path: one MUL_MAT_ID reads
+    // the activations once for both. Only where both have one type and shape and there are no biases. The merged
+    // tensor is filled from the two file tensors at load; it cannot live in an mmap-aliased host buffer.
+    if (const char * e = getenv("LLAMA_MERGE_GATE_UP"); e != nullptr && atoi(e) != 0) {
+        const std::string sfx_gate = ".ffn_gate_exps.weight";
+        std::vector<std::string> prefixes;
+        for (const auto & it : weights_map) {
+            const std::string & n = it.first;
+            if (n.size() > sfx_gate.size() && n.compare(n.size() - sfx_gate.size(), sfx_gate.size(), sfx_gate) == 0) {
+                prefixes.push_back(n.substr(0, n.size() - sfx_gate.size()));
+            }
+        }
+        merged_meta_ctx.reset(ggml_init({ prefixes.size() * ggml_tensor_overhead(), nullptr, true }));
+        int n_merged = 0;
+        for (const std::string & pfx : prefixes) {
+            const std::string ng = pfx + sfx_gate, nu = pfx + ".ffn_up_exps.weight", ngu = pfx + ".ffn_gate_up_exps.weight";
+            auto ig = weights_map.find(ng), iu = weights_map.find(nu);
+            if (iu == weights_map.end() || weights_map.count(ngu) || weights_map.count(pfx + ".ffn_gate_exps.bias") ||
+                weights_map.count(pfx + ".ffn_up_exps.bias")) {
+                continue;
+            }
+            const ggml_tensor * g = ig->second.tensor, * u = iu->second.tensor;
+            if (g->type != u->type || !ggml_are_same_shape(g, u) || g->ne[3] != 1 || !ggml_is_contiguous(g) || !ggml_is_contiguous(u)) {
+                continue;
+            }
+            ggml_tensor * t = ggml_new_tensor_3d(merged_meta_ctx.get(), g->type, g->ne[0], 2 * g->ne[1], g->ne[2]);
+            ggml_set_name(t, ngu.c_str());
+            const size_t blk = ggml_row_size(g->type, g->ne[0]) * g->ne[1];
+            const llama_tensor_weight wg = ig->second, wu = iu->second;
+            weights_map.erase(ng);
+            weights_map.erase(nu);
+            weights_map.emplace(ngu, llama_tensor_weight(t, wg, wu, blk, g->ne[2]));
+            n_merged++;
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_MERGE_GATE_UP: %d gate/up expert pairs merged into ffn_gate_up_exps\n", __func__, n_merged);
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1415,7 +1453,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || weight->idx != idx || weight->merged) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1425,6 +1463,9 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
+    if (w.merged) {
+        throw std::runtime_error(format("%s: LLAMA_MERGE_GATE_UP is a load-time layout, unset it for this tool", ggml_get_name(cur)));
+    }
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1575,6 +1616,33 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->merged) {
+            // LLAMA_MERGE_GATE_UP: assembled block by block from its two file tensors
+            if (cur->data == nullptr) {
+                throw std::runtime_error(format("LLAMA_MERGE_GATE_UP: %s would be an mmap alias of the file (host buffer); "
+                        "the merged layout needs its own buffer, unset LLAMA_MERGE_GATE_UP for this placement", ggml_get_name(cur)));
+            }
+            std::vector<uint8_t> tmp;
+            for (int64_t b = 0; b < weight->n_blk; ++b) {
+                for (int part = 0; part < 2; ++part) {
+                    const uint16_t idx  = part == 0 ? weight->idx  : weight->idx2;
+                    const size_t   offs = (part == 0 ? weight->offs : weight->offs2) + b * weight->blk;
+                    const void * src;
+                    if (use_mmap) {
+                        src = (const uint8_t *) mappings.at(idx)->addr() + offs;
+                    } else {
+                        tmp.resize(weight->blk);
+                        files.at(idx)->seek(offs, SEEK_SET);
+                        files.at(idx)->read_raw(tmp.data(), weight->blk);
+                        src = tmp.data();
+                    }
+                    ggml_backend_tensor_set(cur, src, (2 * b + part) * weight->blk, weight->blk);
+                }
+            }
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
