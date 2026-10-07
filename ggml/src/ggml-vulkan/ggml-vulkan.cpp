@@ -22046,6 +22046,15 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
 // MUL_MAT_ID(up|gate) + CPY(f16) + MUL_MAT_ID(gate|up) + CPY(f16) + GLU(swiglu): the MoE gate/up of build_moe_ffn with
 // separate weights, as one REG_A dispatch (mul_mm.comp SWIGLU). iq3_xxs only, f16 out; the dispatch falls back to the
 // three ops when the tile or the buffers do not fit. GGML_VK_MMID_SWIGLU=1 enables (off until validated).
+// a ggml_cast is a CPY whose src[1] is itself, which counts as one more use of the node: ggml_can_fuse_subgraph then
+// sees an interior cast used outside the subgraph and refuses (MUL_MAT_ID_SWIGLU never fused, 10-07). Check an
+// interior cast here instead: not an output, and used exactly n_uses times apart from that self-reference.
+static bool ggml_vk_interior_cast_uses(const struct ggml_cgraph * cgraph, int idx, int n_uses) {
+    const ggml_tensor * c = cgraph->nodes[idx];
+    return c->op == GGML_OP_CPY && (c->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+           ggml_node_get_use_count(cgraph, idx) == n_uses + (c->src[1] == c ? 1 : 0);
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
 static bool ggml_vk_can_fuse_mmid_swiglu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool enabled = [] { const char * e = getenv("GGML_VK_MMID_SWIGLU"); return e && atoi(e) != 0; }();
@@ -22068,8 +22077,12 @@ static bool ggml_vk_can_fuse_mmid_swiglu(const ggml_backend_vk_context * ctx, co
     if (!ctx->device->pipeline_mmid_swiglu_iq3xxs[0] && !ctx->device->pipeline_mmid_swiglu_iq3xxs[1]) {
         return reject("no swiglu pipeline (REG_A 3 + wave32 medium iq3_xxs required)");
     }
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU }, { node_idx + 4 })) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU },
+                                { node_idx + 1, node_idx + 3, node_idx + 4 })) {
         return reject("ggml_can_fuse_subgraph");
+    }
+    if (!ggml_vk_interior_cast_uses(cgraph, node_idx + 1, 1) || !ggml_vk_interior_cast_uses(cgraph, node_idx + 3, 1)) {
+        return reject("a cast has a use outside the swiglu");
     }
     const ggml_tensor * glu = n[4];
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
@@ -22108,7 +22121,9 @@ static bool ggml_vk_can_fuse_mmid_swiglu_merged(const ggml_backend_vk_context * 
         n[4]->op != GGML_OP_GLU) {
         return false;
     }
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { node_idx + 4 })) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU },
+                                { node_idx + 1, node_idx + 4 }) ||
+        !ggml_vk_interior_cast_uses(cgraph, node_idx + 1, 2)) {
         return false;
     }
     const ggml_tensor * mm = n[0], * cpy = n[1], * glu = n[4];
