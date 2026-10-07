@@ -2096,6 +2096,7 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     float    eps;
     uint32_t gate;               // HC_POST_GATE: post = gate_out*sigmoid(gate_in*p)
     float    gate_in, gate_out;
+    uint32_t sn2;                // f16 norm output token stride in elements
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 
@@ -10853,10 +10854,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool stage_f16 = ypad_f16b && !dense_f16b && src1->type == GGML_TYPE_F16 && ggml_vk_dim01_contiguous(src1) &&
                            ggml_is_quantized(src0->type) && ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                            ggml_vk_dense_ypad() != 0 && ggml_vk_dense_ypad_camps(ne10);
+    // an f16 B whose rows are packed but strided (LLAMA_HC_XN_PAD's padded hc xn): read in place through stride_b
+    // instead of copying it to a packed scratch, which would undo the pad
+    const bool y_rowstride = src1->type == GGML_TYPE_F16 && src1->nb[0] == sizeof(ggml_fp16_t) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                             !ggml_vk_dim01_contiguous(src1) && src1->nb[1] >= src1->ne[0] * sizeof(ggml_fp16_t) && src1->nb[1] % 16 == 0 &&
+                             src0->type != GGML_TYPE_BF16 && !ctx->device->coopmat2;
     const bool y_non_contig = dense_f16b || stage_f16 ||
                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+                              (!ggml_vk_dim01_contiguous(src1) && !y_rowstride);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
@@ -10910,7 +10916,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
     // GGML_VK_DENSE_YPAD: only the f16-B staging writes a layout we own
     const uint32_t y_row_pad = (dense_f16b || stage_f16) && ggml_vk_dense_ypad_camps(ne10) ? ggml_vk_dense_ypad() : 0u;
-    const uint64_t y_row     = ne10 + y_row_pad;
+    const uint64_t y_row     = y_rowstride ? src1->nb[1] / sizeof(ggml_fp16_t) : ne10 + y_row_pad;
     if (y_row_pad != 0) {
         static bool y_row_pad_logged = false;
         if (!y_row_pad_logged) {
@@ -11266,7 +11272,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
     bool batch_n = ne11 > 1;
 
-    const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
+    // an f16 A whose rows are packed but strided (LLAMA_HC_XN_PAD's padded hc xn, the inject mat-vec): mul_mat_vec.comp
+    // steps rows by p.stride_a, so it is read in place instead of copied to a packed scratch
+    const bool x_rowstride = src0->type == GGML_TYPE_F16 && src0->nb[0] == sizeof(ggml_fp16_t) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                             !ggml_vk_dim01_contiguous(src0) && src0->nb[1] >= src0->ne[0] * sizeof(ggml_fp16_t) && src0->nb[1] % 16 == 0;
+    const bool x_non_contig = !ggml_vk_dim01_contiguous(src0) && !x_rowstride;
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
@@ -11407,7 +11417,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     uint32_t stride_batch_y = batch_n ? ne10 : (ne10*ne11);
     uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
 
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
+    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant && !x_rowstride) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
 
@@ -11452,7 +11462,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
         uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)ne00, x_rowstride ? (uint32_t)(src0->nb[1] / sizeof(ggml_fp16_t)) : (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
@@ -17095,7 +17105,10 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
     if (mul->src[0] != rms || !ggml_node_has_n_uses(cgraph, node_idx + 2, 1) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
-    if (cpy->src[0] != mul || cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) || !ggml_are_same_shape(cpy, mul)) {
+    // the f16 output's rows within a token are packed; its token stride may be padded (LLAMA_HC_XN_PAD)
+    if (cpy->src[0] != mul || cpy->type != GGML_TYPE_F16 || !ggml_are_same_shape(cpy, mul) ||
+        cpy->nb[0] != sizeof(ggml_fp16_t) || cpy->nb[1] != cpy->ne[0] * sizeof(ggml_fp16_t) ||
+        cpy->nb[2] < cpy->nb[1] * cpy->ne[1] || cpy->nb[2] % 8 != 0 || cpy->ne[3] != 1) {
         return false;
     }
     const ggml_tensor * x = post->src[0], * res = post->src[1], * pw = post->src[2], * comb = post->src[3];
@@ -17209,6 +17222,7 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         gate_in ? 1u : 0u,
         gate_in ? ggml_get_op_params_f32(gate_in, 0) : 1.0f,
         gate_in ? ggml_get_op_params_f32(post->src[2], 0) : 1.0f,
+        (uint32_t)(cpy->nb[2] / ggml_type_size(cpy->type)),
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
@@ -21433,8 +21447,9 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         }
         const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
         const ggml_tensor *cpy = cgraph->nodes[node_idx + 2];
-        if (cpy->src[0] != mul || cpy->type != GGML_TYPE_F16 ||
-            !ggml_is_contiguous(cpy) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(cpy, mul)) {
+        // rows packed, the outer strides may be padded (LLAMA_HC_XN_PAD): rms_norm.comp stores through the dst strides
+        if (cpy->src[0] != mul || cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(mul) || !ggml_are_same_shape(cpy, mul) ||
+            cpy->nb[0] != sizeof(ggml_fp16_t) || !ggml_is_contiguous_rows(cpy)) {
             return false;
         }
         if (ctx->do_add_rms_partials) {

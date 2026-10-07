@@ -58,7 +58,8 @@ void rms_norm(uint num_iters) {
     // Per-row offset in shared memory
     uint32_t d_offset = 0;
 #else
-    uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
+    // destination strides (equal to the packed layout for a contiguous dst; LLAMA_HC_XN_PAD writes padded f16 rows)
+    uint32_t d_offset = samp*p.nb23 + channel*p.nb22 + row*p.nb21 + get_doffset();
 #endif
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 

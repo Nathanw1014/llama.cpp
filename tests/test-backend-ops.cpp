@@ -3654,6 +3654,62 @@ struct test_ssm_conv_direct_l2 : public test_case {
     }
 };
 
+// LLAMA_HC_XN_PAD: an f16 operand whose rows are packed but padded (a view of [k + pad, n]). mode 0: B of a
+// quantized GEMM (the hc down projection), mode 1: A of an f16 x f32 mat-vec (the hc inject), mode 2: the norm
+// writing it (RMS_NORM + MUL + CPY into the padded view, read back through the 2-D view)
+struct test_rowpad_f16 : public test_case {
+    const int mode;
+    const ggml_type type_a;
+    const int64_t m, n, k, pad;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ROWPAD_F16";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(mode, type_a, m, n, k, pad);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rowpad_f16(int mode = 0, ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 320, int64_t n = 64, int64_t k = 1024, int64_t pad = 128)
+        : mode(mode), type_a(type_a), m(m), n(n), k(k), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k + pad, n);
+        ggml_set_name(buf, "buf");
+        ggml_tensor * out;
+        if (mode == 2) {
+            // k = n_embd * 4 streams
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / 4, 4, n);
+            ggml_set_name(x, "x");
+            ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k / 4, 4);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * dst = ggml_view_3d(ctx, buf, k / 4, 4, n, (k / 4) * ggml_element_size(buf), buf->nb[1], 0);
+            ggml_tensor * xn = ggml_cpy(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma), dst);
+            out = ggml_cast(ctx, ggml_view_2d(ctx, xn, k, n, xn->nb[2], 0), GGML_TYPE_F32);
+        } else {
+            ggml_tensor * v = ggml_view_2d(ctx, buf, k, n, buf->nb[1], 0);
+            if (mode == 0) {
+                ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+                ggml_set_name(a, "a");
+                out = ggml_mul_mat(ctx, a, v);
+            } else {
+                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+                ggml_set_name(b, "b");
+                out = ggml_mul_mat(ctx, v, b);
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // RMS_NORM + MUL(weight) + MUL(gate), short rows (Vulkan fuses the three: the qwen4exp gated GDN norm)
 struct test_rms_norm_mul_mul : public test_case {
     const std::array<int64_t, 4> ne;
@@ -4501,17 +4557,18 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
     bool run_whole_graph() override { return true; }
 
     const bool gated;   // post = 2*sigmoid(post/hc) as qwen4exp builds it (Vulkan HC_POST_GATE_NORM_CPY)
+    const int64_t pad;  // LLAMA_HC_XN_PAD: the f16 output is a view of [n_embd*hc + pad, n_tokens]
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_tokens, gated);
+        return VARS_TO_STR4(n_embd, n_tokens, gated, pad);
     }
 
     double max_nmse_err() override {
         return 1e-4;   // f16 norm output
     }
 
-    test_dsv4_hc_post_norm(int64_t n_embd = 31, int64_t n_tokens = 17, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
+    test_dsv4_hc_post_norm(int64_t n_embd = 31, int64_t n_tokens = 17, bool gated = false, int64_t pad = 0)
+        : n_embd(n_embd), n_tokens(n_tokens), gated(gated), pad(pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4530,7 +4587,14 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
             post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
         }
         ggml_tensor * res_out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
-        ggml_tensor * xn = ggml_cast(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, res_out, 1e-6f), gamma), GGML_TYPE_F16);
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, res_out, 1e-6f), gamma);
+        ggml_tensor * xn;
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd * hc + pad, n_tokens);
+            xn = ggml_cpy(ctx, normed, ggml_view_3d(ctx, buf, n_embd, hc, n_tokens, n_embd * ggml_element_size(buf), buf->nb[1], 0));
+        } else {
+            xn = ggml_cast(ctx, normed, GGML_TYPE_F16);
+        }
         // the fused kernel writes both; check both through one output
         out = ggml_add(ctx, res_out, ggml_cast(ctx, xn, GGML_TYPE_F32));
         ggml_set_name(out, "out");
@@ -9531,6 +9595,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mul({100, 3, 5, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 9, 1}));
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q8_0, 320, 64, 1024, 128));
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q8_0, 320, 512, 10240, 128));  // the hc down shape
+    test_cases.emplace_back(new test_rowpad_f16(0, GGML_TYPE_Q4_K, 256, 33, 2048, 64));
+    test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 64, 1024, 128));       // the hc inject shape
+    test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 300, 10240, 128));
+    test_cases.emplace_back(new test_rowpad_f16(2, GGML_TYPE_F32, 0, 33, 1024, 128));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, false, 128));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, true, 64));
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 16, 4, 256, 512, 512));
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 16, 4, 200, 512, 512));   // partial last row tile
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 320, 10, 640, 2048, 2560)); // the Flash-Next shape

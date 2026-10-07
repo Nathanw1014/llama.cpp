@@ -609,6 +609,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8): give the f16 xn rows a stride of hc_dim + N. hc_dim 10240 f16 is
+    // 80 x 256 B, so unpadded every token row starts on the same DRAM channel of 16 for the down GEMM, the inject
+    // mat-vec and the mix, which all read xn row-strided (Strata pads the same buffer: K + 64). The norm writes the
+    // padded rows directly (RMS_NORM_MUL_CPY with a row-strided destination); the consumers take the stride.
+    static const int64_t xn_pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 0; }();
+    bool xn_padded = false;
     if (qwen4exp_hc_norm3d()) {
         // Apply gamma in the [n_embd, hc, nt] shape so the graph is RMS_NORM directly followed by MUL
         // and the backend fuses them (Vulkan RMS_NORM_MUL); a RESHAPE node between the two blocks the
@@ -622,7 +628,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             // before the reshape: the cast must directly follow the MUL for the backend fusion.
             // prefill only (nt >= 32): at decode the f16-B mat-vec paths are slower than the f32 ones
             // and there is no conversion pass to save (2026-09-14: tg 27.2 -> 25.2 with the cast at N=1)
-            xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+            if (xn_pad > 0) {
+                ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, hc_dim + xn_pad, nt);
+                ggml_tensor * dst = ggml_view_3d(ctx0, buf, n_embd, hc, nt,
+                        n_embd * ggml_element_size(buf), buf->nb[1], 0);
+                xn = ggml_cpy(ctx0, xn, dst);
+                xn_padded = true;
+            } else {
+                xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+            }
             if (x->op == GGML_OP_DSV4_HC_POST && qwen4exp_hc_keep_srcs()) {
                 // the combine's inputs stay allocated until the cast is (see qwen4exp_hc_keep_srcs)
                 for (int s = 0; s < 3; ++s) {
@@ -630,7 +644,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 }
             }
         }
-        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        // a view of the copy (not of the buffer) so every consumer depends on the write
+        xn = xn_padded ? ggml_view_2d(ctx0, xn, hc_dim, nt, xn->nb[2], 0) : ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     } else {
         xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
         xn = ggml_mul(ctx0, xn, w_norm);
@@ -672,7 +687,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 }
             }
         }
-        mixed = ggml_dsv4_hc_mix_ext(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), gate_logits, 1.0f / (float) hc, mix_type, gate_il);
+        ggml_tensor * xn3 = xn_padded ? ggml_view_3d(ctx0, xn, n_embd, hc, nt, n_embd * ggml_element_size(xn), xn->nb[1], 0)
+                                      : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt);
+        mixed = ggml_dsv4_hc_mix_ext(ctx0, xn3, gate_logits, 1.0f / (float) hc, mix_type, gate_il);
         cb(mixed, "hc_mixed", il);
         if (gate_il && gate_logits->op == GGML_OP_CPY) {
             // HC_UP_MIX reads the low-rank input in the GEMM while its epilogue writes the mixed stream: keep lo

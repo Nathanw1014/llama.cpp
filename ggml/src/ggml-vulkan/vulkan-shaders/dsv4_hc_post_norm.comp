@@ -35,6 +35,7 @@ layout(push_constant) uniform Parameters {
     uint  gate;           // HC_POST_GATE fusion: post = gate_out * sigmoid(gate_in * p) (qwen4exp scatter weights)
     float gate_in;
     float gate_out;
+    uint  sn2;            // f16 norm output token stride (elements): hc * n_embd packed, more with LLAMA_HC_XN_PAD
 } p;
 
 // vec4 everywhere: n_embd % 4 == 0 and every operand has element stride 1 (host-checked), so the
@@ -58,6 +59,7 @@ void main() {
         pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
     }
     const uint  ob  = ((t * p.hc + h) * p.n_embd) / 4;   // contiguous [n_embd, hc, n_tokens] outputs, vec4 index
+    const uint  nb  = (t * p.sn2 + h * p.n_embd) / 4;   // the f16 norm output, rows of a token packed
     const uint  xb  = (t * p.sx1) / 4;
     const uint  rb  = (h * p.sr1 + t * p.sr2) / 4;
     const uint  gb  = (h * p.sg1) / 4;
@@ -88,7 +90,7 @@ void main() {
     [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
         const uint i4 = tid + k * 256;
         if (i4 < nv4) {
-            data_n[ob + i4] = f16vec4(v[k] * scale * data_g[gb + i4]);
+            data_n[nb + i4] = f16vec4(v[k] * scale * data_g[gb + i4]);
         }
     }
 }
