@@ -420,6 +420,8 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
+    // far below any KV-sized scratch, so small buffers are never rounded
+    static const size_t POOL_POW2_MIN_SIZE = 4ull*1024*1024;
 
     int device;
     struct ggml_cuda_buffer {
@@ -459,6 +461,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 #endif
         size_t best_diff = 1ull << 36;
         int ibest = -1;
+        size_t largest_unusable = 0;
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr != nullptr) {
@@ -466,7 +469,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 ++nnz;
                 if (b.size > max_size) max_size = b.size;
 #endif
-                if (b.size >= size) {
+                if (b.size < size) {
+                    if (b.size > largest_unusable) largest_unusable = b.size;
+                } else {
                     size_t diff = b.size - size;
                     if (diff < best_diff) {
                         best_diff = diff;
@@ -493,6 +498,20 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
+        const size_t exact_size = look_ahead_size;
+        // Nothing cached can serve this request, and a cached block smaller than it
+        // never will, so a caller that grows its request step by step strands one block
+        // per step. A largest cached block just below the request is that signature:
+        // round up to a power of two so the series reuses one block per octave instead.
+        if (size > POOL_POW2_MIN_SIZE && largest_unusable >= size - size/4) {
+            size_t pow2 = POOL_POW2_MIN_SIZE;
+            while (pow2 < size && pow2 <= SIZE_MAX/2) {
+                pow2 *= 2;
+            }
+            if (pow2 >= size) {
+                look_ahead_size = pow2;
+            }
+        }
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
@@ -502,6 +521,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
+            look_ahead_size = exact_size;   // retry without the rounding
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
@@ -7016,7 +7036,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
             }
-            for (int i = 0; i < cgraph->n_nodes; ++i) {   // the HC gate GEMM feeding only the fused mix keeps its BF16 epilogue
+            // HC gate GEMM read only by the stream mix right after it. If the fused gate mix refuses, hc_mix_reduce reads the F32
+            // gate unless it finds BF16 copies of both inputs. So drop the F32 output only when both copies are expected: this
+            // GEMM's gate copy, and the xn copy from the last combine-norm. A layer-0 mix has no combine-norm and keeps the F32 gate.
+            const ggml_tensor * cn_xn = nullptr;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_cuda_hc_combine_norm_args ca;
+                if (ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false) > 0) cn_xn = ca.out_xn;
                 const ggml_tensor * t = cgraph->nodes[i];
                 if (t->op != GGML_OP_MUL_MAT || t->src[0]->ne[0] != 320 || t->src[0]->ne[1] != 10240 || !ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                 bool ok = true; int nread = 0;
@@ -7024,7 +7050,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     const ggml_tensor * u = cgraph->nodes[n];
                     if (!reads(u, t)) continue;
                     ++nread;
-                    if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t) continue; }
+                    if (n == i + 1 && cn_xn && u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) {
+                        ggml_cuda_hc_mix_args ma;
+                        if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t && (ma.xn == cn_xn || ma.xn->view_src == cn_xn)) continue;
+                    }
                     ok = false;
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, t);
