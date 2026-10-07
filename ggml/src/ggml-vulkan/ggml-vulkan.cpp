@@ -22021,8 +22021,7 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
 static bool ggml_vk_can_fuse_mmid_swiglu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool enabled = [] { const char * e = getenv("GGML_VK_MMID_SWIGLU"); return e && atoi(e) != 0; }();
-    if (!enabled || (!ctx->device->pipeline_mmid_swiglu_iq3xxs[0] && !ctx->device->pipeline_mmid_swiglu_iq3xxs[1]) ||
-        node_idx + 5 > cgraph->n_nodes) {
+    if (!enabled || node_idx + 5 > cgraph->n_nodes) {
         return false;
     }
     ggml_tensor * const * n = cgraph->nodes + node_idx;
@@ -22030,26 +22029,42 @@ static bool ggml_vk_can_fuse_mmid_swiglu(const ggml_backend_vk_context * ctx, co
         n[3]->op != GGML_OP_CPY || n[4]->op != GGML_OP_GLU) {
         return false;
     }
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU }, { node_idx + 4 })) {
+    // the op sequence matched: say once per reason why it does not fuse (tbo and the model never fused, 10-07)
+    auto reject = [](const char * why) {
+        static std::set<std::string> seen;
+        if (seen.insert(why).second) {
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID_SWIGLU rejected: %s\n", why);
+        }
         return false;
+    };
+    if (!ctx->device->pipeline_mmid_swiglu_iq3xxs[0] && !ctx->device->pipeline_mmid_swiglu_iq3xxs[1]) {
+        return reject("no swiglu pipeline (REG_A 3 + wave32 medium iq3_xxs required)");
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU }, { node_idx + 4 })) {
+        return reject("ggml_can_fuse_subgraph");
     }
     const ggml_tensor * glu = n[4];
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
         glu->type != GGML_TYPE_F16 || !ggml_is_contiguous(glu)) {
-        return false;
+        return reject("glu op / swapped / type / layout");
     }
     if (n[1]->src[0] != n[0] || n[3]->src[0] != n[2] || n[1]->type != GGML_TYPE_F16 || n[3]->type != GGML_TYPE_F16 ||
         !((glu->src[0] == n[1] && glu->src[1] == n[3]) || (glu->src[0] == n[3] && glu->src[1] == n[1]))) {
-        return false;
+        return reject("cast wiring / types");
     }
     const ggml_tensor * gate = glu->src[0]->src[0];
     const ggml_tensor * up   = glu->src[1]->src[0];
-    if (gate->src[1] != up->src[1] || gate->src[2] != up->src[2] || gate->src[0]->type != GGML_TYPE_IQ3_XXS ||
-        up->src[0]->type != GGML_TYPE_IQ3_XXS || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
-        !ggml_are_same_shape(gate, glu)) {
-        return false;
+    if (gate->src[1] != up->src[1] || gate->src[2] != up->src[2]) {
+        return reject("gate and up read different B / ids");
     }
-    return !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) && !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx + 2);
+    if (gate->src[0]->type != GGML_TYPE_IQ3_XXS || up->src[0]->type != GGML_TYPE_IQ3_XXS || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+        !ggml_are_same_shape(gate, glu)) {
+        return reject("weight types / shapes");
+    }
+    if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) || ggml_vk_use_mul_mat_vec_id(cgraph, node_idx + 2)) {
+        return reject("mat-vec MUL_MAT_ID");
+    }
+    return true;
 }
 
 // the merged gate|up layout (LLAMA_MERGE_GATE_UP or a GGUF with ffn_gate_up_exps): MUL_MAT_ID + CPY(f16) + VIEW(gate,
