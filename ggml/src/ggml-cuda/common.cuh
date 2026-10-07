@@ -1132,6 +1132,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+#ifdef GGML_USE_TRELLIS
 // Trellis types (TQ2_T, TQK6, TQK7): 128 weights per block, 32 trellis steps of 4 weights.
 // qi counts steps (one step pairs with one int of q8_1 values); see tq.cuh.
 #define QR_TQ 4
@@ -1161,6 +1162,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_TQK7> {
     static constexpr int qi = QI_TQ;
     static constexpr int bs = sizeof(block_tqk7);
 };
+#endif // GGML_USE_TRELLIS
 
 //////////////////////
 

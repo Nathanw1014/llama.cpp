@@ -110,7 +110,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
-            size_t n_blocks = fast_init ? fast_init_blocks : n_blocks_all;
+            size_t n_blocks = nels / blck_size;
+            if (fast_init) {
+                n_blocks = fast_init_blocks;
+            }
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
@@ -9655,10 +9658,12 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
+#ifdef GGML_USE_TRELLIS
     GGML_TYPE_PTQ1_0,
     GGML_TYPE_TQ2_T,
     GGML_TYPE_TQK6,
     GGML_TYPE_TQK7,
+#endif
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
@@ -9675,10 +9680,12 @@ static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
+#ifdef GGML_USE_TRELLIS
     GGML_TYPE_PTQ1_0,
     GGML_TYPE_TQ2_T,
     GGML_TYPE_TQK6,
     GGML_TYPE_TQK7,
+#endif
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
@@ -9692,10 +9699,12 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
+#ifdef GGML_USE_TRELLIS
     GGML_TYPE_PTQ1_0,
     GGML_TYPE_TQ2_T,
     GGML_TYPE_TQK6,
     GGML_TYPE_TQK7,
+#endif
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
@@ -10711,6 +10720,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+#ifdef GGML_USE_TRELLIS
     // PTQ has independent scales every 128 elements and a two-byte qh tail.
     // Exercise odd block counts, partial output tiles, and batched row offsets
     // through both matvec and matmul, including non-contiguous weight views.
@@ -10747,6 +10757,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+#endif // GGML_USE_TRELLIS
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -10963,6 +10974,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
 
+#ifdef GGML_USE_TRELLIS
     // Trellis types in a small Flash-Next-like MoE (10 of 32 experts; gate/up-like k = 640 = 5 blocks,
     // down-like m = 640): mat-vec (n <= 8, incl. the multi-token MoE kernel), the n = 9 / 32 fallback
     // through the dequant + BLAS path, and the fused gate/up mat-vec.
@@ -10988,6 +11000,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640, 1));
         }
     }
+#endif // GGML_USE_TRELLIS
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
@@ -12287,6 +12300,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+#ifdef GGML_USE_TRELLIS
     // qwen3.8-flash-next routed experts (512 experts, 10 used): gate/up k=2560 -> m=640, down k=640 -> m=2560.
     // Trellis types against the K/IQ types they replace; 32..512 are prefill batches.
     for (int bs : {1, 2, 4, 32, 128, 512}) {
@@ -12304,6 +12318,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, bs, 640));
         }
     }
+#endif // GGML_USE_TRELLIS
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
