@@ -11,6 +11,11 @@ layout (push_constant) uniform parameter
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+    // GGML_VK_MMID_INDIRECT_EARLY: when args_off != 0, fold ceil(count / bn) into the matmul's dispatch args at
+    // data_d[args_off] (y zeroed by the host before this pass): one workgroup per expert knows its whole count
+    uint32_t args_off;
+    uint32_t gx;
+    uint32_t bn;
 } p;
 
 #define BLOCK_SIZE 256
@@ -18,7 +23,7 @@ layout (push_constant) uniform parameter
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {uint data_a[];};
-layout (binding = 1) writeonly buffer D {uint data_d[];};
+layout (binding = 1) buffer D {uint data_d[];};
 
 shared uint vals[BLOCK_SIZE];
 
@@ -47,5 +52,12 @@ void main() {
 
     if (tid == 0) {
         data_d[expert_id] = vals[0];
+        if (p.args_off != 0) {
+            atomicMax(data_d[p.args_off + 1], (vals[0] + p.bn - 1) / p.bn);
+            if (expert_id == 0) {
+                data_d[p.args_off]     = p.gx;
+                data_d[p.args_off + 2] = gl_NumWorkGroups.x;
+            }
+        }
     }
 }

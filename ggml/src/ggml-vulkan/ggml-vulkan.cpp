@@ -1566,6 +1566,9 @@ struct vk_op_count_experts_push_constants {
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+    uint32_t args_off;   // GGML_VK_MMID_INDIRECT_EARLY: where to fold the matmul's dispatch args (0 = off)
+    uint32_t gx;
+    uint32_t bn;
 };
 
 struct vk_op_mmid_row_lists_push_constants {
@@ -12195,6 +12198,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     auto mmid_gate = [&](int mode) { return mode == 2 || (mode == 1 && mmid_gx >= mmid_ind_min_gx); };
     const bool use_tile_list = mmid_gate(mmid_tilelist) && use_row_lists && !quantize_y;
     const bool use_indirect = (mmid_gate(mmid_indirect) || use_tile_list) && use_row_lists;
+    // GGML_VK_MMID_INDIRECT_EARLY=1: the count pass writes the args (one workgroup per expert has its whole count), so
+    // the indirect-read barrier follows the count pass and the row-list pass gets the ordinary one. Not with the tile
+    // list, which needs the per-expert prefix sum. GGML_VK_MMID_INDIRECT_PROBE=1 (indirect off): the indirect-read
+    // barrier with a direct dispatch, to price the barrier on its own.
+    static const bool mmid_ind_early = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT_EARLY"); return e && atoi(e) != 0; }();
+    static const bool mmid_ind_probe = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT_PROBE"); return e && atoi(e) != 0; }();
+    const bool use_ind_early = mmid_ind_early && use_indirect && !use_tile_list;
     const uint32_t args_off = (uint32_t)(3 * n_as + 1 + nei0 * nei1);
     const uint32_t tile_off = args_off + 4;
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
@@ -12290,12 +12300,20 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (ctx->prealloc_split_k_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
+    if (use_ind_early) {
+        // the y slot starts at 0 for the count pass's atomicMax
+        ggml_vk_buffer_memset_async(subctx, ctx->prealloc_split_k, expert_count_buf.offset + sizeof(uint32_t) * (args_off + 1), 0, sizeof(uint32_t));
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
     {
         const std::vector<uint32_t> pc = { (uint32_t)nei0,
                                            (uint32_t)nei1,
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
                                            (uint32_t)(nbi1 / ggml_type_size(ids->type)),
-                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)) };
+                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                           use_ind_early ? args_off : 0u,
+                                           mmid_gx,
+                                           pipeline->wg_denoms[1] };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { (uint32_t)n_as, 1, 1});
     }
@@ -12347,7 +12365,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ctx->prealloc_y_last_row_pad = 0;
         }
     }
-    ggml_vk_sync_buffers(ctx, subctx);
+    if (use_ind_early) {
+        ggml_vk_sync_indirect(ctx, subctx);
+    } else {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
 
     if (use_row_lists) {
         // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists
@@ -12357,13 +12379,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(nbi1 / ggml_type_size(ids->type)),
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
-                                           use_indirect ? args_off : 0u,
+                                           use_indirect && !use_ind_early ? args_off : 0u,
                                            CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]),
                                            pipeline->wg_denoms[1],
                                            use_tile_list ? tile_off : 0u };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
-        if (use_indirect) {
+        if ((use_indirect && !use_ind_early) || (mmid_ind_probe && !use_indirect)) {
             ggml_vk_sync_indirect(ctx, subctx);
         } else {
             ggml_vk_sync_buffers(ctx, subctx);
