@@ -34,6 +34,7 @@ layout(push_constant) uniform PushConstants {
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
     // SSM_CONV_L2 only: channels [0, n_l2) are the GDN q/k heads (128 wide), written l2-normalised to qk
     uint n_l2; float l2_eps; float l2_post;
+    uint l2_write_all;   // DEBUG (GGML_VK_SSM_CONV_L2_WRITEALL): also store the q|k columns of the conv output
 };
 
 #ifdef SSM_CONV_L2
@@ -88,7 +89,7 @@ void main() {
                 float sum = dot(vec4(win[0], win[1], win[2], v), w);
                 sum = sum / (1.0f + exp(-sum));
                 y[i] = sum;
-                if (!l2) {
+                if (!l2 || l2_write_all != 0) {
                     dst[s * (dst_nb2 / 4) + c + t * (dst_nb1 / 4)] = sum;
                 }
                 win[0] = win[1];

@@ -2166,6 +2166,7 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
     uint32_t n_l2; float l2_eps; float l2_post;   // CONCAT_SSM_CONV_SILU_L2 only
+    uint32_t l2_write_all;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -17442,6 +17443,9 @@ static void ggml_vk_ssm_conv_direct_l2(ggml_backend_vk_context * ctx, vk_context
     pc.n_l2    = (uint32_t) (view->ne[0] * view->ne[1]);
     pc.l2_eps  = ggml_get_op_params_f32(rms, 0);
     pc.l2_post = ggml_get_op_params_f32(qk, 0);
+    // DEBUG GGML_VK_SSM_CONV_L2_WRITEALL=1: store the conv output's q|k columns too (the fused path leaves them unwritten)
+    static const bool write_all = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2_WRITEALL"); return e && atoi(e) != 0; }();
+    pc.l2_write_all = write_all ? 1u : 0u;
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, xt), ggml_vk_tensor_subbuffer(ctx, kern),
