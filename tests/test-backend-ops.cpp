@@ -5406,6 +5406,54 @@ struct test_mul_mat_id_swiglu : public test_case {
     }
 };
 
+// merged gate|up weights (ffn_gate_up_exps, LLAMA_MERGE_GATE_UP): MUL_MAT_ID + CPY(f16) + VIEW(gate half) +
+// VIEW(up half) + GLU(swiglu), as build_moe_ffn's merged path emits it (Vulkan MUL_MAT_ID_SWIGLU_MERGED)
+struct test_mul_mat_id_swiglu_merged : public test_case {
+    const ggml_type type_a;
+    const int n_mats, n_used;
+    const int64_t m, n, k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SWIGLU_MERGED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_swiglu_merged(ggml_type type_a = GGML_TYPE_IQ3_XXS, int n_mats = 16, int n_used = 4, int64_t m = 256, int64_t n = 512, int64_t k = 512)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type_a, k, 2 * m, n_mats);   // per expert: m gate rows, then m up rows
+        ggml_set_name(w, "gate_up_w");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);   // f32: the CPU reference takes no f16 B
+        ggml_set_name(b, "b");
+        ggml_tensor * gu   = ggml_cast(ctx, ggml_mul_mat_id(ctx, w, b, ids), GGML_TYPE_F16);
+        ggml_tensor * gate = ggml_view_3d(ctx, gu, m, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gu, m, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], m * ggml_element_size(gu));
+        ggml_tensor * out  = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -9617,6 +9665,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, false, 128));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, true, 64));
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 16, 4, 256, 512, 512));
+    test_cases.emplace_back(new test_mul_mat_id_swiglu_merged(GGML_TYPE_IQ3_XXS, 16, 4, 256, 512, 512));
+    test_cases.emplace_back(new test_mul_mat_id_swiglu_merged(GGML_TYPE_IQ3_XXS, 16, 4, 192, 512, 512));
+    test_cases.emplace_back(new test_mul_mat_id_swiglu_merged(GGML_TYPE_IQ3_XXS, 320, 10, 640, 2048, 2560)); // the Flash-Next shape
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 16, 4, 200, 512, 512));   // partial last row tile
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 320, 10, 640, 2048, 2560)); // the Flash-Next shape
     test_cases.emplace_back(new test_ssm_conv_direct_l2(4, 256, 37, 1));

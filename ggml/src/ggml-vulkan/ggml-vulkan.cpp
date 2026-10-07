@@ -662,6 +662,16 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
 static constexpr std::initializer_list<ggml_op> gdn_norm_f16_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> gdn_conv_l2_pattern  { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE };
 static constexpr std::initializer_list<ggml_op> mmid_swiglu_pattern  { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU };
+static constexpr std::initializer_list<ggml_op> mmid_swiglu_merged_pattern { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
+static bool ggml_vk_mmid_swiglu_merged_wiring(const ggml_cgraph * g, int i) {
+    if (i + 5 > g->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * n = g->nodes + i;
+    return n[0]->op == GGML_OP_MUL_MAT_ID && n[1]->op == GGML_OP_CPY && n[1]->src[0] == n[0] &&
+           n[2]->op == GGML_OP_VIEW && n[2]->view_src == n[1] && n[3]->op == GGML_OP_VIEW && n[3]->view_src == n[1] &&
+           n[4]->op == GGML_OP_GLU && (n[4]->src[0] == n[2] || n[4]->src[0] == n[3]);
+}
 static bool ggml_vk_mmid_swiglu_wiring(const ggml_cgraph * g, int i) {
     if (i + 5 > g->n_nodes) {
         return false;
@@ -11933,7 +11943,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // MUL_MAT_ID(+MUL)+CPY(f16) fusion: out_dst is the CPY node (contiguous f16, same shape) and the
     // matmul stores float16_t through the d16 pipelines
     const bool d16 = out_dst->type == GGML_TYPE_F16;
-    GGML_ASSERT(!fused_dst || (ggml_is_contiguous(fused_dst) && ggml_are_same_shape(fused_dst, dst)));
+    // merged gate|up swiglu (src0_up == src0): the GLU output is half the matmul's rows
+    const bool swiglu_merged = src0_up != nullptr && src0_up == src0;
+    GGML_ASSERT(!fused_dst || (ggml_is_contiguous(fused_dst) &&
+                (ggml_are_same_shape(fused_dst, dst) || (swiglu_merged && fused_dst->ne[0] * 2 == dst->ne[0]))));
+    // rows the kernel computes per tensor half (m_out) and the dispatch's row span (m_disp)
+    const uint32_t m_out  = swiglu_merged ? (uint32_t) ne01 / 2 : (uint32_t) ne01;
+    const uint32_t m_disp = src0_up ? (swiglu_merged ? (uint32_t) ne01 : 2 * (uint32_t) ne01) : (uint32_t) ne01;
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)out_dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
@@ -12080,7 +12096,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         } else {
             why = "not the REG_A medium tile";
         }
-        if (sw) {
+        if (sw && swiglu_merged) {
+            // per expert the gate rows, then the up rows: the up row r sits m_out rows further in the same expert block
+            swiglu_boff = m_out * (uint32_t) ggml_row_size(src0->type, ne00);
+            if (ne01 % 2 != 0 || swiglu_boff % 2 != 0) {
+                why = "merged gate|up rows not splittable";
+            } else {
+                pipeline = sw;
+            }
+        } else if (sw) {
             auto resolve = [&](const ggml_tensor * t, vk_buffer & b, size_t & o) {
                 b = nullptr;
                 o = 0;
@@ -12124,7 +12148,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * padded_n * ne12 * ne13;
-    const uint64_t d_ne = ggml_nelements(dst);
+    const uint64_t d_ne = ggml_nelements(out_dst);   // the fused destination (half the rows for a merged swiglu)
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
@@ -12194,7 +12218,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const int mmid_indirect = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT"); return e ? atoi(e) : 0; }();
     static const int mmid_tilelist = [] { const char * e = getenv("GGML_VK_MMID_TILELIST"); return e ? atoi(e) : 0; }();
     static const uint32_t mmid_ind_min_gx = [] { const char * e = getenv("GGML_VK_MMID_INDIRECT_MIN_GX"); return e ? (uint32_t) atoi(e) : 16u; }();
-    const uint32_t mmid_gx = CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]);
+    const uint32_t mmid_gx = CEIL_DIV(m_disp, pipeline->wg_denoms[0]);
     auto mmid_gate = [&](int mode) { return mode == 2 || (mode == 1 && mmid_gx >= mmid_ind_min_gx); };
     const bool use_tile_list = mmid_gate(mmid_tilelist) && use_row_lists && !quantize_y;
     const bool use_indirect = (mmid_gate(mmid_indirect) || use_tile_list) && use_row_lists;
@@ -12380,7 +12404,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
                                            use_indirect && !use_ind_early ? args_off : 0u,
-                                           CEIL_DIV(src0_up ? 2 * (uint32_t) ne01 : (uint32_t) ne01, pipeline->wg_denoms[0]),
+                                           CEIL_DIV(m_disp, pipeline->wg_denoms[0]),
                                            pipeline->wg_denoms[1],
                                            use_tile_list ? tile_off : 0u };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
@@ -12413,15 +12437,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
-        { d_X, x_buf_offset, src0_up ? swiglu_boff + ggml_nbytes(src0_up) : x_sz }, { d_Y, y_buf_offset, y_sz },
+        { d_X, x_buf_offset, src0_up && !swiglu_merged ? swiglu_boff + ggml_nbytes(src0_up) : x_sz }, { d_Y, y_buf_offset, y_sz },
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
-        ne01, ne21, ne10, ne10, stride_b_y, ne01,
-        stride_batch_x, stride_batch_y, ne20*ne21,
+        m_out, ne21, ne10, ne10, stride_b_y, (uint32_t) out_dst->ne[0],
+        stride_batch_x, stride_batch_y, (uint32_t) (out_dst->ne[0] * out_dst->ne[1]),
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n,
         use_row_lists ? 1u : 0u,
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
         fused_scale ? 1u : 0u,
-        swiglu_boff, src0_up ? 2 * (uint32_t) ne01 : 0u,
+        swiglu_boff, src0_up ? m_disp : 0u,
         use_indirect ? &indirect_args : nullptr,
         use_tile_list ? tile_off : 0u
     );  // NOLINT
@@ -12684,6 +12708,19 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
 static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->fused_mmid_swiglu && cgraph->nodes[node_idx + 2]->op == GGML_OP_VIEW) {
+        // merged gate|up weights: MUL_MAT_ID, CPY(f16), VIEW(gate half), VIEW(up half), GLU(swiglu)
+        ggml_tensor * mm  = cgraph->nodes[node_idx];
+        ggml_tensor * glu = cgraph->nodes[node_idx + 4];
+        bool done = false;
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, mm->src[0], mm->src[1], mm->src[2], mm, nullptr, glu, mm->src[0], &done);
+        if (!done) {
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, mm->src[0], mm->src[1], mm->src[2], mm, nullptr, cgraph->nodes[node_idx + 1]);
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_glu(ctx, subctx, glu->src[0], glu->src[1], glu);
+        }
+        return;
+    }
     if (ctx->fused_mmid_swiglu) {
         // MUL_MAT_ID, CPY(f16), MUL_MAT_ID, CPY(f16), GLU(swiglu): gate = the GLU's first operand
         ggml_tensor * glu  = cgraph->nodes[node_idx + 4];
@@ -21936,6 +21973,42 @@ static bool ggml_vk_can_fuse_mmid_swiglu(const ggml_backend_vk_context * ctx, co
     return !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) && !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx + 2);
 }
 
+// the merged gate|up layout (LLAMA_MERGE_GATE_UP or a GGUF with ffn_gate_up_exps): MUL_MAT_ID + CPY(f16) + VIEW(gate,
+// the first half of the rows) + VIEW(up, the second half) + GLU(swiglu), as build_moe_ffn's merged path emits it
+static bool ggml_vk_can_fuse_mmid_swiglu_merged(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool enabled = [] { const char * e = getenv("GGML_VK_MMID_SWIGLU"); return e && atoi(e) != 0; }();
+    if (!enabled || (!ctx->device->pipeline_mmid_swiglu_iq3xxs[0] && !ctx->device->pipeline_mmid_swiglu_iq3xxs[1]) ||
+        node_idx + 5 > cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * n = cgraph->nodes + node_idx;
+    if (n[0]->op != GGML_OP_MUL_MAT_ID || n[1]->op != GGML_OP_CPY || n[2]->op != GGML_OP_VIEW || n[3]->op != GGML_OP_VIEW ||
+        n[4]->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { node_idx + 4 })) {
+        return false;
+    }
+    const ggml_tensor * mm = n[0], * cpy = n[1], * glu = n[4];
+    if (cpy->src[0] != mm || cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) || mm->src[0]->type != GGML_TYPE_IQ3_XXS ||
+        mm->ne[0] % 2 != 0) {
+        return false;
+    }
+    const int64_t half = mm->ne[0] / 2;
+    const ggml_tensor * g = glu->src[0], * u = glu->src[1];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || u == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F16 || !ggml_is_contiguous(glu) || glu->ne[0] != half) {
+        return false;
+    }
+    // gate = rows [0, half), up = rows [half, 2*half) of the cast, same row/batch strides
+    if (g->view_src != cpy || u->view_src != cpy || g->view_offs != 0 || u->view_offs != (size_t) half * ggml_element_size(cpy) ||
+        g->ne[0] != half || u->ne[0] != half || g->nb[1] != cpy->nb[1] || u->nb[1] != cpy->nb[1] ||
+        g->nb[2] != cpy->nb[2] || u->nb[2] != cpy->nb[2]) {
+        return false;
+    }
+    return !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx);
+}
+
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -22997,6 +23070,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mmid_swiglu_merged(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 4;
+                ctx->fused_mmid_swiglu = true;
+                fusion_string = "MUL_MAT_ID_SWIGLU_MERGED";
+                std::fill_n(op_srcs_fused_elementwise, 5, false);
+                op_srcs_fused_elementwise[1] = true;   // the cast's src[1] is its own (never written) destination
             } else if (ggml_vk_can_fuse_mmid_swiglu(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 ctx->fused_mmid_swiglu = true;
@@ -23520,6 +23599,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (ggml_vk_mmid_swiglu_wiring(graph, first_unused) && keep_pattern(mmid_swiglu_pattern)) {
             continue;
         }
+        if (ggml_vk_mmid_swiglu_merged_wiring(graph, first_unused) && keep_pattern(mmid_swiglu_merged_pattern)) {
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -23584,6 +23666,11 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 }
                 for (int o = 0; o < (int) mmid_swiglu_pattern.size(); ++o) {
                     if (n - o >= first_unused && match_pattern(mmid_swiglu_pattern, n - o) && ggml_vk_mmid_swiglu_wiring(graph, n - o)) {
+                        return true;
+                    }
+                }
+                for (int o = 0; o < (int) mmid_swiglu_merged_pattern.size(); ++o) {
+                    if (n - o >= first_unused && match_pattern(mmid_swiglu_merged_pattern, n - o) && ggml_vk_mmid_swiglu_merged_wiring(graph, n - o)) {
                         return true;
                     }
                 }
