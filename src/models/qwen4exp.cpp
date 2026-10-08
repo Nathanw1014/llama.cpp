@@ -688,11 +688,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8; default 64, 0 off): give the f16 xn rows a stride of hc_dim + N. hc_dim 10240 f16 is
+    // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8; default 128, 0 off): give the f16 xn rows a stride of hc_dim + N.
+    // 10-08, FN REAP-320 pp2048 with NOY, 2 runs each: 128 = 64 at d0, +4.7% at d8192, -0.7% at d32768; 64 dips at
+    // 8k with or without NOY (an op-level sweep at d0 had shown 32/64/128 equal). hc_dim 10240 f16 is
     // 80 x 256 B, so unpadded every token row starts on the same DRAM channel of 16 for the down GEMM, the inject
     // mat-vec and the mix, which all read xn row-strided (Strata pads the same buffer: K + 64). The norm writes the
     // padded rows directly (RMS_NORM_MUL_CPY with a row-strided destination); the consumers take the stride.
-    static const int64_t xn_pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 64; }();
+    static const int64_t xn_pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 128; }();
     bool xn_padded = false;
     if (qwen4exp_hc_norm3d()) {
         // Apply gamma in the [n_embd, hc, nt] shape so the graph is RMS_NORM directly followed by MUL
