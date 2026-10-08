@@ -70,6 +70,13 @@ shared float scale_sh[ROWS];
 // MR_LAZY: per softmax subgroup, whether any of its eight rows moved its running max this tile
 shared uint32_t resc_sh[NSG];
 
+// bit k of vis_sh[tile parity]: key k of the 16-key tile is unmasked in at least one row that reaches the output.
+// RDNA3 WMMA rounds a dot product toward -inf when any product term is -0.0, and a key masked in every row has
+// P = +0 there, so a negative V in that cell (a discarded prompt branch, say) moved the output by an ulp. Tiles
+// with such a key restage their V^T tiles through vstage_sh with those keys zeroed (one 16 x 16 tile per subgroup).
+shared uint32_t vis_sh[2];
+shared f16vec4 vstage_sh[NSG * 16 * (KT / 4)];
+
 // skip the O rescale of a row block whose rows all kept their running max (eM == 1 exactly, so the
 // skipped multiply is an identity and the result is bit-identical); at depth the max rarely moves
 const bool MR_LAZY = (Flags & 4096) != 0;
@@ -78,11 +85,6 @@ const bool MR_NOEB = (Flags & 8192) != 0;
 // issue the tile's V^T loads right after the S store, before the softmax barrier
 const bool MR_VPOST = (Flags & 16384) != 0;
 
-// NAN_SAFE_V: per tile parity, bit k set when key k of the 16-key tile is visible to some real row; a tile
-// with a key hidden from every row stages its V^T fragments through vz_sh with those keys zeroed
-shared uint32_t alive_sh[2];
-// one 16 x 16 f16 V^T fragment per subgroup, [dim][key]
-shared f16vec4 vz_sh[NSG * 64];
 
 // 2-bit mask_opt state of 64-key block j for this workgroup's tokens
 uint32_t block_bits(const uint32_t j, const uint32_t mo_offset) {
@@ -191,10 +193,14 @@ void main() {
     uint32_t j = next_block(0xFFFFFFFFu, end_j, mo_offset);
     uint32_t key0 = j * Bc;
     bool read_mask = false;
-    uint32_t tile_par = 0;
-    if (NAN_SAFE_V && tid < 2) {
-        alive_sh[tid] = 0;
+
+    if (tid < 2) {
+        vis_sh[tid] = 0u;
     }
+    barrier();
+    // vis_sh[tp & 1] is written in this tile's softmax and read in its PV; vis_sh[(tp + 1) & 1] was last read in the
+    // previous tile's PV, which every subgroup finished before this tile's S barrier, so the softmax may clear it
+    uint32_t tp = 0;
 
     [[dont_unroll]]
     while (j < end_j) {
@@ -243,23 +249,23 @@ void main() {
                     const vec4 m = vec4(data_m[mo], data_m[mo + 1], data_m[mo + 2], data_m[mo + 3]);
                     // a masked key scores -inf outright, so non-finite K data cannot turn it into NaN
                     s = mix(s + slope * m, vec4(uintBitsToFloat(0xFF800000)), lessThanEqual(m, vec4(FA_MASK_DEAD)));
-                    if (NAN_SAFE_V) {
-                        // rows past N are padding and see nothing
-                        const bvec4 alive = greaterThan(m, vec4(FA_MASK_DEAD));
-                        uint32_t bits = 0;
-                        [[unroll]] for (uint32_t c = 0; c < 4; ++c) {
-                            bits |= (alive[c] && sm_tok < N) ? (1u << (sm_seg * 4 + c)) : 0u;
-                        }
-                        bits = subgroupOr(bits);
-                        if (subgroupElect()) {
-                            atomicOr(alive_sh[tile_par], bits);
+                }
+                if (read_mask) {
+                    // rows past N never reach the output; rows past nem1 read no mask, so every key is visible there
+                    uint32_t bits = 0u;
+                    if (sm_tok < N) {
+                        [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                            const bool vis = !m_row_ok || float(data_m[m_row_off + key0 + sm_seg * 4 + k]) > NEG_FLT_MAX_OVER_2;
+                            bits |= vis ? 1u << (sm_seg * 4 + k) : 0u;
                         }
                     }
+                    bits = subgroupOr(bits);
+                    if (subgroupElect()) {
+                        atomicOr(vis_sh[tp & 1], bits);
+                    }
                 }
-                if (NAN_SAFE_V && tid == 0) {
-                    // the other parity was last read by the previous tile's P x V, which every thread finished
-                    // before this tile's S barrier; the softmax barrier below orders the reset before its next use
-                    alive_sh[tile_par ^ 1] = 0;
+                if (tid == 0) {
+                    vis_sh[(tp + 1) & 1] = 0u;
                 }
                 float rowmax = max(max(s.x, s.y), max(s.z, s.w));
                 rowmax = subgroupClusteredMax(rowmax, 4) + FATTN_KQ_MAX_OFFSET;
@@ -289,26 +295,23 @@ void main() {
                     coopMatLoad(VB[t], data_vv4, coord, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
                 }
             }
-            // keys hidden from every row: P is 0 there, but 0 * NaN is not, so their V^T columns are zeroed
-            // (uniform: read_mask and alive_sh are the same for the whole workgroup)
-            if (NAN_SAFE_V && read_mask && alive_sh[tile_par] != 0xFFFFu) {
-                const uint32_t alive = alive_sh[tile_par];
-                const uint32_t lane = gl_SubgroupInvocationID;
+            if (read_mask && vis_sh[tp & 1] != 0xFFFFu) {
+                const uint32_t vis = vis_sh[tp & 1];
                 [[unroll]] for (uint32_t t = 0; t < OT; ++t) {
-                    const uint32_t d0 = (t * NSG + sg) * 16;
-                    [[unroll]] for (uint32_t e = lane; e < 64; e += 32) {
-                        const uint32_t dim = e / 4, kq = e % 4;
-                        f16vec4 v = data_vv4[(v_offset + (d0 + dim) * v_stride + key0) / 4 + kq];
-                        [[unroll]] for (uint32_t c = 0; c < 4; ++c) {
-                            if ((alive & (1u << (kq * 4 + c))) == 0) {
-                                v[c] = float16_t(0.0);
+                    for (uint32_t e = gl_SubgroupInvocationID; e < 16 * (KT / 4); e += gl_SubgroupSize) {
+                        const uint32_t hd = e / (KT / 4);
+                        const uint32_t kq = e % (KT / 4);
+                        f16vec4 vt = data_vv4[(v_offset + ((t * NSG + sg) * 16 + hd) * v_stride + key0) / 4 + kq];
+                        [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                            if (((vis >> (kq * 4 + k)) & 1u) == 0u) {
+                                vt[k] = float16_t(0.0);
                             }
                         }
-                        vz_sh[sg * 64 + e] = v;
+                        vstage_sh[sg * 16 * (KT / 4) + e] = vt;
                     }
                     subgroupMemoryBarrierShared();
                     subgroupBarrier();
-                    coopMatLoad(VB[t], vz_sh, sg * 64, 4, gl_CooperativeMatrixLayoutColumnMajor);
+                    coopMatLoad(VB[t], vstage_sh, sg * 16 * (KT / 4), KT / 4, gl_CooperativeMatrixLayoutColumnMajor);
                     subgroupBarrier();
                 }
             }
@@ -338,7 +341,7 @@ void main() {
         }
         j = nj;
         key0 = nkey0;
-        tile_par ^= 1;
+        ++tp;
     }
     if (MR_NOEB) {
         barrier();   // the last PV may still read scale_sh

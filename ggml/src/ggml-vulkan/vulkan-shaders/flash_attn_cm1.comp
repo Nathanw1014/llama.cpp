@@ -71,10 +71,11 @@ shared ACC_TYPE slope[Br];
 // K chunk / V tile / mask column (the index reload was 250 of the 320 buffer loads per block)
 shared uint32_t grow_sh[Bc];
 
-// NAN_SAFE_V: alive_stamp[c] == j + 1 when key c of block j is visible to some row of the tile, and
-// dead_blk == j + 1 when block j has a key hidden from every row. Stamps, so nothing is reset per block.
-shared uint32_t alive_stamp[Bc];
-shared uint32_t dead_blk;
+// zvis_sh[c] == j: KV column c of block j is unmasked in at least one row that reaches the output. Otherwise every
+// such row has P = +0 there (written during the mask load, read after its barrier; only blocks whose mask is loaded)
+shared uint zvis_sh[Bc];
+// one MatBc x MatBc V tile per subgroup, for direct-path chunks that hold such a column (staged with it zeroed)
+shared FLOAT_TYPEV4 vchunk_sh[row_split * MatBc * (MatBc / 4)];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -113,12 +114,6 @@ void main() {
             i * Br + r < N) {
             Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row(i * Br + r) / 4 + d] * p.scale);
         }
-    }
-    if (NAN_SAFE_V && tid < Bc) {
-        alive_stamp[tid] = 0;
-    }
-    if (NAN_SAFE_V && tid == 0) {
-        dead_blk = 0;
     }
     barrier();
 
@@ -177,9 +172,15 @@ void main() {
         OAcc[t] = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
     }
 
+    for (uint32_t c = tid; c < Bc; c += gl_WorkGroupSize.x) {
+        zvis_sh[c] = ~0u;
+    }
+    barrier();
+
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
-        bool dead_rows = false;
+        // the mask of this block was loaded, so zvis_sh describes it; unloaded blocks have no -inf entry
+        bool mask_loaded = false;
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -213,6 +214,7 @@ void main() {
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
+                mask_loaded = true;
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                     uint32_t c = (idx + tid) / (Br / 4);
@@ -255,15 +257,16 @@ void main() {
                                 m = f16vec4(0.0);
                             }
                             mask_cache[idx / WorkGroupSize] = m;
-                            // key c is alive when some real row of the tile sees it (rows past N are padding)
-                            if (NAN_SAFE_V && !GATHER_KV) {
-                                bool alive = false;
-                                [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
-                                    alive = alive || (i * Br + r * 4 + k < N && float(m[k]) > FA_MASK_DEAD);
-                                }
-                                if (alive) {
-                                    alive_stamp[c] = j + 1;
-                                }
+                            // padding rows (GQA decode fills 16 rows from N <= 8, a short last tile) never reach the
+                            // output, so they must not keep a column alive
+                            bool vis = false;
+                            [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                const uint32_t row = r * 4 + k;
+                                const bool valid = gqa_ratio > 1 ? row < N : i * Br + row < N;
+                                vis = vis || (valid && float(m[k]) > NEG_FLT_MAX_OVER_2);
+                            }
+                            if (vis) {
+                                zvis_sh[c] = j;
                             }
                         }
                     }
@@ -280,11 +283,6 @@ void main() {
                 }
                 if (max_mask <= NEG_FLT_MAX_OVER_2) {
                     continue;
-                }
-                // the stamps are ordered by the barriers above; dead_blk is read after the S barrier below
-                if (NAN_SAFE_V && !GATHER_KV && tid < Bc && (!KV_bounds_check || j * Bc + tid < KV) &&
-                    alive_stamp[tid] != j + 1) {
-                    dead_blk = j + 1;
                 }
             }
         }
@@ -394,7 +392,6 @@ void main() {
         uint coord = gl_SubgroupID * MatBc * sfshstride;
         coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
-        dead_rows = NAN_SAFE_V && !GATHER_KV && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO && dead_blk == j + 1;
 
         if (LOGIT_SOFTCAP) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
@@ -490,15 +487,34 @@ void main() {
             }
         }
 
+        // RDNA3 WMMA rounds a dot product toward -inf when any product term is -0.0 (measured on gfx1151,
+        // v_wmma_f32_16x16x16_f16), and P = +0 times a negative V is -0.0. A masked-out KV cell has P = +0, so the
+        // sign of whatever V it holds (a discarded prompt branch, say) moved the output by an ulp. V is fed to the
+        // WMMA as zero in every column masked in all output rows (zvis_sh): the product is then +0.
+        // On the direct-load path only chunks holding such a column take a staged load. Spec-constant tests are
+        // nested ifs: glslang miscompiles a short-circuit && of these spec constants into invalid SPIR-V.
+        uint32_t masked_chunks = 0u;
+        bool staged_pv = false;
+        if (SHMEM_STAGING == 0) {
+            if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV) {
+                if (mask_loaded) {
+                    for (uint32_t c = 0; c < Bc; ++c) {
+                        if (zvis_sh[c] != j) {
+                            masked_chunks |= 1u << (c / MatBc);
+                        }
+                    }
+                }
+                staged_pv = masked_chunks != 0u;
+            }
+        }
+
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    // keys hidden from every row stay zero: P is 0 there, but 0 * NaN is not
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4) &&
-                        !(dead_rows && alive_stamp[c] != j + 1)) {
+                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -512,7 +528,7 @@ void main() {
                         }
                     }
 
-                    kvsh[c * kvsh_stride + d] = V_Tf;
+                    kvsh[c * kvsh_stride + d] = mask_loaded && zvis_sh[c] != j ? FLOAT_TYPEV4(0) : V_Tf;
                 }
             }
         }
@@ -545,7 +561,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check || GATHER_KV || dead_rows;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || GATHER_KV;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -559,8 +575,9 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    const bool v_ok = GATHER_KV ? (v_row != 0xFFFFFFFFu && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV));
-                    if (v_ok && !(dead_rows && alive_stamp[row] != j + 1)) {
+                    const bool v_ok = !(mask_loaded && zvis_sh[row] != j) &&
+                                      (GATHER_KV ? (v_row != 0xFFFFFFFFu && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV)));
+                    if (v_ok) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -592,35 +609,82 @@ void main() {
                 }
             }
             if (hsv_offset < HSV_pad) {
-                [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV && !dead_rows) {   // GATHER_KV / dead_rows: V rows were staged; never read them directly
-                        // F16/BF16 values can be loaded directly from global memory
+                if (staged_pv) {
+                    // rare: some chunk of this block holds a column masked in every output row. Those chunks stage
+                    // their V tile through vchunk_sh with the masked kv zeroed; the rest load directly.
+                    [[dont_unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-                        if (V_TRANSPOSED) {
-                            // V^T scratch [HSV][KV] per head (v_stride = KV): the B operand (k = kv, n = hd)
-                            // is ColumnMajor there, so each lane's 16 kv are one contiguous 32-byte run.
-                            // The RowMajor read of V[kv][hd] below costs 16 separate 16-bit global loads
-                            // plus an address op each per fragment (1024 of the 1972 loop instructions).
+                        if (((masked_chunks >> bc_chunk) & 1u) != 0u) {
+                            const uint vc_base = gl_SubgroupID * MatBc * (MatBc / 4);
+                            for (uint32_t e = gl_SubgroupInvocationID; e < MatBc * (MatBc / 4); e += gl_SubgroupSize) {
+                                if (V_TRANSPOSED) {
+                                    // [16 hd][16 kv]: each vec4 holds 4 consecutive kv of one hd
+                                    const uint32_t hd = e / (MatBc / 4);
+                                    const uint32_t kq = e % (MatBc / 4);
+                                    FLOAT_TYPEV4 vt = data_vv4[v_offset / 4 + (hsv_offset + hd) * (v_stride / 4) + v_tile_row / 4 + kq];
+                                    [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                        if (zvis_sh[bc_chunk * MatBc + kq * 4 + k] != j) {
+                                            vt[k] = FLOAT_TYPE(0);
+                                        }
+                                    }
+                                    vchunk_sh[vc_base + e] = vt;
+                                } else {
+                                    // [16 kv][16 hd]
+                                    const uint32_t vr = e / (MatBc / 4);
+                                    vchunk_sh[vc_base + e] = zvis_sh[bc_chunk * MatBc + vr] != j ? FLOAT_TYPEV4(0)
+                                                           : data_vv4[v_offset / 4 + (v_tile_row + vr) * v_stride / 4 + hsv_offset / 4 + e % (MatBc / 4)];
+                                }
+                            }
+                            subgroupMemoryBarrierShared();
+                            subgroupBarrier();
+                            coopMatLoad(QMat, vchunk_sh, vc_base, MatBc / 4,
+                                        V_TRANSPOSED ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
+                            subgroupBarrier();
+                        } else if (V_TRANSPOSED) {
                             const uint vt_tile_offset = v_offset / 4 + hsv_offset * (v_stride / 4) + v_tile_row / 4;
                             coopMatLoad(QMat, data_vv4, vt_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
                         } else {
                             const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
                             coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
                         }
-                    } else {
-                        const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
-                        coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                    }
-                    } else {
-                        const uint v_tile_offset = bc_chunk * MatBc * kvsh_stride + (hsv_tile * row_split + gl_SubgroupID) * (MatBc / 4);
-                        coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                    }
 
-                    if (O_IN_REGS) {
-                        OAcc[hsv_tile] = coopMatMulAdd(PMat[bc_chunk], QMat, OAcc[hsv_tile]);
-                    } else {
-                        PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                        if (O_IN_REGS) {
+                            OAcc[hsv_tile] = coopMatMulAdd(PMat[bc_chunk], QMat, OAcc[hsv_tile]);
+                        } else {
+                            PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                        }
+                    }
+                } else {
+                    [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                        if (SHMEM_STAGING == 0) {
+                        if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV) {   // GATHER_KV: V rows were staged by index; never read them directly
+                            // F16/BF16 values can be loaded directly from global memory
+                            const uint v_tile_row = j * Bc + bc_chunk * MatBc;
+                            if (V_TRANSPOSED) {
+                                // V^T scratch [HSV][KV] per head (v_stride = KV): the B operand (k = kv, n = hd)
+                                // is ColumnMajor there, so each lane's 16 kv are one contiguous 32-byte run.
+                                // The RowMajor read of V[kv][hd] below costs 16 separate 16-bit global loads
+                                // plus an address op each per fragment (1024 of the 1972 loop instructions).
+                                const uint vt_tile_offset = v_offset / 4 + hsv_offset * (v_stride / 4) + v_tile_row / 4;
+                                coopMatLoad(QMat, data_vv4, vt_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                            } else {
+                                const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+                                coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                            }
+                        } else {
+                            const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
+                            coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                        } else {
+                            const uint v_tile_offset = bc_chunk * MatBc * kvsh_stride + (hsv_tile * row_split + gl_SubgroupID) * (MatBc / 4);
+                            coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+
+                        if (O_IN_REGS) {
+                            OAcc[hsv_tile] = coopMatMulAdd(PMat[bc_chunk], QMat, OAcc[hsv_tile]);
+                        } else {
+                            PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                        }
                     }
                 }
 

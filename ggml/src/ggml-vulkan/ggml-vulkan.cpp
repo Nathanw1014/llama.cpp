@@ -12910,10 +12910,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    // alive_stamp[Bc] + dead_blk (hidden-key tracking; only NAN_SAFE_V pipelines use it, counted for all)
-    const uint32_t live = (Bc + 1) * sizeof(uint32_t);
+    // grow_sh (gathered rows) and eMsh (O_IN_REGS rescale), which this sum used to miss; zvis_sh (per-column
+    // "visible in this block" stamps) and vchunk_sh (one MatBc x MatBc V tile per subgroup)
+    const uint32_t extra = Bc * sizeof(uint32_t) + 16 * sizeof(float) + Bc * sizeof(uint32_t) + row_split * MatBc * (MatBc / 4) * f16vec4;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + live;
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + extra;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
