@@ -11745,6 +11745,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // f16 B into an IQ4_XS dense matmul at >= 32 tokens: SIGSEGV on builds without an IQ4_XS f16-B pipeline
+    // (strix-halo-llamacpp PR 12, the Flash-Next IQ4_XS files). Perf mode only: the CPU reference takes no f16 B
+    // for a quantized A, so this shape is unreachable in test mode.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F16, 2560, 512, 4096, {1, 1}, {1, 1}));
+
     // fusion-pass kernels (2026-09-14) at the Flash-Next ub2048 shapes; each has an env gate so the
     // fused and unfused forms can be timed from the same case
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 48, 2048, 1}, false, 1e-6f));
