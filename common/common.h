@@ -326,6 +326,7 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
     std::string docker_repo = ""; // Docker repo
+    std::string ple         = ""; // GGUF with per-layer embedding tables used instead of the model's own
 
     std::string get_name() const {
         if (!hf_repo.empty()) {
@@ -437,12 +438,25 @@ struct common_params_speculative {
     bool has_prefill() const {
         return prefill.enabled && !prefill.model.empty();
     }
+
+    // cap on the rollback snapshot slots, -1 = follow draft.n_max (see need_n_rs_seq)
+    int32_t n_rs_seq_max = -1;
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        // the recurrent cache holds (1 + n_rs_seq) copies of every sequence's state, which on a
+        // large linear-attention model is GiBs. Capping trades speed for memory: a rollback
+        // deeper than n_rs_seq is still correct, it just falls back to the host checkpoint.
+        const int32_t n = n_rs_seq_max >= 0 ? std::min(n_rs_seq_max, draft.n_max) : draft.n_max;
+
+        return (uint32_t) std::max(0, n);
     }
 };
 
@@ -675,9 +689,6 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t cache_dir_max_mib   = -1;    // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-
-    std::string cache_dir_path;
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
