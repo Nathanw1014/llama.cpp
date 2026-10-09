@@ -376,8 +376,9 @@ static bool qwen4exp_takes_f16_b(const llama_model & model) {
     return true;
 }
 
-// Community Flash-Next GGUFs ship the indexer projections in bf16, and no backend takes bf16 x f16. Only
-// those matmuls get an f32 copy of their input, so the rest of the graph keeps the f16 hc chain.
+// Community Flash-Next GGUFs ship some projections in bf16 (the QSA indexer, and in some files the hc down
+// projections such as output_hc_down), and no backend takes bf16 x f16. Only those matmuls get an f32 copy of
+// their input, so the rest of the graph keeps the f16 hc chain.
 static ggml_tensor * qwen4exp_indexer_in(ggml_context * ctx, const ggml_tensor * w, ggml_tensor * cur) {
     return w->type == GGML_TYPE_BF16 && cur->type == GGML_TYPE_F16 ? ggml_cast(ctx, cur, GGML_TYPE_F32) : cur;
 }
@@ -739,12 +740,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * dinj = nullptr;
     ggml_tensor * lo;
     if (w_dinj) {
-        dinj = ggml_mul_mat(ctx0, w_dinj, xn);   // [n_down + hc, nt]
+        dinj = ggml_mul_mat(ctx0, w_dinj, qwen4exp_indexer_in(ctx0, w_dinj, xn));   // [n_down + hc, nt]
         // the down rows are a strided view (row stride n_down + hc): SCALE needs a contiguous source on Vulkan (and
         // the CPU fallback asserts), so copy the 2.6 MB out first
         lo = ggml_cont(ctx0, ggml_view_2d(ctx0, dinj, w_down->ne[1], nt, dinj->nb[1], 0));
     } else {
-        lo = build_lora_mm(w_down, xn);
+        lo = build_lora_mm(w_down, qwen4exp_indexer_in(ctx0, w_down, xn));   // a bf16 down projection takes f32 (issue 23)
     }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
