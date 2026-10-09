@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -107,6 +108,8 @@ struct llama_model_loader {
     // byte ranges of TENSOR_READ_LAZY tensors, per file index. init_mappings() must not pull
     // these in eagerly: they are gather tables the model reads a few percent of.
     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+    std::set<std::string> f16_from_bf16; // LLAMA_BF16_TO_F16: bf16 file tensors created (and uploaded) as f16
+    size_t f16_from_bf16_rounded = 0;    // values below 2^-14 that rounded in that conversion
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
