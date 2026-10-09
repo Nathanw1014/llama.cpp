@@ -469,14 +469,21 @@ llama_context::llama_context(
         }
 
         // The KQ mask is one input tensor of n_kv x n_ubatch cells (f16 with flash attention, f32 without),
-        // allocated whole in the compute buffer of the device that runs attention. Past that buffer type's
-        // single-allocation limit (4 GiB on RADV: -ub 8192 at 512k) the context fails to reserve, so lower the
-        // ubatch to the largest multiple of 256 whose mask fits; prefill stays correct, only its batching changes.
+        // allocated whole in the compute buffer of the device that runs attention. Past the largest tensor that
+        // device can bind (4 GiB on RADV: -ub 8192 at 512k) the context fails to reserve, so lower the ubatch to
+        // the largest multiple of 256 whose mask fits; prefill stays correct, only its batching changes.
+        // The limit comes from the backend's ggml_backend_dev_get_max_tensor_size when it has one. The buffer
+        // type's max size is the allocator's chunk size (1 GiB on Vulkan), which one tensor may exceed, so it is
+        // only the fallback.
         if (cparams.offload_kqv && cparams.causal_attn) {
+            typedef size_t (*get_max_tensor_size_t)(ggml_backend_dev_t);
             size_t max_size = SIZE_MAX;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                if (ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    max_size = std::min(max_size, ggml_backend_buft_get_max_size(backend_buft[i]));
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    auto * get_max_tensor_size = reg ? (get_max_tensor_size_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_max_tensor_size") : nullptr;
+                    max_size = std::min(max_size, get_max_tensor_size ? get_max_tensor_size(dev) : ggml_backend_buft_get_max_size(backend_buft[i]));
                 }
             }
             const size_t n_kv_max = (size_t) (cparams.kv_unified ? cparams.n_ctx : cparams.n_ctx_seq) + 256;
@@ -486,7 +493,7 @@ llama_context::llama_context(
                 cparams.n_ubatch = std::max<uint32_t>(256, (uint32_t) (max_size / (n_kv_max * cell)) & ~255u);
             }
             if (cparams.n_ubatch != n_ubatch_req) {
-                LLAMA_LOG_WARN("%s: n_ubatch %u x n_ctx %u needs a %.1f GiB KQ mask, over the %.1f GiB device buffer limit; "
+                LLAMA_LOG_WARN("%s: n_ubatch %u x n_ctx %u needs a %.1f GiB KQ mask, over the device's %.1f GiB tensor limit; "
                         "using n_ubatch = %u\n", __func__, n_ubatch_req, cparams.n_ctx,
                         n_kv_max * n_ubatch_req * cell / 1073741824.0, max_size / 1073741824.0, cparams.n_ubatch);
             }
