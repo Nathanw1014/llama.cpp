@@ -1318,6 +1318,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// MTP verify rows: a batch of up to this many rows (any verify batch) keeps every row for accept();
+// only larger ones (prompt ubatches) are trimmed to the MTP draft length
+#define GGML_MTP_VERIFY_KEEP_ALL 512
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1603,12 +1607,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
 
             if (pf_trim) {
-                // accept() reads row min(n_accepted, n_rows - 1) and n_accepted never exceeds the
-                // draft length, so rows past n_max + 1 are dead: a prompt ubatch keeps a handful of
-                // rows instead of copying n_tokens x n_embd floats. The target's nextn rows are
-                // dense by batch index (unmasked), so read them from one base pointer rather than
-                // one synchronising _ith call per row.
-                const int32_t n_keep = std::min(n_rows, std::max({ params.n_max, this->n_max, 16 }) + 1);
+                // accept() reads row min(n_accepted, n_rows - 1). A prompt ubatch keeps a handful of
+                // rows instead of copying n_tokens x n_embd floats, since n_accepted after a prompt is
+                // at most the MTP draft length. A verify batch keeps every row: with another drafter
+                // in the chain (ngram-mod,draft-mtp) its draft can be longer than this one's n_max, and
+                // more of it accepted (issue 23). Verify batches are small, so this costs nothing.
+                // The target's nextn rows are dense by batch index (unmasked), so read them from one
+                // base pointer rather than one synchronising _ith call per row.
+                const int32_t n_trim = std::max({ params.n_max, this->n_max, 16 }) + 1;
+                const int32_t n_keep = n_rows <= GGML_MTP_VERIFY_KEEP_ALL ? n_rows : std::min(n_rows, n_trim);
                 const float * h_all  = h_tgt_all;
                 verify_h[seq_id].resize((size_t) n_keep * n_embd);
                 std::memcpy(verify_h[seq_id].data(), h_all + (size_t) i_batch_beg[seq_id] * n_embd,
