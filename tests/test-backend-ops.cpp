@@ -1217,6 +1217,13 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // nodes to put in the graph ahead of `out`, as a model does with ggml_build_forward_expand before a chain it
+    // wants kept consecutive (e.g. a padded destination view): the harness expands them first in eval and eval_perf
+    virtual std::vector<ggml_tensor *> graph_prefix_nodes() { return {}; }
+    // engagement: called on backend1 right before the compare and right after it; a test that requires a fused
+    // dispatch resets the backend's counters in the first and FAILS from the second when the count stayed 0
+    virtual void before_compute(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1398,6 +1405,9 @@ struct test_case {
         }
 
         // build graph
+        for (ggml_tensor * t : graph_prefix_nodes()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1490,6 +1500,7 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        before_compute(backend1);
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
@@ -1497,6 +1508,13 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        if (test_passed) {
+            std::string engage_msg;
+            if (!verify_engagement(backend1, engage_msg)) {
+                test_passed = false;
+                error_msg   = engage_msg;
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -1565,6 +1583,9 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        for (ggml_tensor * t : graph_prefix_nodes()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -3656,11 +3677,16 @@ struct test_ssm_conv_direct_l2 : public test_case {
 
 // LLAMA_HC_XN_PAD: an f16 operand whose rows are packed but padded (a view of [k + pad, n]). mode 0: B of a
 // quantized GEMM (the hc down projection), mode 1: A of an f16 x f32 mat-vec (the hc inject), mode 2: the norm
-// writing it (RMS_NORM + MUL + CPY into the padded view, read back through the 2-D view)
+// writing it (RMS_NORM + MUL + CPY into the padded view, read back through the 2-D view), mode 3: the gated GDN
+// norm writing it (RMS_NORM + MUL + SIGMOID + MUL + CPY, LLAMA_GDN_NORM_PAD).
+// Modes 2 and 3 put the padded view in the graph ahead of the chain, as the model does since 10-10 (before that the
+// VIEW landed between the MUL and the CPY and the backend ran the chain unfused: 36 of 95 hc norms on Flash-Next),
+// and FAIL on Vulkan when the fused dispatch (RMS_NORM_MUL_CPY / RMS_NORM_MUL_SIGMUL_CPY) did not run.
 struct test_rowpad_f16 : public test_case {
     const int mode;
     const ggml_type type_a;
     const int64_t m, n, k, pad;
+    ggml_tensor * dst = nullptr;   // modes 2/3: the padded destination view, expanded ahead of the chain
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3690,9 +3716,22 @@ struct test_rowpad_f16 : public test_case {
             ggml_set_name(x, "x");
             ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k / 4, 4);
             ggml_set_name(gamma, "gamma");
-            ggml_tensor * dst = ggml_view_3d(ctx, buf, k / 4, 4, n, (k / 4) * ggml_element_size(buf), buf->nb[1], 0);
+            dst = ggml_view_3d(ctx, buf, k / 4, 4, n, (k / 4) * ggml_element_size(buf), buf->nb[1], 0);
             ggml_tensor * xn = ggml_cpy(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma), dst);
             out = ggml_cast(ctx, ggml_view_2d(ctx, xn, k, n, xn->nb[2], 0), GGML_TYPE_F32);
+        } else if (mode == 3) {
+            // k = head_v_dim 128 x n_heads: rms over the head, [128] gamma, sigmoid(z) gate, f16 rows of k + pad
+            const int64_t hd = 128, nh = k / hd;
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, n);
+            ggml_set_name(x, "x");
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, n);
+            ggml_set_name(z, "z");
+            dst = ggml_view_4d(ctx, buf, hd, nh, n, 1, hd * ggml_element_size(buf), buf->nb[1], buf->nb[1] * n, 0);
+            ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+            ggml_tensor * y = ggml_cpy(ctx, ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z)), dst);
+            out = ggml_cast(ctx, ggml_view_2d(ctx, y, k, n, y->nb[2], 0), GGML_TYPE_F32);
         } else {
             ggml_tensor * v = ggml_view_2d(ctx, buf, k, n, buf->nb[1], 0);
             if (mode == 0) {
@@ -3707,6 +3746,40 @@ struct test_rowpad_f16 : public test_case {
         }
         ggml_set_name(out, "out");
         return out;
+    }
+
+    std::vector<ggml_tensor *> graph_prefix_nodes() override {
+        return dst ? std::vector<ggml_tensor *>{ dst } : std::vector<ggml_tensor *>{};
+    }
+
+    // the Vulkan backend's fused-dispatch counters, through the registry (null on every other backend)
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (mode != 2 && mode != 3) {
+            return true;
+        }
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (count == nullptr) {
+            return true;
+        }
+        const char * name = mode == 2 ? "RMS_NORM_MUL_CPY" : "RMS_NORM_MUL_SIGMUL_CPY";
+        // the whole graph runs once on this backend and holds one chain: exactly one fused dispatch
+        const uint64_t c = count(name);
+        if (c != 1) {
+            msg = std::string("fused dispatch ") + name + " ran " + std::to_string(c) + " times, expected 1";
+            return false;
+        }
+        return true;
     }
 };
 
@@ -9669,6 +9742,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 64, 1024, 128));       // the hc inject shape
     test_cases.emplace_back(new test_rowpad_f16(1, GGML_TYPE_F32, 4, 300, 10240, 128));
     test_cases.emplace_back(new test_rowpad_f16(2, GGML_TYPE_F32, 0, 33, 1024, 128));
+    test_cases.emplace_back(new test_rowpad_f16(2, GGML_TYPE_F32, 0, 33, 1024, 0));         // unpadded: the fusion must engage too
+    test_cases.emplace_back(new test_rowpad_f16(2, GGML_TYPE_F32, 0, 64, 10240, 128));      // the Flash-Next hc norm shape
+    test_cases.emplace_back(new test_rowpad_f16(3, GGML_TYPE_F32, 0, 33, 6144, 128));       // the gated GDN norm (LLAMA_GDN_NORM_PAD)
+    test_cases.emplace_back(new test_rowpad_f16(3, GGML_TYPE_F32, 0, 33, 6144, 0));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, false, 128));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(64, 33, true, 64));
     test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_IQ3_XXS, 16, 4, 256, 512, 512));

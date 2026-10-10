@@ -24,6 +24,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// engagement counters for the fused dispatches (keyed by the perf logger's fusion name, e.g. "RMS_NORM_MUL_CPY"):
+// test-backend-ops asserts that a chain built like the model's actually runs fused. Also reachable through
+// ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count" / "ggml_backend_vk_fusion_count_reset").
+GGML_BACKEND_API uint64_t ggml_backend_vk_fusion_count(const char * fusion_name);
+GGML_BACKEND_API void     ggml_backend_vk_fusion_count_reset(void);
+
 #ifdef  __cplusplus
 }
 #endif

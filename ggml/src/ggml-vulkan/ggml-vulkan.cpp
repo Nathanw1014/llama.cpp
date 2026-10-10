@@ -22954,6 +22954,27 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// fused-dispatch engagement counters (see ggml-vulkan.h): a map keyed by the fusion name, bumped once per enqueued
+// fused dispatch. Only read by tests and the engagement checks, so a mutex per bump is fine.
+static std::mutex g_vk_fusion_count_mutex;
+static std::unordered_map<std::string, uint64_t> g_vk_fusion_counts;
+
+static void ggml_vk_fusion_count_add(const char * name) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    g_vk_fusion_counts[name] += 1;
+}
+
+uint64_t ggml_backend_vk_fusion_count(const char * fusion_name) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    auto it = g_vk_fusion_counts.find(fusion_name);
+    return it == g_vk_fusion_counts.end() ? 0 : it->second;
+}
+
+void ggml_backend_vk_fusion_count_reset(void) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    g_vk_fusion_counts.clear();
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -23565,6 +23586,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        if (enqueued && fusion_string) {
+            ggml_vk_fusion_count_add(fusion_string);
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -25197,6 +25221,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_get_max_tensor_size") == 0) {
         return (void *) ggml_backend_vk_dev_get_max_tensor_size;
+    }
+    if (strcmp(name, "ggml_backend_vk_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_fusion_count_reset") == 0) {
+        return (void *) ggml_backend_vk_fusion_count_reset;
     }
     return nullptr;
 }
