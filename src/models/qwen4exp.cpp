@@ -393,6 +393,15 @@ static bool qwen4exp_hc_gate16() {
     return on;
 }
 
+// LLAMA_HC_STRIP=<tokens>: strip-mine the hc up GEMM -> f16 gate -> DSV4_HC_MIX chain per token strip (E6, re-ported onto the
+// release's hc chain 10-10). 0 = off. On the 83c9 line 512-token strips read +1.8% d0 / +2.9% 8k Flash-Next pp (the mix and the
+// inject mat-vec stayed MALL-resident); here the down + inject GEMM (LLAMA_HC_DOWN_INJECT) stays full width and only the
+// up -> gate -> mix part is stripped, so the gain is to be re-measured on this line.
+static int64_t qwen4exp_hc_strip() {
+    static const int64_t v = [] { const char * e = getenv("LLAMA_HC_STRIP"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    return v;
+}
+
 // LLAMA_HC_MIXOP=0 restores the unfused mix collapse (sigmoid, mul, hc-1 adds, scale).
 static bool qwen4exp_hc_mixop() {
     static const bool on = [] {
@@ -767,6 +776,55 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         } else {
             ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo, 1, 0));
         }
+    }
+
+    // E6 strip-mining (LLAMA_HC_STRIP=<tokens>, default off): the up GEMM, its f16 gate cast and the mix run per token strip
+    // so each strip's lo / gate / xn stay MALL-resident across the three ops; the results land in views of one full-width
+    // mixed tensor (strip 0 allocates it), so no concat pass is added, and the strips are expanded here, before any consumer
+    // of the full tensor, which orders them in the graph. The "hc_strip" names keep the Vulkan graph optimizer from hoisting
+    // the next strip's up GEMM in front of this strip's mix. The down (+ inject) GEMM above stays full width.
+    const int64_t hc_strip = qwen4exp_hc_strip();
+    if (hc_strip > 0 && nt > hc_strip && nt % hc_strip == 0 && qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() &&
+        qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32 && qwen4exp_takes_f16_b(model) &&
+        llm_graph_weights_on_gpu(w_up->buffer) && xn->type == GGML_TYPE_F16 && lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) &&
+        gate_logits->op == GGML_OP_CPY && !static_cast<const llama_model_qwen4exp &>(model).hc_up_interleaved()) {
+        const ggml_type mix_type = GGML_TYPE_F16;
+        const size_t xn_row = xn_padded ? xn->nb[1] : ggml_row_size(xn->type, hc_dim);
+        ggml_tensor * mixed_full = nullptr;
+        for (int64_t t0 = 0; t0 < nt; t0 += hc_strip) {
+            ggml_tensor * lo_s   = ggml_view_2d(ctx0, lo, lo->ne[0], hc_strip, lo->nb[1], t0 * lo->nb[1]);
+            ggml_tensor * up_s   = ggml_mul_mat(ctx0, w_up, lo_s);
+            ggml_set_name(up_s, "hc_strip_up");
+            ggml_tensor * gate_s = ggml_cast(ctx0, up_s, GGML_TYPE_F16);
+            ggml_set_name(gate_s, "hc_strip_gate");
+            if (qwen4exp_hc_keep_srcs()) {
+                qwen4exp_keep_until(gate_s, lo_s);
+            } else {
+                ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo_s, 1, 0));
+            }
+            // the strip's xn as [n_embd, hc, strip] with the (padded) row stride, like xn3 below
+            ggml_tensor * xs3 = ggml_view_3d(ctx0, xn, n_embd, hc, hc_strip, n_embd * ggml_element_size(xn), xn_row, t0 * xn_row);
+            ggml_tensor * dst = mixed_full == nullptr ? nullptr
+                              : ggml_view_2d(ctx0, mixed_full, n_embd, hc_strip, mixed_full->nb[1], t0 * mixed_full->nb[1]);
+            ggml_tensor * mixed_s = ggml_dsv4_hc_mix_strip(ctx0, xs3, gate_s, 1.0f / (float) hc, mix_type, false, nt, dst);
+            ggml_set_name(mixed_s, "hc_strip_mix");
+            if (mixed_full == nullptr) {
+                mixed_full = mixed_s;
+            }
+            ggml_build_forward_expand(gf, mixed_s);
+        }
+        cb(mixed_full, "hc_mixed", il);
+        if (inject) {
+            if (dinj) {
+                *inject = ggml_cont(ctx0, ggml_view_2d(ctx0, dinj, hc, nt, dinj->nb[1], w_down->ne[1] * ggml_element_size(dinj)));   // [hc, nt]
+            } else {
+                ggml_tensor * w_rows = ggml_get_rows(ctx0, w_inject, build_hc_consts()->iota); // f32 [hc_dim, hc]
+                ggml_tensor * inj_t  = ggml_mul_mat(ctx0, xn, w_rows);              // [nt, hc]
+                *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));             // [hc, nt]
+            }
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed_full;
     }
 
     ggml_tensor * mixed;

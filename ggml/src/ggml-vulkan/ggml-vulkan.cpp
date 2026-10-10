@@ -23784,6 +23784,20 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             continue;
         }
 
+        // hc strip chain (qwen4exp build_hc_mix, LLAMA_HC_STRIP): nodes named "hc_strip*" run in build order, nothing is hoisted
+        // across them and nothing is hoisted behind one. The per-strip MALL residency (up -> mix -> inject on one 512-token
+        // strip) is exactly the order the grab below would destroy (2026-10-10 round 4: inject 117 -> 28 us per call in order).
+        auto const &is_hc_strip = [](const ggml_tensor * t) -> bool { return strncmp(t->name, "hc_strip", 8) == 0; };
+        if (is_hc_strip(graph->nodes[first_unused])) {
+            new_order.push_back(graph->nodes[first_unused]);
+            used[first_unused] = true;
+            used_node_set.insert(graph->nodes[first_unused]);
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                ++first_unused;
+            }
+            continue;
+        }
+
         // First, grab the next unused node.
         current_set.push_back(first_unused);
 
@@ -23797,6 +23811,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
+            }
+            if (is_hc_strip(graph->nodes[j])) {
+                break;   // never hoist past an hc strip node
             }
             if (is_empty(graph->nodes[j])) {
                 continue;

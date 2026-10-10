@@ -6537,6 +6537,49 @@ struct ggml_tensor * ggml_dsv4_hc_mix_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_hc_mix_strip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xn,
+        struct ggml_tensor  * gate,
+        float                 scale,
+        enum   ggml_type      type,
+        bool                  gate_interleaved,
+        int64_t               n_tokens_total,
+        struct ggml_tensor  * dst) {
+    GGML_ASSERT(xn->type == GGML_TYPE_F32 || xn->type == GGML_TYPE_F16);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+
+    const int64_t n_embd   = xn->ne[0];
+    const int64_t hc       = xn->ne[1];
+    const int64_t n_strip  = xn->ne[2];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(xn->ne[3] == 1);
+    GGML_ASSERT(gate->ne[0] == n_embd * hc);
+    GGML_ASSERT(gate->ne[1] == n_strip);
+    GGML_ASSERT(gate->ne[2] == 1);
+    GGML_ASSERT(gate->ne[3] == 1);
+    GGML_ASSERT(n_tokens_total >= n_strip);
+
+    struct ggml_tensor * result;
+    if (dst == NULL) {
+        result = ggml_new_tensor_2d(ctx, type, n_embd, n_tokens_total);
+    } else {
+        GGML_ASSERT(dst->type == type && dst->ne[0] == n_embd && dst->ne[1] == n_strip && dst->nb[0] == ggml_type_size(type));
+        result = ggml_view_tensor(ctx, dst);   // same bytes as the view, its own op (the ggml_cpy idiom)
+    }
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, gate_interleaved ? 1 : 0);
+
+    result->op     = GGML_OP_DSV4_HC_MIX;
+    result->src[0] = xn;
+    result->src[1] = gate;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

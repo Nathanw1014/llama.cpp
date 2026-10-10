@@ -2676,6 +2676,20 @@ extern "C" {
             enum   ggml_type      type,
             bool                  gate_interleaved);
 
+    // hc_mix of one TOKEN STRIP written into a larger result (E6 strip-mining, 2026-10-09): xn / gate hold n_strip tokens;
+    // dst == NULL allocates the full [n_embd, n_tokens_total] result and writes its first n_strip tokens, otherwise dst is a
+    // token-range view of that result (ggml_view_2d) and the op writes there. The result tensor of the strip-0 call is the
+    // full tensor the consumers read; the later strips must be built (expanded) before those consumers.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix_strip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * gate,
+            float                 scale,
+            enum   ggml_type      type,
+            bool                  gate_interleaved,
+            int64_t               n_tokens_total,
+            struct ggml_tensor  * dst);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
