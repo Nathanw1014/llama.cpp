@@ -714,6 +714,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, hc_dim + xn_pad, nt);
                 ggml_tensor * dst = ggml_view_3d(ctx0, buf, n_embd, hc, nt,
                         n_embd * ggml_element_size(buf), buf->nb[1], 0);
+                // Put the destination's VIEW node in the graph now, ahead of the norm chain. Expanded from the CPY it
+                // is visited after the MUL (src[0] first), which puts a VIEW between MUL and CPY and the backend's
+                // RMS_NORM_MUL_CPY / HC_POST_NORM_CPY matchers (consecutive nodes) fall back to the unfused chain:
+                // 36 of 95 hc-norm fusions lost on FN REAP-320 with the pad on (10-10, repack-camping-recheck.md R1).
+                ggml_build_forward_expand(gf, dst);
                 xn = ggml_cpy(ctx0, xn, dst);
                 xn_padded = true;
             } else {
@@ -1062,6 +1067,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
             ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, row + pad, out->ne[2]);
             ggml_tensor * dst = ggml_view_4d(ctx0, buf, out->ne[0], out->ne[1], out->ne[2], 1,
                     out->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * out->ne[2], 0);
+            // the destination's VIEW goes into the graph ahead of the chain (see build_hc_mix): otherwise it sits
+            // between the gate MUL and the CPY and RMS_NORM_MUL_SIGMUL_CPY never matches (35 -> 0 with the pad on)
+            ggml_build_forward_expand(gf, dst);
             return ggml_cpy(ctx0, out, dst);
         }
         return ggml_cast(ctx0, out, GGML_TYPE_F16);
