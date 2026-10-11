@@ -55,6 +55,9 @@ const std::vector<std::string> type_names = {
     "tq2_t",
     "tqk6",
     "tqk7",
+    "tqp5",
+    "tqp6",
+    "tqp7",
 #endif
     "q2_0",
     "q4_0",
@@ -253,7 +256,8 @@ bool is_iq_quant(const std::string& type_name) {
 
 // Trellis/ternary types : per-type mul_mm SPIR-V, no coopmat2 decoder
 bool is_trellis_quant(const std::string& type_name) {
-    return type_name == "ptq1_0" || type_name == "tq2_t" || type_name == "tqk6" || type_name == "tqk7";
+    return type_name == "ptq1_0" || type_name == "tq2_t" || type_name == "tqk6" || type_name == "tqk7" ||
+           type_name == "tqp5" || type_name == "tqp6" || type_name == "tqp7";
 }
 
 static const char path_separator = '/';
@@ -437,7 +441,8 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
     // Experiment knob (build time): trellis shaders read the codebook straight from the
     // constant array instead of copying it into shared memory per workgroup.
     if (getenv("GGML_VK_TQ_LUT_DIRECT") && !defines.count("TQ_LUT_DIRECT") &&
-        (defines.count("DATA_A_TQ2_T") || defines.count("DATA_A_TQK6") || defines.count("DATA_A_TQK7"))) {
+        (defines.count("DATA_A_TQ2_T") || defines.count("DATA_A_TQK6") || defines.count("DATA_A_TQK7") ||
+         defines.count("DATA_A_TQP5") || defines.count("DATA_A_TQP6") || defines.count("DATA_A_TQP7"))) {
         std::map<std::string, std::string> defines_direct = defines;
         defines_direct["TQ_LUT_DIRECT"] = "1";
         string_to_spv(name, source, defines_direct, fp16, coopmat, coopmat2, f16acc, suffix);
