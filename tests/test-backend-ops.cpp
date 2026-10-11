@@ -6883,6 +6883,30 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
+// the REAP-320 expert shapes with the REG_A engagement assert (GGML_VK_TEST_REQUIRE_REGA=1): same graph and compare as the base case
+struct test_mul_mat_id_rega : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    static bool required() {
+        static const bool r = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_REGA"); return e != nullptr && atoi(e) != 0; }();
+        return r;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        dispatch_census_reset(backend);
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_REGA");
+        if (n < 0 || !required()) {
+            return true;
+        }
+        if (n == 0) {
+            msg = "MUL_MAT_ID_REGA dispatches: 0 (GGML_VK_TEST_REQUIRE_REGA=1; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken)";
+            return false;
+        }
+        return true;
+    }
+};
+
 struct test_mul_mat_id_cold : public test_case {
     const ggml_type type_a;
     const int n_mats;
@@ -14146,10 +14170,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Flash-Next REAP-320 expert shapes at ub2048 (320 experts, top-10, 64 rows per expert): the MMID tile selector takes the medium
     // tile here, which is the only place the REG_A (register-direct A, 128x64, wave32) pipeline engages on iq3_xxs / iq4_nl; both B
     // types, since the in-model B is f16 on the fork line and f32 on halo-box (an engagement count of 0 here means REG_A untested)
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true, 2560, 2048, 640));
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, true, 2560, 2048, 640));
+    // GGML_VK_TEST_REQUIRE_REGA=1 (the wave-3 filler, with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all): each of these must
+    // run at least one MUL_MAT_ID_REGA dispatch on Vulkan, else it fails; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken
+    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true, 2560, 2048, 640));
+    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, true, 2560, 2048, 640));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
