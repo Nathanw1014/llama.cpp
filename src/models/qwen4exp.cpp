@@ -812,6 +812,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         const ggml_type mix_type = GGML_TYPE_F16;
         const size_t xn_row = xn_padded ? xn->nb[1] : ggml_row_size(xn->type, hc_dim);
         ggml_tensor * mixed_full = nullptr;
+        ggml_tensor * prev_strip = nullptr;
         for (int64_t t0 = 0; t0 < nt; t0 += hc_strip) {
             ggml_tensor * lo_s   = ggml_view_2d(ctx0, lo, lo->ne[0], hc_strip, lo->nb[1], t0 * lo->nb[1]);
             ggml_tensor * up_s   = ggml_mul_mat(ctx0, w_up, lo_s);
@@ -831,8 +832,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             ggml_set_name(mixed_s, "hc_strip_mix");
             if (mixed_full == nullptr) {
                 mixed_full = mixed_s;
+            } else {
+                // strips 1.. are views of the full tensor (the ggml_cpy idiom) and nothing reads them as such: ggml-alloc
+                // releases a tensor only when every view of it has been consumed, so with the views dangling the full
+                // mixed tensor of every mix stayed allocated to the end of the graph (96 x 10 MiB at ub 2048 on
+                // Flash-Next, the ~1 GB over halo-box's reserve, 10-11). Each strip lists the previous one as an
+                // unread extra source and the result view below lists the last, which closes the chain: the full
+                // tensor is freed after the block that reads it.
+                qwen4exp_keep_until(mixed_s, prev_strip);
             }
+            prev_strip = mixed_s;
             ggml_build_forward_expand(gf, mixed_s);
+        }
+        if (prev_strip != mixed_full) {
+            ggml_tensor * mixed_out = ggml_view_2d(ctx0, mixed_full, mixed_full->ne[0], mixed_full->ne[1], mixed_full->nb[1], 0);
+            qwen4exp_keep_until(mixed_out, prev_strip);
+            mixed_full = mixed_out;
         }
         cb(mixed_full, "hc_mixed", il);
         if (inject) {
