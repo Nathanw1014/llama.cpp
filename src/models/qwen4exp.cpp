@@ -687,6 +687,20 @@ llama_model_qwen4exp::llm_graph_input_hc_consts * llama_model_qwen4exp::graph::b
     return hc_consts;
 }
 
+// one padded destination per graph (see models.h): a fresh leaf only when none exists or the shape differs
+ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name) {
+    static const bool shared = [] { const char * e = getenv("LLAMA_PAD_BUF_SHARED"); return e == nullptr || atoi(e) != 0; }();
+    if (shared && *slot != nullptr && (*slot)->ne[0] == ne0 && (*slot)->ne[1] == ne1) {
+        return *slot;
+    }
+    ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, ne0, ne1);
+    ggml_set_name(buf, name);
+    if (shared) {
+        *slot = buf;
+    }
+    return buf;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -724,7 +738,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             // prefill only (nt >= 32): at decode the f16-B mat-vec paths are slower than the f32 ones
             // and there is no conversion pass to save (2026-09-14: tg 27.2 -> 25.2 with the cast at N=1)
             if (xn_pad > 0) {
-                ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, hc_dim + xn_pad, nt);
+                // one buffer per graph, not per layer (models.h pad_buf): every reader of this layer's xn precedes the next
+                // layer's norm through the residual stream, and the backend orders the overlapping write behind them
+                ggml_tensor * buf = pad_buf(&hc_xn_pad_buf, hc_dim + xn_pad, nt, "hc_xn_pad");
                 ggml_tensor * dst = ggml_view_3d(ctx0, buf, n_embd, hc, nt,
                         n_embd * ggml_element_size(buf), buf->nb[1], 0);
                 // Put the destination's VIEW node in the graph now, ahead of the norm chain. Expanded from the CPY it
@@ -1130,7 +1146,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : 128; }();
         const int64_t row = out->ne[0] * out->ne[1];
         if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
-            ggml_tensor * buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, row + pad, out->ne[2]);
+            ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, out->ne[2], "gdn_norm_pad");   // one per graph, see models.h
             ggml_tensor * dst = ggml_view_4d(ctx0, buf, out->ne[0], out->ne[1], out->ne[2], 1,
                     out->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * out->ne[2], 0);
             // the destination's VIEW goes into the graph ahead of the chain (see build_hc_mix): otherwise it sits

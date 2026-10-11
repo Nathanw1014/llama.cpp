@@ -2415,6 +2415,14 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // the padded f16 destinations of LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD: one buffer per graph, written and read by one
+        // layer at a time. A per-layer ggml_new_tensor_2d is a graph LEAF, and ggml-alloc allocates every leaf before the
+        // first node, so 48 x 40.5 MiB (hc) + 36 x 25 MiB (GDN) sat in the compute buffer at ub 2048 for the whole graph
+        // (2.8 GB of the 5.3 GB Flash-Next reserve, 10-11). LLAMA_PAD_BUF_SHARED=0 restores the per-layer buffers.
+        ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * gdn_norm_pad_buf = nullptr;
+        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
+
         // hc fast path constants (I32 iota [hc], F32 identity [hc, hc]), created on first use
         llm_graph_input_hc_consts * hc_consts = nullptr;
         llm_graph_input_hc_consts * build_hc_consts();
