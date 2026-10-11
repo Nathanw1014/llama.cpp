@@ -22551,6 +22551,19 @@ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, co
 // the MoE gate/up projections feeding the GLU and the weighted down projection feeding the expert combine.
 // GGML_VK_FUSE_MM_CPY16=0 disables. GEMM (coopmat, f16 B) shapes only: the mat-vec, MMQ and split-K paths
 // all write f32.
+// GGML_VK_ALLOC_DEPS=0 disables the allocation dependencies graph_optimize adds for the fusions whose kernel reads
+// the inputs of the first nodes while it writes the last node's output (default on). Without them ggml-alloc may place
+// that output on the bytes of an input whose last reader is an earlier node of the fusion, and the overlap check
+// in graph_compute then drops the fusion on that graph (or, for the direct GDN conv, the dispatch aliases).
+// Mechanism from halo-box (strix-llama.cpp, ggml_backend_graph_optimize_params::add_alloc_dep).
+static bool ggml_vk_alloc_deps_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_ALLOC_DEPS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool ggml_vk_mm_cpy16_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_MM_CPY16");
@@ -23706,12 +23719,119 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 }
 
 // Sort the graph for improved parallelism.
-static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph)
+// Allocation dependencies for the fusions graph_compute will match on this (final) node order: every tensor a fused
+// node reads that the fusion does not itself produce stays allocated until the fused output is. The matchers are the
+// ones graph_compute uses, in its priority order, so the set of kept tensors is exactly the set the fused dispatch reads.
+static void ggml_vk_graph_add_alloc_deps(ggml_backend_vk_context * ctx, const struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params) {
+    if (!params || !params->add_alloc_dep || ctx->device->disable_fusion || !ggml_vk_alloc_deps_enabled()) {
+        return;
+    }
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+
+    auto const &keep_srcs = [&](int first, int last, const char * what) {
+        for (int j = first; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                ggml_tensor * src = node->src[s];
+                if (!src || src->op == GGML_OP_NONE) {
+                    continue;   // weights, inputs and the KV cache are not ggml-alloc tensors
+                }
+                bool internal = false;
+                for (int k = first; k < j && !internal; ++k) {
+                    internal = graph->nodes[k] == src;
+                }
+                if (!internal) {
+                    params->add_alloc_dep(params->user_data, src, graph->nodes[last]);
+                }
+            }
+        }
+        if (dbg) {
+            fprintf(stderr, "ggml_vulkan: alloc deps %s nodes %d..%d (%s)\n", what, first, last, graph->nodes[last]->name);
+        }
+    };
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        int n_fused = 0;   // additional fused ops behind node i
+        const char * what = nullptr;
+        int idx;
+        if (const int gate_n = ggml_vk_can_fuse_hc_post_gate(ctx, graph, i)) {
+            n_fused = gate_n;
+            what = gate_n == 6 ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE";
+        } else if (ggml_vk_can_fuse_hc_post_norm(ctx, graph, i)) {
+            n_fused = 3;
+            what = "HC_POST_NORM_CPY";
+        } else if (node->op == GGML_OP_MUL_MAT && (idx = ggml_vk_match_hc_up_mix(ctx, graph, i)) != 0) {
+            n_fused = idx - i;
+            what = "HC_UP_MIX";
+        } else if (ggml_vk_can_fuse_mmid_swiglu(ctx, graph, i)) {
+            n_fused = 4;
+            what = "MUL_MAT_ID_SWIGLU";
+        } else if (ggml_vk_can_fuse_mmid_swiglu_merged(ctx, graph, i)) {
+            n_fused = (int) mmid_swiglu_merged_pattern.size() - 1;
+            what = "MUL_MAT_ID_SWIGLU_MERGED";
+        } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, graph, i, true)) {
+            n_fused = 2;
+            what = "MUL_MAT_ID_MUL_CPY16";
+        } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, graph, i, false)) {
+            n_fused = 1;
+            what = "MUL_MAT_ID_CPY16";
+        } else if (ggml_vk_can_fuse_mm_cpy16(ctx, graph, i)) {
+            n_fused = 1;
+            what = "MUL_MAT_CPY16";
+        } else if (ggml_vk_can_fuse_ssm_conv_direct_l2(ctx, graph, i)) {
+            n_fused = 5;
+            what = "CONCAT_SSM_CONV_SILU_L2";
+        } else if (ggml_vk_can_fuse_ssm_conv_direct(ctx, graph, i)) {
+            n_fused = 2;
+            what = "CONCAT_SSM_CONV_SILU";
+        } else if (ggml_can_fuse_subgraph(graph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
+                   ggml_check_edges(graph, i, topk_moe_early_softmax_norm_edges) &&
+                   ggml_vk_can_fuse_topk_moe(ctx, graph, i, TOPK_MOE_EARLY_SOFTMAX_NORM)) {
+            n_fused = (int) topk_moe_early_softmax_norm.size() - 1;
+            what = "TOPK_MOE_EARLY_SOFTMAX_NORM";
+        } else if (ggml_can_fuse_subgraph(graph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
+                   ggml_check_edges(graph, i, topk_moe_sigmoid_norm_bias_edges) &&
+                   ggml_vk_can_fuse_topk_moe(ctx, graph, i, TOPK_MOE_SIGMOID_NORM_BIAS)) {
+            n_fused = (int) topk_moe_sigmoid_norm_bias.size() - 1;
+            what = "TOPK_MOE_SIGMOID_NORM_BIAS";
+        } else if (ggml_can_fuse_subgraph(graph, i, topk_moe_sqrt_softplus_norm_bias, { i + 5, i + 11 }) &&
+                   ggml_check_edges(graph, i, topk_moe_sqrt_softplus_norm_bias_edges) &&
+                   ggml_vk_can_fuse_topk_moe(ctx, graph, i, TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS)) {
+            n_fused = (int) topk_moe_sqrt_softplus_norm_bias.size() - 1;
+            what = "TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS";
+        } else if (ggml_can_fuse_subgraph(graph, i, topk_moe_early_softmax, { i + 3, i + 4 }) &&
+                   ggml_check_edges(graph, i, topk_moe_early_softmax_edges) &&
+                   ggml_vk_can_fuse_topk_moe(ctx, graph, i, TOPK_MOE_EARLY_SOFTMAX)) {
+            n_fused = (int) topk_moe_early_softmax.size() - 1;
+            what = "TOPK_MOE_EARLY_SOFTMAX";
+        } else if (ggml_can_fuse_subgraph(graph, i, topk_moe_late_softmax, { i + 1, i + 5 }) &&
+                   ggml_check_edges(graph, i, topk_moe_late_softmax_edges) &&
+                   ggml_vk_can_fuse_topk_moe(ctx, graph, i, TOPK_MOE_LATE_SOFTMAX)) {
+            n_fused = (int) topk_moe_late_softmax.size() - 1;
+            what = "TOPK_MOE_LATE_SOFTMAX";
+        }
+        if (what != nullptr && strncmp(what, "TOPK_MOE", 8) == 0) {
+            // the trailing scale some TOPK_MOE variants fuse (deepseek2, nemotron3 nano)
+            if (ggml_can_fuse_subgraph(graph, i + n_fused - 1, { GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE }, { i + n_fused + 1 }) ||
+                ggml_can_fuse_subgraph(graph, i + n_fused, { GGML_OP_GET_ROWS, GGML_OP_SCALE }, { i + n_fused + 1 })) {
+                n_fused++;
+            }
+        }
+        if (n_fused > 0 && i + n_fused < graph->n_nodes) {
+            keep_srcs(i, i + n_fused, what);
+            i += n_fused;
+        }
+    }
+}
+
+static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     if (ctx->device->disable_graph_optimize) {
+        ggml_vk_graph_add_alloc_deps(ctx, graph, params);
         return;
     }
 
@@ -24099,6 +24219,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }
+
+    ggml_vk_graph_add_alloc_deps(ctx, graph, params);
 }
 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {

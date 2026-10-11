@@ -440,18 +440,22 @@ static void qwen4exp_keep_until(ggml_tensor * node, ggml_tensor * t) {
     GGML_ABORT("no free source slot");
 }
 
-// LLAMA_HC_KEEP_SRCS=1 keeps the inputs of a combine (block output, residual, inject weights) allocated until
-// the next mix's f16 norm cast is. Their last reader is the DSV4_HC_POST that Vulkan fuses with that norm
-// (HC_POST_NORM_CPY), so ggml-alloc was free to put the f16 norm output on their bytes; the fused kernel would
-// then overwrite rows other workgroups have not read yet, and the overlap check dropped the fusion on 32 of 96
-// combines at d0 and 50 at d16384 (REAP-320 ub2048). The hc gate cast keeps the low-rank input the same way
-// instead of through a consumer-less view, which pinned it to the end of the graph.
-static bool qwen4exp_hc_keep_srcs() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_HC_KEEP_SRCS");   // default on (2026-10-05); =0 restores the keep-alive view
-        return e == nullptr || atoi(e) != 0;
+// LLAMA_HC_KEEP_SRCS: model-level keep-alives for the inputs the Vulkan hc fusions read while they write their
+// output (the combine's block output, residual and inject weights until the next mix's f16 norm cast; the low-rank
+// input until the gate cast / the mix). Their last reader is the first node of the fusion, so ggml-alloc was free to
+// put the fused output on their bytes; the fused kernel would then overwrite rows other workgroups have not read
+// yet, and the overlap check dropped the fusion on 32 of 96 combines at d0 and 50 at d16384 (REAP-320 ub2048).
+//   0 (default since 2026-10-11): none; the backend adds the dependencies itself, scoped per fused output, from
+//     graph_optimize (ggml_backend_graph_optimize_params::add_alloc_dep, GGML_VK_ALLOC_DEPS), so nothing is kept
+//     on graphs the fusion does not take, and the hc stream tensors are not pinned across the layer;
+//   1: the 2026-10-05 default, the inputs listed as extra (unread) sources of the fused output;
+//   2: the 2026-09 consumer-less views of the low-rank input (pinned it to the end of the graph; no combine keep).
+static int qwen4exp_hc_keep_srcs() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_HC_KEEP_SRCS");
+        return e == nullptr ? 0 : atoi(e);
     }();
-    return on;
+    return mode;
 }
 
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
@@ -733,7 +737,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             } else {
                 xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
             }
-            if (x->op == GGML_OP_DSV4_HC_POST && qwen4exp_hc_keep_srcs()) {
+            if (x->op == GGML_OP_DSV4_HC_POST && qwen4exp_hc_keep_srcs() == 1) {
                 // the combine's inputs stay allocated until the cast is (see qwen4exp_hc_keep_srcs)
                 for (int s = 0; s < 3; ++s) {
                     qwen4exp_keep_until(xn, x->src[s]);
@@ -770,10 +774,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // DSV4_HC_MIX reads the f16 gate; the 84 MB f32 gate tensor is neither written nor read (prefill only)
         gate_logits = ggml_cast(ctx0, gate_logits, GGML_TYPE_F16);
         // the low-rank input stays referenced past the cast: the fused matmul reads it while it writes the
-        // cast's destination, so the allocator must not place the two on the same bytes
-        if (qwen4exp_hc_keep_srcs()) {
+        // cast's destination, so the allocator must not place the two on the same bytes (the backend's alloc
+        // dependency does this under LLAMA_HC_KEEP_SRCS=0)
+        if (qwen4exp_hc_keep_srcs() == 1) {
             qwen4exp_keep_until(gate_logits, lo);
-        } else {
+        } else if (qwen4exp_hc_keep_srcs() == 2) {
             ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo, 1, 0));
         }
     }
@@ -797,9 +802,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             ggml_set_name(up_s, "hc_strip_up");
             ggml_tensor * gate_s = ggml_cast(ctx0, up_s, GGML_TYPE_F16);
             ggml_set_name(gate_s, "hc_strip_gate");
-            if (qwen4exp_hc_keep_srcs()) {
+            if (qwen4exp_hc_keep_srcs() == 1) {
                 qwen4exp_keep_until(gate_s, lo_s);
-            } else {
+            } else if (qwen4exp_hc_keep_srcs() == 2) {
                 ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo_s, 1, 0));
             }
             // the strip's xn as [n_embd, hc, strip] with the (padded) row stride, like xn3 below
@@ -848,9 +853,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                                       : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt);
         mixed = ggml_dsv4_hc_mix_ext(ctx0, xn3, gate_logits, 1.0f / (float) hc, mix_type, gate_il);
         cb(mixed, "hc_mixed", il);
-        if (gate_il && gate_logits->op == GGML_OP_CPY) {
+        if (gate_il && gate_logits->op == GGML_OP_CPY && qwen4exp_hc_keep_srcs() != 0) {
             // HC_UP_MIX reads the low-rank input in the GEMM while its epilogue writes the mixed stream: keep lo
             // allocated until the mix is, so the allocator cannot hand the mixed stream lo's freed bytes
+            // (the backend's alloc dependency does this under LLAMA_HC_KEEP_SRCS=0)
             qwen4exp_keep_until(mixed, lo);
         }
     } else {
