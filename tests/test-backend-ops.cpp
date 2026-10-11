@@ -5566,6 +5566,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const ggml_type type_x;    // f16: the f16 hc norm
     const int64_t pad;         // > 0: x is a [n_embd, n_hc, n_tokens] view of a [n_embd*n_hc + pad, n_tokens] buffer
                                // (LLAMA_HC_XN_PAD rows; 128 = the shipped pad, 2048 = a stride that camps again)
+    const ggml_type type_gate; // f16: the f16 gate (LLAMA_HC_GATE_F16), gated with an f16 x only
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5573,6 +5574,9 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
+        if (type_gate != GGML_TYPE_F32) {
+            return VARS_TO_STR7(n_embd, n_hc, n_tokens, gated, type_x, pad, type_gate);
+        }
         if (pad != 0) {
             return VARS_TO_STR6(n_embd, n_hc, n_tokens, gated, type_x, pad);
         }
@@ -5582,8 +5586,9 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated);
     }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type type_x = GGML_TYPE_F32, int64_t pad = 0)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x), pad(pad) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type type_x = GGML_TYPE_F32, int64_t pad = 0,
+                     ggml_type type_gate = GGML_TYPE_F32)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x), pad(pad), type_gate(type_gate) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x;
@@ -5597,7 +5602,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         ggml_set_name(x, "x");
 
         if (gated) {
-            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_gate, n_embd, n_hc, n_tokens);
             ggml_set_name(gate, "gate");
 
             out = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
@@ -12796,6 +12801,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16, 128));   // row-padded f16 xn (LLAMA_HC_XN_PAD)
+    // the f16 gate (LLAMA_HC_GATE_F16) with the f16 norm: the shapes above, the Flash-Next hc width, and the padded rows
+    test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, 0,   GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64,   true, GGML_TYPE_F16, 128, GGML_TYPE_F16));
 
     // MUL_MAT + CPY(f16): exact and ragged tiles, the column count at the mat-vec boundary, the Flash-Next hc up GEMM
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
