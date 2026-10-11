@@ -1984,7 +1984,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         qk_norm = build_gdn_l2_norm(ctx0, qk_view, hparams.f_norm_rms_eps);
         ggml_build_forward_expand(gf, qk_norm);
     }
-    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 1, 0));
+    // the projection must stay allocated while the fused conv reads it (CONCAT_SSM_CONV_SILU(_L2) reads the qkv view
+    // and the state while it writes the conv output): the backend's alloc dependency does that; LLAMA_KEEP_PINS=1
+    // restores the consumer-less view, which held the whole [qkv_dim, n_tokens] projection to the end of the graph
+    // on every GDN layer (the largest share of the 5.6 GB Flash-Next compute buffer at -c 8192 -ub 2048)
+    if (llm_graph_keep_pins()) {
+        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 1, 0));
+    }
 
     // Extract the convolved Q, K, V from conv_output
     ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,

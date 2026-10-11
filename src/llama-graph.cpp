@@ -1923,6 +1923,14 @@ bool llm_graph_weights_on_gpu(ggml_backend_buffer_t buf) {
 // The expert weights must sit on a GPU buffer: a CPU mul_mat_id converts its B operand from f32 and
 // reads f16 activations as garbage (keep-320 PPL = nan with -ncmoe 8, 2026-09-14), so layers whose experts
 // are host-resident keep the f32 chain.
+bool llm_graph_keep_pins() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_KEEP_PINS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool llm_graph_moe_f16(int64_t n_tokens, const ggml_tensor * exps) {
     static const bool on = [] {
         const char * e = getenv("LLAMA_MOE_F16");
@@ -2168,13 +2176,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (llm_graph_moe_f16(n_tokens, down_exps)) {
             // f16 expert activations at prefill: one cast of the merged projection, pinned right behind its
             // matmul so the backend fuses MUL_MAT_ID+CPY(f16) and stores f16 from the accumulator; the gate
-            // and up views below are then f16 and the GLU runs f16 in / f16 out. The block input stays
-            // referenced past the cast (view expanded after it) so its bytes cannot become the destination.
+            // and up views below are then f16 and the GLU runs f16 in / f16 out. The block input must stay
+            // allocated past the cast so its bytes cannot become the destination: the backend's alloc
+            // dependency does that (LLAMA_KEEP_PINS=1: the old consumer-less view, which held it to the graph's end)
             ggml_tensor * moe_inp = cur;
             gate_up = ggml_cast(ctx0, gate_up, GGML_TYPE_F16);
             cb(gate_up, "ffn_moe_gate_up_f16", il);
             ggml_build_forward_expand(gf, gate_up);
-            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));
+            if (llm_graph_keep_pins()) {
+                ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));
+            }
         }
 
         const int64_t n_ff = gate_up->ne[0] / 2;
@@ -2238,7 +2249,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
             cb(cur, "ffn_moe_gate_f16", il);
             ggml_build_forward_expand(gf, cur);
-            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));   // keep moe_inp alive past the cast
+            if (llm_graph_keep_pins()) {
+                ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));   // keep moe_inp alive past the cast
+            }
         }
     }
 
@@ -2359,10 +2372,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // f16 expert outputs: the weighted down projection stores f16 (MUL_MAT_ID+MUL+CPY(f16) fusion) and
         // the combine below reads f16 and sums in f32 (ggml_add_cast, MULTI_ADD f16in kernel): half the
         // bytes of the largest elementwise pass in the block. The GLU output (the down projection's B
-        // operand) stays referenced past the cast so its bytes cannot be reused for the cast's destination.
+        // operand) must stay allocated past the cast so its bytes cannot be reused for the cast's destination:
+        // the backend's alloc dependency (LLAMA_KEEP_PINS=1: the old consumer-less view, held to the graph's end)
         experts = ggml_cast(ctx0, experts, GGML_TYPE_F16);
         cb(experts, "ffn_moe_weighted_f16", il);
-        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, cur, 1, 0));
+        if (llm_graph_keep_pins()) {
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, cur, 1, 0));
+        }
     }
 
     ggml_build_forward_expand(gf, experts);

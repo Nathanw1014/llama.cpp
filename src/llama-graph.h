@@ -12,6 +12,13 @@
 #include <functional>
 #include <map>
 
+
+// LLAMA_KEEP_PINS=1: the pre-2026-10-11 consumer-less view pins that kept a fusion's input allocated (the block input past
+// the f16 expert cast, the GLU output past the f16 down cast, the GDN qkv projection past its conv). A pinned tensor is
+// never freed before the end of the graph, so every layer's copy stayed resident: 5.6 GB of the Flash-Next compute
+// buffer at -c 8192 -ub 2048. The backend keeps those inputs itself now, scoped to the fused output
+// (ggml_backend_graph_optimize_params::add_alloc_dep), so the default is 0.
+bool llm_graph_keep_pins();
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
