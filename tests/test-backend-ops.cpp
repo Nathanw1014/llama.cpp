@@ -3634,6 +3634,10 @@ struct test_ssm_conv_direct : public test_case {
 // heads with the v columns, read through a view past them as the GDN does.
 struct test_ssm_conv_direct_l2 : public test_case {
     const int64_t n_qk_heads, v_channels, n_t, n_s;
+    // mode 0: the LLAMA_GDN_CONV_L2 graph (one norm over the q|k heads, named "gdn_qk_l2"): Vulkan must take the fusion
+    // (exactly one CONCAT_SSM_CONV_SILU_L2 dispatch) and match the CPU; mode 1: the default GDN graph, q and k normalised
+    // separately from their own views, unnamed: the fusion must NOT engage (it broke the model when it did, 2026-10-11)
+    const int mode;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3643,11 +3647,37 @@ struct test_ssm_conv_direct_l2 : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_qk_heads, v_channels, n_t, n_s);
+        return VARS_TO_STR5(n_qk_heads, v_channels, n_t, n_s, mode);
     }
 
-    test_ssm_conv_direct_l2(int64_t n_qk_heads = 4, int64_t v_channels = 256, int64_t n_t = 37, int64_t n_s = 1)
-        : n_qk_heads(n_qk_heads), v_channels(v_channels), n_t(n_t), n_s(n_s) {}
+    test_ssm_conv_direct_l2(int64_t n_qk_heads = 4, int64_t v_channels = 256, int64_t n_t = 37, int64_t n_s = 1, int mode = 0)
+        : n_qk_heads(n_qk_heads), v_channels(v_channels), n_t(n_t), n_s(n_s), mode(mode) {}
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (count == nullptr) {
+            return true;   // not the Vulkan backend
+        }
+        const uint64_t n = count("CONCAT_SSM_CONV_SILU_L2");
+        const uint64_t want = mode == 0 ? 1 : 0;
+        if (n != want) {
+            msg = "CONCAT_SSM_CONV_SILU_L2 dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) +
+                  (mode == 0 ? ": the opt-in chain ran unfused)" : ": the default q/k chain must not fuse)");
+            return false;
+        }
+        return true;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hd = 128, d_conv = 4;
@@ -3662,14 +3692,28 @@ struct test_ssm_conv_direct_l2 : public test_case {
         ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
         ggml_tensor * silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, kern));
 
-        ggml_tensor * qk_view = ggml_view_4d(ctx, silu, hd, n_qk_heads, n_t, n_s,
-                hd * sizeof(float), silu->nb[1], silu->nb[2], 0);
         const float n = (float) hd;
-        ggml_tensor * qk = ggml_scale(ctx, ggml_rms_norm(ctx, qk_view, 1e-6f/n), 1.0f/sqrtf(n));
-
         ggml_tensor * v_view = ggml_view_3d(ctx, silu, v_channels, n_t, n_s, silu->nb[1], silu->nb[2],
                 n_qk_heads * hd * sizeof(float));
-        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_3d(ctx, qk, n_qk_heads * hd, n_t, n_s), ggml_cont(ctx, v_view), 0);
+        ggml_tensor * out = nullptr;
+        if (mode == 0) {
+            ggml_tensor * qk_view = ggml_view_4d(ctx, silu, hd, n_qk_heads, n_t, n_s,
+                    hd * sizeof(float), silu->nb[1], silu->nb[2], 0);
+            ggml_tensor * qk = ggml_scale(ctx, ggml_rms_norm(ctx, qk_view, 1e-6f/n), 1.0f/sqrtf(n));
+            ggml_set_name(qk, "gdn_qk_l2");
+            out = ggml_concat(ctx, ggml_reshape_3d(ctx, qk, n_qk_heads * hd, n_t, n_s), ggml_cont(ctx, v_view), 0);
+        } else {
+            // the default qwen4exp order: q view, k view, v view, then q's norm and k's norm (n_qk_heads = q + k heads)
+            GGML_ASSERT(n_qk_heads % 2 == 0);
+            const int64_t nk = n_qk_heads / 2;
+            ggml_tensor * q_view = ggml_view_4d(ctx, silu, hd, nk, n_t, n_s, hd * sizeof(float), silu->nb[1], silu->nb[2], 0);
+            ggml_tensor * k_view = ggml_view_4d(ctx, silu, hd, nk, n_t, n_s, hd * sizeof(float), silu->nb[1], silu->nb[2],
+                    nk * hd * sizeof(float));
+            ggml_tensor * q = ggml_scale(ctx, ggml_rms_norm(ctx, q_view, 1e-6f/n), 1.0f/sqrtf(n));
+            ggml_tensor * k = ggml_scale(ctx, ggml_rms_norm(ctx, k_view, 1e-6f/n), 1.0f/sqrtf(n));
+            out = ggml_concat(ctx, ggml_concat(ctx, ggml_reshape_3d(ctx, q, nk * hd, n_t, n_s), ggml_reshape_3d(ctx, k, nk * hd, n_t, n_s), 0),
+                              ggml_cont(ctx, v_view), 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -9760,6 +9804,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_direct_l2(4, 128, 70, 2));
     test_cases.emplace_back(new test_ssm_conv_direct_l2(32, 6144, 2048, 1));   // the Flash-Next shape
     test_cases.emplace_back(new test_ssm_conv_direct_l2(32, 6144, 33, 1));
+    // the default q/k chain (separate norms, unnamed): exact AND no CONCAT_SSM_CONV_SILU_L2 dispatch
+    test_cases.emplace_back(new test_ssm_conv_direct_l2(32, 6144, 2048, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_direct_l2(4,  128,  37,   2, 1));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({100, 3, 5, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 2048, 1}));   // the Flash-Next shape
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 33, 1}, 1e-6f, 128));     // LLAMA_GDN_NORM_PAD

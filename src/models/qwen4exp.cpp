@@ -1998,6 +1998,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         ggml_tensor * qk_view = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
                 ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
         qk_norm = build_gdn_l2_norm(ctx0, qk_view, hparams.f_norm_rms_eps);
+        ggml_set_name(qk_norm, "gdn_qk_l2");   // the Vulkan CONCAT_SSM_CONV_SILU_L2 kernel takes only this named chain
         ggml_build_forward_expand(gf, qk_norm);
     }
     // the projection must stay allocated while the fused conv reads it (CONCAT_SSM_CONV_SILU(_L2) reads the qkv view

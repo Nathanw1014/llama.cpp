@@ -22044,6 +22044,15 @@ static bool ggml_vk_can_fuse_ssm_conv_direct_l2(const ggml_backend_vk_context * 
         get_misalign_bytes(ctx, scale) != 0) {
         return false;
     }
+    // Only the graph built for this kernel (qwen4exp LLAMA_GDN_CONV_L2: one norm over the q|k heads together, named
+    // "gdn_qk_l2") may take it. The default GDN graph normalises q and k separately, and once its q VIEW happened to
+    // follow the SILU directly (2026-10-11, the GDN keep pin's VIEW node had sat between them) this matcher took the
+    // q-only chain: the kernel then normalised q, left the SILU's q columns unwritten and the rest of the graph read a
+    // layout it was never built for (KLD 8-12 vs the release, non-repeatable). A fusion that changes what a later node
+    // reads is opt-in from the graph builder, not a pattern match.
+    if (strncmp(scale->name, "gdn_qk_l2", 9) != 0) {
+        return false;
+    }
     // the reduction is rms_norm_small's, which needs these
     if (ctx->device->subgroup_size < 32 || (256 % ctx->device->subgroup_size) != 0) {
         return false;
