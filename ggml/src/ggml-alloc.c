@@ -802,6 +802,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             hn->addr = p_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
+                            if (ggml_alloc_trace_level() >= 2) {
+                                // the bytes change hands without a free: the live list follows them
+                                ggml_alloc_live_remove(galloc->buf_tallocs[hn->buffer_id], view_src);
+                                ggml_alloc_live_add(galloc->buf_tallocs[hn->buffer_id], node, ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node));
+                            }
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
                             return;
                         }
@@ -810,6 +815,10 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
+                        if (ggml_alloc_trace_level() >= 2) {
+                            ggml_alloc_live_remove(galloc->buf_tallocs[hn->buffer_id], parent);
+                            ggml_alloc_live_add(galloc->buf_tallocs[hn->buffer_id], node, ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node));
+                        }
                         ggml_gallocr_free_extra_space(galloc, node, parent);
                         return;
                     }
