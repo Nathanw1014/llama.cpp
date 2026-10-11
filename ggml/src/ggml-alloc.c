@@ -124,6 +124,11 @@ struct ggml_dyn_tallocr {
     int n_chunks;
     int cap_chunks;
 
+    // GGML_ALLOC_TRACE=2: the tensors currently allocated, to print the largest ones each time a chunk's peak grows
+    struct ggml_alloc_live { const struct ggml_tensor * tensor; size_t size; } * live;
+    int n_live;
+    int cap_live;
+
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
         const struct ggml_tensor * tensor;
@@ -201,6 +206,58 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, struct buff
     GGML_ABORT("tried to free tensor %s not found\n", tensor->name);
 }
 #endif
+
+// GGML_ALLOC_TRACE: 1 logs reallocations (below), 2 also prints, each time a chunk's peak grows, the largest tensors
+// allocated at that moment: what the compute buffer's size is made of (names, ops, shapes), without a debug build
+static int ggml_alloc_trace_level(void) {
+    static int level = -1;
+    if (level < 0) {
+        const char * t = getenv("GGML_ALLOC_TRACE");
+        level = t != NULL ? atoi(t) : 0;
+    }
+    return level;
+}
+
+static void ggml_alloc_live_add(struct ggml_dyn_tallocr * alloc, const struct ggml_tensor * tensor, size_t size) {
+    if (alloc->n_live == alloc->cap_live) {
+        alloc->cap_live = alloc->cap_live > 0 ? 2 * alloc->cap_live : 1024;
+        alloc->live = realloc(alloc->live, alloc->cap_live * sizeof(alloc->live[0]));
+        GGML_ASSERT(alloc->live != NULL);
+    }
+    alloc->live[alloc->n_live].tensor = tensor;
+    alloc->live[alloc->n_live].size   = size;
+    alloc->n_live++;
+}
+
+static void ggml_alloc_live_remove(struct ggml_dyn_tallocr * alloc, const struct ggml_tensor * tensor) {
+    for (int i = alloc->n_live - 1; i >= 0; --i) {
+        if (alloc->live[i].tensor == tensor) {
+            alloc->live[i] = alloc->live[--alloc->n_live];
+            return;
+        }
+    }
+}
+
+static void ggml_alloc_live_print(struct ggml_dyn_tallocr * alloc, int chunk, size_t cur_max) {
+    fprintf(stderr, "ggml_alloc: chunk %d peak %.1f MiB, %d live tensors, largest:", chunk, cur_max / 1048576.0, alloc->n_live);
+    size_t shown = 0;
+    for (int k = 0; k < 12 && k < alloc->n_live; ++k) {
+        int best = k;
+        for (int i = k + 1; i < alloc->n_live; ++i) {
+            if (alloc->live[i].size > alloc->live[best].size) {
+                best = i;
+            }
+        }
+        struct ggml_alloc_live tmp = alloc->live[k];
+        alloc->live[k] = alloc->live[best];
+        alloc->live[best] = tmp;
+        const struct ggml_tensor * t = alloc->live[k].tensor;
+        fprintf(stderr, " %s(%s %s %lldx%lldx%lldx%lld %.1fM)", t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], alloc->live[k].size / 1048576.0);
+        shown += alloc->live[k].size;
+    }
+    fprintf(stderr, " | shown %.1f MiB\n", shown / 1048576.0);
+}
 
 static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor) {
     size = aligned_offset(NULL, size, alloc->alignment);
@@ -304,6 +361,13 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    if (ggml_alloc_trace_level() >= 2) {
+        ggml_alloc_live_add(alloc, tensor, size);
+        if (addr.offset + size > chunk->max_size) {
+            ggml_alloc_live_print(alloc, addr.chunk, addr.offset + size);
+        }
+    }
+
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
     return addr;
@@ -358,6 +422,7 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
         alloc->chunks[i] = NULL;
     }
     alloc->n_chunks = 0;
+    alloc->n_live = 0;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
@@ -375,6 +440,9 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.chunks         = */ NULL,
         /*.n_chunks       = */ 0,
         /*.cap_chunks     = */ 0,
+        /*.live           = */ NULL,
+        /*.n_live         = */ 0,
+        /*.cap_live       = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
@@ -390,6 +458,7 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
         free(alloc->chunks[i]);
     }
     free(alloc->chunks);
+    free(alloc->live);
     free(alloc);
 }
 
@@ -774,6 +843,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 #ifdef GGML_ALLOCATOR_DEBUG
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
+    if (ggml_alloc_trace_level() >= 2) {
+        ggml_alloc_live_remove(alloc, node);
+    }
 
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
@@ -1003,8 +1075,7 @@ static bool ggml_gallocr_reserve_n_impl(
             if (grow_only < 0) {
                 const char * e = getenv("GGML_ALLOC_GROW_ONLY");
                 grow_only = e == NULL || atoi(e) != 0;
-                const char * t = getenv("GGML_ALLOC_TRACE");
-                alloc_trace = t != NULL && atoi(t) != 0;
+                alloc_trace = ggml_alloc_trace_level() != 0;
             }
             if (alloc_trace) {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
