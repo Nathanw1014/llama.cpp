@@ -852,6 +852,24 @@ struct llama_mmap::impl {
     }
 #endif
 
+    size_t drop_cache(size_t first, size_t last, const llama_mmap::ranges & keep) {
+#if defined(__linux__)
+        size_t n = 0;
+        for (const auto & [b, e] : llama_drop_cache_ranges(first, std::min(last, size), keep, llama_mmap_page_size())) {
+            // unchecked hints: a failure only leaves the pages cached, as without the knob
+            madvise((char *) addr + b, e - b, MADV_DONTNEED);
+            posix_fadvise(fd_advise, (off_t) b, (off_t) (e - b), POSIX_FADV_DONTNEED);
+            n += e - b;
+        }
+        return n;
+#else
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        GGML_UNUSED(keep);
+        return 0;
+#endif
+    }
+
     bool contains(const void * ptr, size_t len) const {
         const char * p = (const char *) ptr;
         const char * b = (const char *) addr;
@@ -874,6 +892,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+size_t llama_mmap::drop_cache(size_t first, size_t last, const ranges & keep) { return pimpl->drop_cache(first, last, keep); }
 
 bool llama_mmap::contains(const void * ptr, size_t len) const { return pimpl->contains(ptr, len); }
 

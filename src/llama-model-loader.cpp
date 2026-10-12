@@ -1443,6 +1443,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
+    if (duplicated) {
+        // the original and the duplicate read the same file range; one of them may stay host-mapped
+        drop_cache_skip.insert(tn.str());
+    }
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
@@ -1574,6 +1578,32 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // LLAMA_LOAD_DROP_CACHE=1 (default off; Linux, mmap loads): a tensor COPIED out of the mapping into a buffer (a GPU
+    // buffer, a repacked CPU buffer) never reads the file again, but its pages stay in the page cache. On a UMA box the GPU
+    // copy (GTT) and the page cache then hold the weights twice while the load runs, and the page cache refills exactly as
+    // the GTT pages are allocated (Flash-Next: MemFree 41-45 GB -> 0.5-6 GB within 30 s of loading 37.8 GB, the BO_VA
+    // margin). With the knob each copied tensor's whole interior pages are dropped right after its copy returns. Never a
+    // host-mapped tensor (it is served from these pages at run time: the PLE n-gram table), never a lazily read range, never
+    // a TENSOR_DUPLICATED name (token_embd / output share one range across a host and a device context). The copies here
+    // are synchronous: with mmap there is no async upload backend (pinned staging only serves the non-mmap read path), so
+    // a range is advised only after ggml_backend_tensor_set has returned. Off with check_tensors (its validation reads the
+    // mapping asynchronously).
+    static const bool drop_cache_env = [] { const char * e = getenv("LLAMA_LOAD_DROP_CACHE"); return e != nullptr && atoi(e) != 0; }();
+    const bool drop_cache = drop_cache_env && use_mmap && !check_tensors;
+    auto drop_after_copy = [&](const llama_tensor_weight * w, size_t n_size, const char * name) {
+        if (!drop_cache || drop_cache_skip.count(name)) {
+            return;
+        }
+        llama_mmap::ranges keep = drop_cache_keep[w->idx];
+        const auto it_lazy = lazy_tensor_ranges.find(w->idx);
+        if (it_lazy != lazy_tensor_ranges.end()) {
+            keep.insert(keep.end(), it_lazy->second.begin(), it_lazy->second.end());
+        }
+        const size_t n = mappings.at(w->idx)->drop_cache(w->offs, w->offs + n_size, keep);
+        drop_cache_bytes += n;
+        drop_cache_tensors += n > 0;
+    };
+
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
@@ -1703,6 +1733,9 @@ bool llama_model_loader::load_all_data(
             std::vector<ggml_fp16_t> dst(src.size());
             llama_bf16_to_f16_row(src.data(), dst.data(), src.size());
             ggml_backend_tensor_set(cur, dst.data(), 0, n_size);
+            if (use_mmap) {
+                drop_after_copy(weight, n_size, ggml_get_name(cur));
+            }
             size_done += n_size;
             continue;
         }
@@ -1759,8 +1792,11 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                // host-mapped: served from these pages at run time
+                drop_cache_keep[weight->idx].emplace_back(weight->offs, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                drop_after_copy(weight, n_size, ggml_get_name(cur));
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1867,6 +1903,15 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (drop_cache) {
+            size_t n_keep = 0;
+            for (const auto & [idx, r] : drop_cache_keep) {
+                n_keep += r.size();
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_LOAD_DROP_CACHE: dropped %.2f GiB of copied tensors' file pages from the page cache "
+                    "(%zu tensors; %zu host-mapped and %zu duplicated tensors kept)\n", __func__,
+                    drop_cache_bytes / 1073741824.0, drop_cache_tensors, n_keep, drop_cache_skip.size());
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

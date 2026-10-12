@@ -129,6 +129,13 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // LLAMA_LOAD_DROP_CACHE=1 (mmap loads, see load_all_data): the file pages of each tensor COPIED into a buffer are
+    // dropped from the page cache once the copy returns, so a GPU load does not leave its weights cached twice
+    std::set<std::string> drop_cache_skip;                  // TENSOR_DUPLICATED names: one file range in a host and a device context
+    std::map<uint32_t, llama_mmap::ranges> drop_cache_keep; // per file: the host-mapped tensors seen so far (served from the page cache)
+    size_t drop_cache_bytes   = 0;
+    size_t drop_cache_tensors = 0;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -42,6 +43,43 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
+// The whole pages inside [first, last) that no keep range touches, as [first, last) byte ranges: what a load may drop from
+// the page cache once [first, last) has been copied into a device buffer. A page the copied range shares with a neighbour
+// (partial at either edge) is kept, and a keep range claims every page it overlaps, so nothing a host-mapped tensor (or a
+// lazily read one) is served from at run time is dropped. page must be a power of two; keep need not be sorted.
+inline std::vector<std::pair<size_t, size_t>> llama_drop_cache_ranges(size_t first, size_t last,
+        const std::vector<std::pair<size_t, size_t>> & keep, size_t page) {
+    std::vector<std::pair<size_t, size_t>> out;
+    const size_t b = (first + page - 1) & ~(page - 1);
+    const size_t e = last & ~(page - 1);
+    if (last <= first || b >= e) {
+        return out;
+    }
+    std::vector<std::pair<size_t, size_t>> k;
+    for (const auto & r : keep) {
+        if (r.second <= r.first) {
+            continue;
+        }
+        const size_t kb = r.first & ~(page - 1);
+        const size_t ke = (r.second + page - 1) & ~(page - 1);
+        if (ke > b && kb < e) {
+            k.emplace_back(kb < b ? b : kb, ke > e ? e : ke);
+        }
+    }
+    std::sort(k.begin(), k.end());
+    size_t cur = b;
+    for (const auto & r : k) {
+        if (r.first > cur) {
+            out.emplace_back(cur, r.first);
+        }
+        cur = r.second > cur ? r.second : cur;
+    }
+    if (cur < e) {
+        out.emplace_back(cur, e);
+    }
+    return out;
+}
+
 struct llama_mmap {
     // list of [first, last) byte ranges within a file
     using ranges = std::vector<std::pair<size_t, size_t>>;
@@ -55,6 +93,12 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+
+    // after [first, last) has been copied out of the mapping into another buffer: drop its pages from this process's page
+    // tables (madvise) and from the page cache (posix_fadvise; mapped pages are not evicted, hence the madvise first).
+    // Only the pages llama_drop_cache_ranges(first, last, keep) returns. Clean, read-only pages: the data is reread from
+    // the file if anything touches them again. Returns the bytes advised (0 where this is not supported).
+    size_t drop_cache(size_t first, size_t last, const ranges & keep);
 
     // true if [ptr, ptr + len) lies inside this mapping
     bool contains(const void * ptr, size_t len) const;
