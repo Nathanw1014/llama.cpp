@@ -2350,6 +2350,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> merged;   // w_down -> merged
     };
     mutable hc_down_inject_cache hc_dinj;
+
+    // bf16 twins of the f32 weights that decode reads as mat-vecs (router ffn_gate_inp, ssm_alpha / ssm_beta, the hc inject
+    // projections; port of halo-box e68c1a9cf, B6): half the bytes per token where the values are bf16-exact (lower 16 bits
+    // zero), built lazily on the first graph with loaded weights. LLAMA_BF16_TWINS=0 disables. nullptr = no twin for this weight.
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    mutable std::mutex bf16_twins_mutex;
+    mutable bool bf16_twins_tried = false;
+    mutable std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    mutable std::vector<ggml_context *> bf16_twin_ctxs;
+    mutable std::vector<ggml_backend_buffer_t> bf16_twin_bufs;
     struct ggml_tensor * hc_down_inject(const struct ggml_tensor * w_down) const;
 
     class llm_graph_input_qsa;

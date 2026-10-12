@@ -701,6 +701,99 @@ ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t 
     return buf;
 }
 
+// bf16 twins (B6, port of halo-box e68c1a9cf): the f32 router / ssm_alpha / ssm_beta / hc inject weights are read whole once
+// per token at decode as f32 mat-vecs. Where every value is bf16-exact (the converter keeps these in f32 but their origin is
+// bf16), a bf16 copy halves the bytes with identical values. Built once, on the first graph whose weights are loaded (a
+// no-alloc fitting model defers), on the weight's own buffer type; used only for batches of <= 8 tokens (the mat-vec path),
+// the f32 original stays for the GEMMs. Freed with the model. LLAMA_BF16_TWINS=0 disables.
+ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
+    std::lock_guard<std::mutex> lock(bf16_twins_mutex);
+    if (!bf16_twins_tried) {
+        const char * e = getenv("LLAMA_BF16_TWINS");
+        if (e != nullptr && atoi(e) == 0) {
+            bf16_twins_tried = true;
+            return nullptr;
+        }
+        std::vector<ggml_tensor *> ws;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ssm_alpha, layer.ssm_beta, layer.hc_attn_inject, layer.hc_ffn_inject }) {
+                if (t != nullptr && t->type == GGML_TYPE_F32) {
+                    ws.push_back(t);
+                }
+            }
+        }
+        for (const ggml_tensor * t : ws) {
+            if (t->data == nullptr) {
+                return nullptr;   // not loaded yet (the -fit probe): decide on a later build
+            }
+        }
+        bf16_twins_tried = true;
+        size_t n_exact = 0, n_inexact = 0, bytes = 0;
+        std::vector<float> src;
+        std::vector<ggml_bf16_t> dst;
+        std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
+        for (ggml_tensor * t : ws) {
+            if (t->buffer == nullptr || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+                continue;
+            }
+            src.resize(ggml_nelements(t));
+            ggml_backend_tensor_get(t, src.data(), 0, src.size() * sizeof(float));
+            bool exact = true;
+            for (float v : src) {
+                uint32_t u; memcpy(&u, &v, 4);
+                if ((u & 0xffffu) != 0) { exact = false; break; }
+            }
+            if (!exact) {
+                n_inexact++;
+                continue;
+            }
+            by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
+        }
+        for (auto & kv : by_buft) {
+            ggml_init_params ip = { ggml_tensor_overhead() * (kv.second.size() + 1), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+            for (ggml_tensor * t : kv.second) {
+                ggml_tensor * tw = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, t->ne[0], t->ne[1]);
+                ggml_format_name(tw, "%s.bf16", ggml_get_name(t));
+                pairs.emplace_back(t, tw);
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, kv.first);
+            if (buf == nullptr) {
+                LLAMA_LOG_WARN("%s: bf16 twins: allocation on %s failed, keeping f32\n", __func__, ggml_backend_buft_name(kv.first));
+                ggml_free(ctx);
+                continue;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (auto & p : pairs) {
+                src.resize(ggml_nelements(p.first));
+                dst.resize(src.size());
+                ggml_backend_tensor_get(p.first, src.data(), 0, src.size() * sizeof(float));
+                ggml_fp32_to_bf16_row_ref(src.data(), dst.data(), (int64_t) src.size());
+                ggml_backend_tensor_set(p.second, dst.data(), 0, dst.size() * sizeof(ggml_bf16_t));
+                bf16_twins[p.first] = p.second;
+                n_exact++;
+                bytes += ggml_nbytes(p.second);
+            }
+            bf16_twin_ctxs.push_back(ctx);
+            bf16_twin_bufs.push_back(buf);
+        }
+        LLAMA_LOG_INFO("%s: bf16 twins: %zu f32 weights are bf16-exact and got twins (%.1f MiB), %zu are not and keep f32\n",
+                __func__, n_exact, bytes / (1024.0 * 1024.0), n_inexact);
+    }
+    auto it = bf16_twins.find(w);
+    return it == bf16_twins.end() ? nullptr : it->second;
+}
+
+// decode-sized batches (<= 8 tokens take the mat-vec path): the bf16 twin of a weight where it exists, else the weight
+static ggml_tensor * qwen4exp_dec_weight(const llama_model & model, ggml_tensor * w, int64_t n_tokens, bool no_lora) {
+    if (w == nullptr || n_tokens > 8 || !no_lora) {
+        return w;
+    }
+    ggml_tensor * tw = static_cast<const llama_model_qwen4exp &>(model).bf16_twin(w);
+    return tw != nullptr ? tw : w;
+}
+
 // LLAMA_HC_INJECT_DEC=N (default 8, 0 = off; R1): for ubatches of up to N tokens the hc inject projection is the plain
 // mul_mat(w_inject [hc_dim, hc], xn), a mat-vec of hc rows read once, as halo-box builds it. The fast path's form
 // (5d28b128e: an identity get_rows of w_inject on an iota input, mul_mat(xn, rows), cont(transpose)) was made for prefill,
@@ -935,7 +1028,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             ggml_tensor * inj_t  = ggml_mul_mat(ctx0, xn, w_rows);              // [nt, hc]
             *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));             // [hc, nt]
         } else {
-            *inject = build_lora_mm(w_inject, xn);
+            *inject = build_lora_mm(qwen4exp_dec_weight(model, w_inject, nt, loras->empty()), xn);
         }
         cb(*inject, "hc_inject", il);
     }
@@ -1960,14 +2053,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_beta, n_tokens, loras->empty()), cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_tensor * alpha = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_alpha, n_tokens, loras->empty()), cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -2112,7 +2205,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
+            qwen4exp_dec_weight(model, model.layers[il].ffn_gate_inp, n_tokens, loras->empty()),
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
@@ -2163,6 +2256,8 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
     if (ple_hot.ctx) { ggml_free(ple_hot.ctx); }
     if (hc_dinj.buf) { ggml_backend_buffer_free(hc_dinj.buf); }
     if (hc_dinj.ctx) { ggml_free(hc_dinj.ctx); }
+    for (auto * b : bf16_twin_bufs) { ggml_backend_buffer_free(b); }
+    for (auto * c : bf16_twin_ctxs) { ggml_free(c); }
 }
 
 // LLAMA_PLE_HOT=<sidecar> (scripts/flash-next/make_ple_hot.py): load the hot rows into a buffer of
