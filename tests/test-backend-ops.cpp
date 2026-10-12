@@ -6603,13 +6603,15 @@ struct test_mul_mat_cpy16 : public test_case {
 // fails a case unless the fusion ran exactly once (knob-aware: none with GGML_VK_HC_UP_MIX=0).
 struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;
+    const bool gate16;   // false: the f32-gate form (LLAMA_HC_GATE_F16=0, no cast; Vulkan fusion name HC_UP_MIX_F32G)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_UP_MIX_F16"; }
-    std::string vars() override { return VARS_TO_STR4(n_embd, nt, k, pad); }
+    std::string vars() override { return gate16 ? VARS_TO_STR4(n_embd, nt, k, pad) : VARS_TO_STR5(n_embd, nt, k, pad, gate16); }
     double max_nmse_err() override { return 5e-4; }
     bool run_whole_graph() override { return true; }
 
-    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0) : n_embd(n_embd), nt(nt), k(k), pad(pad) {}
+    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0, bool gate16 = true)
+        : n_embd(n_embd), nt(nt), k(k), pad(pad), gate16(gate16) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * n_embd);
@@ -6619,8 +6621,11 @@ struct test_hc_up_mix_f16 : public test_case {
         ggml_tensor * xb = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 4 * n_embd + pad, nt);
         ggml_set_name(xb, "xn");
         ggml_tensor * x  = ggml_view_3d(ctx, xb, n_embd, 4, nt, n_embd * ggml_element_size(xb), xb->nb[1], 0);
-        ggml_tensor * g  = ggml_cast(ctx, ggml_mul_mat(ctx, w, lo), GGML_TYPE_F16);
-        ggml_set_name(g, "gate_f16");
+        ggml_tensor * g  = ggml_mul_mat(ctx, w, lo);
+        if (gate16) {
+            g = ggml_cast(ctx, g, GGML_TYPE_F16);
+        }
+        ggml_set_name(g, gate16 ? "gate_f16" : "gate_f32");
         ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, x, ggml_reshape_3d(ctx, g, n_embd, 4, nt), 0.25f);
         ggml_set_name(out, "mixed");
         return out;
@@ -6632,12 +6637,13 @@ struct test_hc_up_mix_f16 : public test_case {
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         static const bool require = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_HC_UP_MIX"); return e != nullptr && atoi(e) != 0; }();
         static const bool knob_on = [] { const char * e = getenv("GGML_VK_HC_UP_MIX"); return e == nullptr || atoi(e) != 0; }();
-        const int64_t n = dispatch_census_count(backend, "HC_UP_MIX"), want = knob_on ? 1 : 0;
+        const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
+        const int64_t n = dispatch_census_count(backend, name), want = knob_on ? 1 : 0;
         if (!require || n < 0) {
             return true;
         }
         if (n != want) {
-            msg = "HC_UP_MIX dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
         }
         return true;
@@ -12869,6 +12875,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2048, 320, 128));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128));
+    // the f32-gate form (LLAMA_HC_GATE_F16=0)
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false));
+    test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8, false));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false));
     // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
     // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
     // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 (wave 4)
