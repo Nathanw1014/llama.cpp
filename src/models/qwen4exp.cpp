@@ -701,6 +701,18 @@ ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t 
     return buf;
 }
 
+// LLAMA_HC_INJECT_DEC=N (default 8, 0 = off; R1): for ubatches of up to N tokens the hc inject projection is the plain
+// mul_mat(w_inject [hc_dim, hc], xn), a mat-vec of hc rows read once, as halo-box builds it. The fast path's form
+// (5d28b128e: an identity get_rows of w_inject on an iota input, mul_mat(xn, rows), cont(transpose)) was made for prefill,
+// where a quantized 4-row A padded a whole coopmat tile; at decode it costs a GET_ROWS and a CONT per mix (2 x 96 dispatches
+// per token on Flash-Next) and a GEMV with xn as the matrix (B0 decode diff, 10-09: inject 0.82 vs 0.52 ms, +0.33 ms
+// GET_ROWS, +0.33 ms CONT per token). Prefill (more than N tokens) keeps the fast-path form. The sum over hc_dim runs in
+// the other GEMV orientation, so the scatter weights are not bit-identical: KL-gated.
+static int64_t qwen4exp_hc_inject_dec_max() {
+    static const int64_t v = [] { const char * e = getenv("LLAMA_HC_INJECT_DEC"); return e ? (int64_t) atoll(e) : (int64_t) 8; }();
+    return v;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -918,7 +930,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     if (inject) {
         if (dinj) {
             *inject = ggml_cont(ctx0, ggml_view_2d(ctx0, dinj, hc, nt, dinj->nb[1], w_down->ne[1] * ggml_element_size(dinj)));   // [hc, nt]
-        } else if (qwen4exp_hc_fastpath(model) && loras->empty()) {
+        } else if (qwen4exp_hc_fastpath(model) && loras->empty() && nt > qwen4exp_hc_inject_dec_max()) {
             ggml_tensor * w_rows = ggml_get_rows(ctx0, w_inject, build_hc_consts()->iota); // f32 [hc_dim, hc]
             ggml_tensor * inj_t  = ggml_mul_mat(ctx0, xn, w_rows);              // [nt, hc]
             *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));             // [hc, nt]
