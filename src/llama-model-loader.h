@@ -135,6 +135,9 @@ struct llama_model_loader {
     std::map<uint32_t, llama_mmap::ranges> drop_cache_keep; // per file: the host-mapped tensors seen so far (served from the page cache)
     size_t drop_cache_bytes   = 0;
     size_t drop_cache_tensors = 0;
+    size_t drop_cache_kept_bytes = 0;      // host-mapped bytes kept, and the largest such tensor (the PLE table on Flash-Next)
+    size_t drop_cache_kept_max   = 0;
+    std::string drop_cache_kept_max_name;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

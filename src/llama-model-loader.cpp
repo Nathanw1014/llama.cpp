@@ -1794,6 +1794,11 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
                 // host-mapped: served from these pages at run time
                 drop_cache_keep[weight->idx].emplace_back(weight->offs, weight->offs + n_size);
+                drop_cache_kept_bytes += n_size;
+                if (n_size > drop_cache_kept_max) {
+                    drop_cache_kept_max      = n_size;
+                    drop_cache_kept_max_name = ggml_get_name(cur);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
                 drop_after_copy(weight, n_size, ggml_get_name(cur));
@@ -1911,6 +1916,9 @@ bool llama_model_loader::load_all_data(
             LLAMA_LOG_INFO("%s: LLAMA_LOAD_DROP_CACHE: dropped %.2f GiB of copied tensors' file pages from the page cache "
                     "(%zu tensors; %zu host-mapped and %zu duplicated tensors kept)\n", __func__,
                     drop_cache_bytes / 1073741824.0, drop_cache_tensors, n_keep, drop_cache_skip.size());
+            LLAMA_LOG_INFO("%s: LLAMA_LOAD_DROP_CACHE: kept %.2f GiB host-mapped, the largest %s (%.2f GiB)\n", __func__,
+                    drop_cache_kept_bytes / 1073741824.0, n_keep ? drop_cache_kept_max_name.c_str() : "(none)",
+                    drop_cache_kept_max / 1073741824.0);
         }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
