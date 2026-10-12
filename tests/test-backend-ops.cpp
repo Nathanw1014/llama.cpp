@@ -3670,7 +3670,9 @@ struct test_ssm_conv_direct_l2 : public test_case {
             return true;   // not the Vulkan backend
         }
         const uint64_t n = count("CONCAT_SSM_CONV_SILU_L2");
-        const uint64_t want = mode == 0 ? 1 : 0;
+        // GGML_VK_SSM_CONV_L2=0 is the backend's kill switch: the opt-in chain then runs unfused and must not fuse either
+        static const bool knob_on = [] { const char * e = getenv("GGML_VK_SSM_CONV_L2"); return e == nullptr || atoi(e) != 0; }();
+        const uint64_t want = (mode == 0 && knob_on) ? 1 : 0;
         if (n != want) {
             msg = "CONCAT_SSM_CONV_SILU_L2 dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) +
                   (mode == 0 ? ": the opt-in chain ran unfused)" : ": the default q/k chain must not fuse)");
