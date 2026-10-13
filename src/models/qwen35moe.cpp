@@ -520,13 +520,43 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        const auto & L = model.layers[il];
+        // LLAMA_SHEXP_F16 (default on): at prefill the shared expert's up and gate projections store f16 (the Vulkan
+        // MUL_MAT_CPY16 fusion), the SwiGLU runs in f16 and the down projection reads its f16 B as is, as LLAMA_MOE_F16
+        // does for the routed experts. With f32 activations the down projection converted its B to f16 in a separate
+        // pass (Qwen3.6-35B-A3B pp2048: MM_B_TO_F16 40 x ~107 us per ubatch, x35 per-op 10-13). Only where all three
+        // weights are on a GPU buffer and their type has an f16-output GEMM; =0 keeps the f32 chain.
+        static const bool shexp_f16 = [] { const char * e = getenv("LLAMA_SHEXP_F16"); return e == nullptr || atoi(e) != 0; }();
+        auto d16_type = [](const ggml_tensor * w) {
+            return w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_0 ||
+                   w->type == GGML_TYPE_Q6_K || w->type == GGML_TYPE_IQ4_NL;
+        };
+        const bool use_f16 = shexp_f16 && n_tokens >= 32 && loras->empty() && L.ffn_gate_shexp != nullptr &&
+            !L.ffn_up_shexp_s && !L.ffn_gate_shexp_s && !L.ffn_down_shexp_s && hparams.swiglu_clamp_shexp[il] <= 1e-6f &&
+            d16_type(L.ffn_up_shexp) && d16_type(L.ffn_gate_shexp) &&
+            llm_graph_weights_on_gpu(L.ffn_up_shexp->buffer) && llm_graph_weights_on_gpu(L.ffn_gate_shexp->buffer) &&
+            llm_graph_weights_on_gpu(L.ffn_down_shexp->buffer);
+        ggml_tensor * ffn_shexp;
+        if (use_f16) {
+            // each cast right behind its matmul, so the pair fuses
+            ggml_tensor * up = ggml_cast(ctx0, build_lora_mm(L.ffn_up_shexp, cur), GGML_TYPE_F16);
+            cb(up, "ffn_up_shexp_f16", il);
+            ggml_build_forward_expand(gf, up);
+            ggml_tensor * gate = ggml_cast(ctx0, build_lora_mm(L.ffn_gate_shexp, cur), GGML_TYPE_F16);
+            cb(gate, "ffn_gate_shexp_f16", il);
+            ggml_build_forward_expand(gf, gate);
+            ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
+            cb(act, "ffn_shexp_swiglu_f16", il);
+            ffn_shexp = build_lora_mm(L.ffn_down_shexp, act);
+        } else {
+            ffn_shexp =
+                build_ffn(cur,
+                    model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
