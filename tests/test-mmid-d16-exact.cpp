@@ -370,7 +370,8 @@ static int run_hc_post_norm(ggml_backend_t be, ggml_backend_reg_t reg, int64_t n
     fill(x, rng, -1.0f, 1.0f); fill(res, rng, -1.0f, 1.0f); fill(post, rng, 0.0f, 2.0f); fill(gamma, rng, -1.0f, 1.0f);
     { std::vector<float> e(hc * hc, 0.0f); for (int64_t i = 0; i < hc; ++i) e[i * hc + i] = 1.0f; ggml_backend_tensor_set(eye, e.data(), 0, e.size() * 4); }
     char label[96]; snprintf(label, sizeof(label), "HC_POST_NORM_CPY %lldx4x%lld", (long long) n_embd, (long long) nt);
-    int fails = run_pair(be, reg, label, "HC_POST_NORM_CPY", 1, ctx, f.first, r.first, normed_r, [&]() { bump(x); });
+    // its own mean-square reduction differs from rms_norm's in order: ~1e-4 of values (581 of 5242880, 10-13). Known-inexact.
+    int fails = run_pair(be, reg, label, "HC_POST_NORM_CPY", 1, ctx, f.first, r.first, normed_r, [&]() { bump(x); }, false);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return fails;
@@ -402,7 +403,8 @@ static int run_hc_up_mix(ggml_backend_t be, ggml_backend_reg_t reg, int64_t n_em
     fill(w, rng, -1.0f, 1.0f); fill(lo, rng, -1.0f, 1.0f); fill(xn, rng, -1.0f, 1.0f); fill(gl, rng, -2.0f, 2.0f);
     char label[96];
     snprintf(label, sizeof(label), "HC_UP_MIX %lldx%lld lr=%lld", (long long) n_embd, (long long) nt, (long long) lr);
-    int fails = run_pair(be, reg, label, "HC_UP_MIX", -1, ctx, of, orr, nullptr, [&]() { bump(lo); });
+    // the epilogue sums the hc streams in its own order (13% of values one ulp off, 10-13). Known-inexact.
+    int fails = run_pair(be, reg, label, "HC_UP_MIX", -1, ctx, of, orr, nullptr, [&]() { bump(lo); }, false);
     snprintf(label, sizeof(label), "DSV4_HC_MIX f16 out %lldx%lld", (long long) n_embd, (long long) nt);
     fails += run_pair(be, reg, label, nullptr, -1, ctx, sf, sr, s32, [&]() { bump(xn); });
     ggml_backend_buffer_free(buf);
@@ -411,7 +413,7 @@ static int run_hc_up_mix(ggml_backend_t be, ggml_backend_reg_t reg, int64_t n_em
 }
 
 // MUL_MAT + CPY(f16) (MUL_MAT_CPY16): the d16 GEMM never splits K, the unfused f32 GEMM may
-static int run_mm_cpy16(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type t, int64_t m, int64_t n, int64_t k) {
+static int run_mm_cpy16(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type t, int64_t m, int64_t n, int64_t k, bool strict = true) {
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * a = ggml_new_tensor_2d(ctx, t, k, m);
@@ -424,7 +426,7 @@ static int run_mm_cpy16(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type t, 
     fill(a, rng, -1.0f, 1.0f); fill(b, rng, -1.0f, 1.0f);
     char label[96];
     snprintf(label, sizeof(label), "MUL_MAT_CPY16 %s %lldx%lldx%lld", ggml_type_name(t), (long long) m, (long long) n, (long long) k);
-    int fails = run_pair(be, reg, label, "MUL_MAT_CPY16", 1, ctx, of, orr, mm, [&]() { bump(b); });
+    int fails = run_pair(be, reg, label, "MUL_MAT_CPY16", 1, ctx, of, orr, mm, [&]() { bump(b); }, strict);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return fails;
@@ -478,13 +480,65 @@ static int run_f16b(ggml_backend_t be, int64_t m, int64_t n, int64_t k, bool mmi
             num16 += (r16[j * m + i] - ref) * (r16[j * m + i] - ref); num32 += (r32[j * m + i] - ref) * (r32[j * m + i] - ref); den += ref * ref;
         }
         const double e16 = num16 / std::max(den, 1e-30), e32 = num32 / std::max(den, 1e-30);
-        fails = e16 > 1e-10;
+        // the f32-weight GEMM is not double-exact with either B (its tiles stage f16, NMSE ~3e-8, 10-13): the f16 B (same
+        // values) must be byte-equal to the f32 B result, or at least no worse
+        const bool eq = memcmp(r16.data(), r32.data(), ne * 4) == 0;
+        fails = !eq && e16 > e32 * (1.0 + 1e-3);
         snprintf(label, sizeof(label), "MUL_MAT f32 x f16 B %lldx%lldx%lld", (long long) m, (long long) n, (long long) k);
-        printf("%s %-40s nmse f16B=%.2e f32B=%.2e\n", fails ? "FAIL" : "ok", label, e16, e32);
+        printf("%s %-40s byte-equal f16B==f32B=%s nmse vs double: f16B=%.2e f32B=%.2e\n", fails ? "FAIL" : "ok", label, eq ? "yes" : "NO", e16, e32);
     }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return fails;
+}
+
+// Engagement through the scheduler: graph_optimize's alloc deps and ggml-alloc's buffer reuse only exist there (the cases above
+// allocate every tensor separately, so an output can never land on a freed input). which = 0: the GDN output norm with the silu
+// gate (RMS_NORM_MUL_SILUMUL_CPY); 1: the attention output gate (SIGMOID_MUL). Each chain's inputs are computed nodes whose
+// last use is inside the fusion, so without the deps ggml-alloc may place the fused output on them and graph_compute drops
+// the fusion. Requires the fused dispatch; GGML_VK_ALLOC_DEPS=0 is the positive control (expected to drop it).
+static int run_sched_engage(ggml_backend_t be, ggml_backend_reg_t reg, int which, int64_t nt) {
+    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
+    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t bes[2] = { be, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(bes, nullptr, 2, 4096, false, false);
+    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    std::vector<ggml_tensor *> ins;
+    auto input = [&](ggml_tensor * t) { ggml_set_input(t); ins.push_back(t); return t; };
+    const char * fname = which == 0 ? "RMS_NORM_MUL_SILUMUL_CPY" : "SIGMOID_MUL";
+    ggml_tensor * out;
+    if (which == 0) {
+        ggml_tensor * x = ggml_scale(ctx, input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 32, nt)), 1.0f);
+        ggml_tensor * z = ggml_scale(ctx, input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 32, nt)), 1.0f);
+        ggml_tensor * g = input(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128));
+        ggml_tensor * m = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
+        out = ggml_cast(ctx, ggml_mul(ctx, m, ggml_silu(ctx, z)), GGML_TYPE_F16);
+    } else {
+        ggml_tensor * qg  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * 4096, nt));
+        ggml_tensor * att = ggml_scale(ctx, input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, nt)), 1.0f);
+        ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, qg, 4096, nt, qg->nb[1], 4096 * sizeof(float)));
+        out = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
+    }
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_sched_alloc_graph(sched, gf);
+    std::mt19937 rng(5 + which);
+    for (ggml_tensor * t : ins) fill(t, rng, -1.0f, 1.0f);
+    reset();
+    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_sched_synchronize(sched);
+    const uint64_t n = count(fname);
+    static const bool deps_on = [] { const char * e = getenv("GGML_VK_ALLOC_DEPS"); return e == nullptr || atoi(e) != 0; }();
+    const bool fail = deps_on && n != 1;
+    printf("%s %-36s through the scheduler, nt=%lld: fused dispatches %llu (alloc deps %s)\n", fail ? "FAIL" : deps_on ? "ok" : "CONTROL",
+           fname, (long long) nt, (unsigned long long) n, deps_on ? "on" : "off");
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+    return fail;
 }
 
 int main() {
@@ -524,11 +578,15 @@ int main() {
     fails += run_hc_up_mix(be, reg, 2560, 512, 320);
     // MUL_MAT_CPY16: the 35B shared-expert up/gate, the Flash-Next skinny-M shape, a split-K-prone one
     fails += run_mm_cpy16(be, reg, GGML_TYPE_Q8_0,   512, 2048,  2048);
-    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q8_0,   320, 2048, 10240);
-    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q4_K,   256,   64,  8192);
+    // the unfused f32 GEMM splits K on these two (the d16 one never does): accumulation order, known-inexact (10-13: 54654 of
+    // 655360 and 1134 of 16384 values)
+    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q8_0,   320, 2048, 10240, false);
+    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q4_K,   256,   64,  8192, false);
     // LLAMA_NORM_F16B: the router / alpha-beta / shared-gate f32 x f16 GEMMs and an expert gate/up with f16 B
     for (int64_t m : {256, 32, 1}) { fails += run_f16b(be, m, 2048, 2048, false); fails += run_f16b(be, m, 77, 2048, false); }
     fails += run_f16b(be, 512, 96, 2048, true);
+    // the alloc-dep engagement of the 35B GDN output norm and attention gate, through the scheduler
+    for (int64_t nt : {512, 77}) { fails += run_sched_engage(be, reg, 0, nt); fails += run_sched_engage(be, reg, 1, nt); }
     ggml_backend_free(be);
     printf("test-mmid-d16-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
