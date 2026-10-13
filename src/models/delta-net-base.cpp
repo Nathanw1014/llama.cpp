@@ -466,6 +466,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    ggml_tensor * x = qkv_mixed;   // [conv_channels, n_seq_tokens, n_seqs]
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -475,6 +477,55 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+
+    // LLAMA_CONV_TAIL_X (default on): write the new conv state (and each rollback slot) straight from x and the old state,
+    // never from conv_input, as qwen4exp does (6cd39fc7a). The concat then has one consumer, its SSM_CONV, so the Vulkan
+    // backend runs CONCAT + SSM_CONV + SILU as one kernel and never writes the [n_t + 3, channels] transposed concat
+    // (Qwen3.6-35B-A3B pp2048: CONCAT 28.6 ms + SSM_CONV_SILU 21.0 ms per ubatch, x35 per-op 10-13). Same bytes copied.
+    // Ubatches shorter than the state (decode) keep the views: the straddling copy would add a dispatch per layer, and no
+    // backend fuses the concat there. =0 restores the views of conv_input everywhere.
+    static const bool tail_x = [] { const char * e = getenv("LLAMA_CONV_TAIL_X"); return e == nullptr || atoi(e) != 0; }();
+    if (tail_x && x->ne[1] >= conv_kernel_size - 1) {
+        const int64_t state_cols   = conv_kernel_size - 1;
+        const int64_t n_seq_tokens = x->ne[1];
+        const size_t  esz          = ggml_element_size(conv_states_all);
+        // columns [c0, c0 + state_cols) of [old state | x^T] into rollback slot s_slot
+        auto store = [&](int64_t c0, int64_t s_slot) {
+            const size_t row0 = ((size_t) s_slot * mem_size + kv_head) * row_size;
+            if (c0 < state_cols) {
+                ggml_tensor * old = ggml_view_3d(ctx0, conv_states,
+                        state_cols - c0, conv_channels, n_seqs,
+                        conv_states->nb[1], conv_states->nb[2],
+                        c0 * conv_states->nb[0]);
+                ggml_tensor * d_old = ggml_view_3d(ctx0, conv_states_all,
+                        state_cols - c0, conv_channels, n_seqs,
+                        state_cols * esz, conv_states_all->nb[1], row0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, old, d_old));
+            }
+            const int64_t x0 = std::max<int64_t>(0, c0 - state_cols);   // first x token in the window
+            const int64_t nx = c0 + state_cols - std::max<int64_t>(c0, state_cols);   // x tokens in the window
+            if (nx > 0) {
+                ggml_tensor * xs = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                        conv_channels, nx, n_seqs,
+                        x->nb[1], x->nb[2],
+                        x0 * x->nb[1]));
+                ggml_tensor * d_x = ggml_view_3d(ctx0, conv_states_all,
+                        nx, conv_channels, n_seqs,
+                        state_cols * esz, conv_states_all->nb[1], row0 + (state_cols - nx) * esz);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, xs, d_x));
+            }
+        };
+        if (cparams.n_rs_seq == 0) {
+            store(n_seq_tokens, 0);
+        } else {
+            // [TAG_RECURRENT_ROLLBACK_SPLITS] slot K - t holds the columns ending t - K tokens before the end
+            const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+            for (int64_t t = 1; t <= K; ++t) {
+                store(std::max<int64_t>(0, n_seq_tokens - K + t), K - t);
+            }
+        }
+        return conv_input;
+    }
 
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
