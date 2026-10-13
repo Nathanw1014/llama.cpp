@@ -90,7 +90,9 @@ void main() {
     [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
         const uint i4 = tid + k * 256;
         if (i4 < nv4) {
-            data_n[nb + i4] = f16vec4(v[k] * scale * data_g[gb + i4]);
+            // the f32 product through an XOR with a push-constant zero (gate is 0 or 1), so its f32 rounding survives the f16
+            // conversion like the unfused RMS_NORM_MUL f32 store + CPY (test-mmid-d16-exact, 10-13)
+            data_n[nb + i4] = f16vec4(uintBitsToFloat(floatBitsToUint(v[k] * scale * data_g[gb + i4]) ^ uvec4(p.gate & ~1u)));
         }
     }
 }

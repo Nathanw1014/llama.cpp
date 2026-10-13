@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <random>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -214,6 +215,213 @@ static int run_norm(ggml_backend_t be, ggml_backend_reg_t reg, int64_t ne0, int6
     return fails;
 }
 
+// Generic fused-vs-unfused pair: out_f and out_r are f16 results of the same chain, built twice over shared inputs, the
+// reference with its intermediates as graph outputs. ref32 is the reference's last f32 value before the f16 conversion
+// (nullptr: skip the RTE check). expect: required fused-dispatch count in the fused graph (-1: report only). perturb()
+// changes one input for the positive control.
+static int run_pair(ggml_backend_t be, ggml_backend_reg_t reg, const char * label, const char * fname, int expect,
+                    ggml_context * ctx, ggml_tensor * out_f, ggml_tensor * out_r, ggml_tensor * ref32,
+                    const std::function<void()> & perturb) {
+    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
+    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
+    ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, out_f);
+    ggml_cgraph * gr = ggml_new_graph(ctx); ggml_build_forward_expand(gr, out_r);
+    const size_t ne = ggml_nelements(out_f);
+    std::vector<ggml_fp16_t> o_f(ne), o_f2(ne), o_r(ne), o_p(ne);
+    std::vector<float> r32(ref32 ? ne : 0);
+    uint64_t n_f = 0, n_r = 0;
+    auto run = [&](ggml_cgraph * g, ggml_tensor * out, std::vector<ggml_fp16_t> & o, uint64_t * n) {
+        reset(); ggml_backend_graph_compute(be, g); if (n) *n = fname ? count(fname) : 0;
+        ggml_backend_tensor_get(out, o.data(), 0, ne * 2);
+    };
+    run(gf, out_f, o_f, &n_f);
+    run(gr, out_r, o_r, &n_r);
+    if (ref32) ggml_backend_tensor_get(ref32, r32.data(), 0, ne * 4);
+    run(gf, out_f, o_f2, nullptr);
+    size_t ndiff = 0, n_rte = 0;
+    for (size_t i = 0; i < ne; ++i) { ndiff += o_f[i] != o_r[i]; if (ref32) n_rte += o_f[i] == ggml_fp32_to_fp16(r32[i]); }
+    const uint64_t h1 = fnv1a(o_f.data(), ne * 2), h2 = fnv1a(o_f2.data(), ne * 2);
+    perturb();
+    run(gf, out_f, o_p, nullptr);
+    const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
+    const int fails = (ndiff != 0) + (ref32 && n_rte != ne) + (expect >= 0 && (n_f != (uint64_t) expect || n_r != 0)) + (h1 != h2) + !ctl;
+    printf("%s %-36s byte-equal=%s (%zu of %zu differ) rte=%s fused on/ref=%llu/%llu hash=%016llx run2=%s control=%s\n",
+           fails ? "FAIL" : "ok", label, ndiff ? "NO" : "yes", ndiff, ne,
+           ref32 ? (n_rte == ne ? "yes" : "NO") : "n/a", (unsigned long long) n_f, (unsigned long long) n_r,
+           (unsigned long long) h1, h1 == h2 ? "same" : "DIFF", ctl ? "differs" : "SAME");
+    return fails;
+}
+
+static void fill(ggml_tensor * t, std::mt19937 & rng, float lo, float hi) {
+    std::uniform_real_distribution<float> u(lo, hi);
+    std::vector<float> v(ggml_nelements(t));
+    for (auto & x : v) x = u(rng);
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h(v.size());
+        for (size_t i = 0; i < v.size(); ++i) h[i] = ggml_fp32_to_fp16(v[i]);
+        ggml_backend_tensor_set(t, h.data(), 0, h.size() * 2);
+    } else if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, v.data(), 0, v.size() * 4);
+    } else {
+        std::vector<uint8_t> q(ggml_nbytes(t));
+        ggml_quantize_chunk(t->type, v.data(), q.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+        ggml_backend_tensor_set(t, q.data(), 0, q.size());
+    }
+}
+static void bump(ggml_tensor * t) {   // add 0.5 to element 0 of an f32 / f16 tensor
+    if (t->type == GGML_TYPE_F32) { float v; ggml_backend_tensor_get(t, &v, 0, 4); v += 0.5f; ggml_backend_tensor_set(t, &v, 0, 4); }
+    else { ggml_fp16_t h; ggml_backend_tensor_get(t, &h, 0, 2); h = ggml_fp32_to_fp16(ggml_fp16_to_fp32(h) + 0.5f); ggml_backend_tensor_set(t, &h, 0, 2); }
+}
+
+// RMS_NORM + MUL + ROPE + VIEW + SET_ROWS (norm = true) or ROPE + VIEW + SET_ROWS into an f16 cache: the KV write
+static int run_rope_set_rows(ggml_backend_t be, ggml_backend_reg_t reg, bool norm, int mode, int64_t hd, int64_t nh, int64_t nt) {
+    ggml_init_params ip = { 48 * ggml_tensor_overhead() + 6 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const bool multi = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, nt);
+    ggml_tensor * w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, multi ? nt * 4 : nt);
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nt);
+    ggml_tensor * cf  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hd * nh, nt);
+    ggml_tensor * cr  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hd * nh, nt);
+    ggml_tensor * rope_r = nullptr;
+    auto chain = [&](ggml_tensor * cache, bool ref) {
+        ggml_tensor * a = x;
+        if (norm) {
+            ggml_tensor * n = ggml_rms_norm(ctx, x, 1e-6f); if (ref) ggml_set_output(n);
+            a = ggml_mul(ctx, n, w);                         if (ref) ggml_set_output(a);
+        }
+        int sections[4] = { (int) hd / 6, (int) hd / 6, (int) hd / 6, 0 };
+        ggml_tensor * r = multi ? ggml_rope_multi(ctx, a, pos, nullptr, (int) hd / 2 * 2, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)
+                                : ggml_rope(ctx, a, pos, (int) hd, mode);
+        if (ref) { ggml_set_output(r); rope_r = r; }
+        ggml_tensor * v = ggml_view_2d(ctx, r, hd * nh, nt, r->nb[2], 0);
+        ggml_tensor * o = ggml_set_rows(ctx, cache, v, idx);
+        ggml_set_output(o);
+        return o;
+    };
+    ggml_tensor * of = chain(cf, false);
+    ggml_tensor * orr = chain(cr, true);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(55 + (int) hd + mode + (norm ? 1 : 0));
+    fill(x, rng, -2.0f, 2.0f); fill(w, rng, -1.0f, 1.0f);
+    std::vector<int32_t> pv(ggml_nelements(pos)); for (size_t i = 0; i < pv.size(); ++i) pv[i] = (int32_t) (i % nt) * 7 + 3;
+    ggml_backend_tensor_set(pos, pv.data(), 0, pv.size() * 4);
+    std::vector<int64_t> iv(nt); for (int64_t i = 0; i < nt; ++i) iv[i] = (i * 37) % nt;   // nt prime to 37: a permutation
+    ggml_backend_tensor_set(idx, iv.data(), 0, iv.size() * 8);
+    // the reference f32 in cache-row order, for the RTE check: rope_r is [hd, nh, nt], row t goes to cache row iv[t]
+    char label[96];
+    snprintf(label, sizeof(label), "%s mode=%d %lldx%lldx%lld", norm ? "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS" : "ROPE_VIEW_SET_ROWS",
+             mode, (long long) hd, (long long) nh, (long long) nt);
+    const char * fname = norm ? "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS" : "ROPE_VIEW_SET_ROWS";
+    // no ref32 tensor in cache order: check RTE by hand after the pair run
+    int fails = run_pair(be, reg, label, fname, norm || !multi ? 1 : -1, ctx, of, orr, nullptr, [&]() { bump(x); });
+    {
+        // RTE: recompute the reference (the perturbation changed x; restore by re-running both on the bumped input)
+        ggml_cgraph * gr = ggml_new_graph(ctx); ggml_build_forward_expand(gr, orr);
+        ggml_backend_graph_compute(be, gr);
+        ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, of);
+        ggml_backend_graph_compute(be, gf);
+        std::vector<float> r32(hd * nh * nt); ggml_backend_tensor_get(rope_r, r32.data(), 0, r32.size() * 4);
+        std::vector<ggml_fp16_t> c16(hd * nh * nt); ggml_backend_tensor_get(cf, c16.data(), 0, c16.size() * 2);
+        size_t bad = 0;
+        for (int64_t t = 0; t < nt; ++t) for (int64_t e = 0; e < hd * nh; ++e) bad += c16[iv[t] * hd * nh + e] != ggml_fp32_to_fp16(r32[t * hd * nh + e]);
+        if (bad) { printf("FAIL %s: fused cache != RTE(reference rope f32) in %zu values\n", label, bad); fails++; }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
+// DSV4_HC_POST + RMS_NORM + MUL + CPY(f16) (HC_POST_NORM_CPY): the f16 normalised streams the hc up GEMM reads
+static int run_hc_post_norm(ggml_backend_t be, ggml_backend_reg_t reg, int64_t n_embd, int64_t nt) {
+    const int64_t hc = 4;
+    ggml_init_params ip = { 48 * ggml_tensor_overhead() + 6 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+    ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+    ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+    ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+    ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+    ggml_tensor * normed_r = nullptr;
+    auto chain = [&](bool ref) {
+        ggml_tensor * ro = ggml_dsv4_hc_post(ctx, x, res, post, comb);
+        if (ref) ggml_set_output(ro);
+        ggml_tensor * n = ggml_rms_norm(ctx, ro, 1e-6f); if (ref) ggml_set_output(n);
+        ggml_tensor * m = ggml_mul(ctx, n, gamma);       if (ref) { ggml_set_output(m); normed_r = m; }
+        ggml_tensor * xn = ggml_cast(ctx, m, GGML_TYPE_F16);
+        ggml_set_output(xn);
+        // the residual stream is read again downstream, as in the model
+        ggml_tensor * keep = ggml_add(ctx, ro, ggml_cast(ctx, xn, GGML_TYPE_F32));
+        ggml_set_output(keep);
+        return std::make_pair(xn, keep);
+    };
+    auto f = chain(false);
+    auto r = chain(true);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(91 + (int) n_embd);
+    fill(x, rng, -1.0f, 1.0f); fill(res, rng, -1.0f, 1.0f); fill(post, rng, 0.0f, 2.0f); fill(comb, rng, 0.0f, 1.0f); fill(gamma, rng, -1.0f, 1.0f);
+    char label[96]; snprintf(label, sizeof(label), "HC_POST_NORM_CPY %lldx4x%lld", (long long) n_embd, (long long) nt);
+    int fails = run_pair(be, reg, label, "HC_POST_NORM_CPY", -1, ctx, f.first, r.first, normed_r, [&]() { bump(x); });
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
+// MUL_MAT(q8_0 hc up) + CPY(f16) + DSV4_HC_MIX(f16) (HC_UP_MIX), and the standalone f16 DSV4_HC_MIX against its f32
+// variant + CPY
+static int run_hc_up_mix(ggml_backend_t be, ggml_backend_reg_t reg, int64_t n_embd, int64_t nt, int64_t lr) {
+    const int64_t hc = 4;
+    ggml_init_params ip = { 48 * ggml_tensor_overhead() + 6 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd * hc);
+    ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr, nt);
+    ggml_tensor * xn = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd, hc, nt);
+    ggml_tensor * gl = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd * hc, nt);   // standalone mix: gate logits
+    // HC_UP_MIX
+    ggml_tensor * of = ggml_dsv4_hc_mix_ext(ctx, xn, ggml_cast(ctx, ggml_mul_mat(ctx, w, lo), GGML_TYPE_F16), 0.25f, GGML_TYPE_F16, true);
+    ggml_set_output(of);
+    ggml_tensor * mm = ggml_mul_mat(ctx, w, lo); ggml_set_output(mm);
+    ggml_tensor * g16 = ggml_cast(ctx, mm, GGML_TYPE_F16); ggml_set_output(g16);
+    ggml_tensor * mix32 = ggml_dsv4_hc_mix_ext(ctx, xn, g16, 0.25f, GGML_TYPE_F32, true); ggml_set_output(mix32);
+    ggml_tensor * orr = ggml_cast(ctx, mix32, GGML_TYPE_F16); ggml_set_output(orr);
+    // standalone f16 mix vs f32 mix + CPY
+    ggml_tensor * sf = ggml_dsv4_hc_mix_ext(ctx, xn, gl, 0.25f, GGML_TYPE_F16, true); ggml_set_output(sf);
+    ggml_tensor * s32 = ggml_dsv4_hc_mix_ext(ctx, xn, gl, 0.25f, GGML_TYPE_F32, true); ggml_set_output(s32);
+    ggml_tensor * sr = ggml_cast(ctx, s32, GGML_TYPE_F16); ggml_set_output(sr);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(17 + (int) n_embd + (int) nt);
+    fill(w, rng, -1.0f, 1.0f); fill(lo, rng, -1.0f, 1.0f); fill(xn, rng, -1.0f, 1.0f); fill(gl, rng, -2.0f, 2.0f);
+    char label[96];
+    snprintf(label, sizeof(label), "HC_UP_MIX %lldx%lld lr=%lld", (long long) n_embd, (long long) nt, (long long) lr);
+    int fails = run_pair(be, reg, label, "HC_UP_MIX", -1, ctx, of, orr, mix32, [&]() { bump(lo); });
+    snprintf(label, sizeof(label), "DSV4_HC_MIX f16 out %lldx%lld", (long long) n_embd, (long long) nt);
+    fails += run_pair(be, reg, label, nullptr, -1, ctx, sf, sr, s32, [&]() { bump(xn); });
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
+// MUL_MAT + CPY(f16) (MUL_MAT_CPY16): the d16 GEMM never splits K, the unfused f32 GEMM may
+static int run_mm_cpy16(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type t, int64_t m, int64_t n, int64_t k) {
+    ggml_init_params ip = { 16 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, t, k, m);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_tensor * of = ggml_cast(ctx, ggml_mul_mat(ctx, a, b), GGML_TYPE_F16); ggml_set_output(of);
+    ggml_tensor * mm = ggml_mul_mat(ctx, a, b); ggml_set_output(mm);
+    ggml_tensor * orr = ggml_cast(ctx, mm, GGML_TYPE_F16); ggml_set_output(orr);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(3 + (int) m + (int) k);
+    fill(a, rng, -1.0f, 1.0f); fill(b, rng, -1.0f, 1.0f);
+    char label[96];
+    snprintf(label, sizeof(label), "MUL_MAT_CPY16 %s %lldx%lldx%lld", ggml_type_name(t), (long long) m, (long long) n, (long long) k);
+    int fails = run_pair(be, reg, label, "MUL_MAT_CPY16", 1, ctx, of, orr, mm, [&]() { bump(b); });
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
@@ -241,6 +449,18 @@ int main() {
     fails += run_norm(be, reg,  128, 32, 512, 1);
     fails += run_norm(be, reg,  128, 32,  77, 1);
     fails += run_norm(be, reg,  128, 48, 512, 2);
+    // the KV write: neox (qwen4exp / most models) and the multi-section rope, with and without the fused norm
+    fails += run_rope_set_rows(be, reg, true,  GGML_ROPE_TYPE_NEOX, 128, 8, 509);
+    fails += run_rope_set_rows(be, reg, false, GGML_ROPE_TYPE_NEOX, 128, 8, 509);
+    fails += run_rope_set_rows(be, reg, true,  GGML_ROPE_TYPE_NORMAL, 128, 8, 77);
+    fails += run_rope_set_rows(be, reg, false, GGML_ROPE_TYPE_IMROPE, 256, 2, 509);
+    // qwen4exp hc: the post-combine norm and the up-projection mix (Flash-Next n_embd 2560, low rank 320)
+    fails += run_hc_post_norm(be, reg, 2560, 512);
+    fails += run_hc_up_mix(be, reg, 2560, 512, 320);
+    // MUL_MAT_CPY16: the 35B shared-expert up/gate, the Flash-Next skinny-M shape, a split-K-prone one
+    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q8_0,   512, 2048,  2048);
+    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q8_0,   320, 2048, 10240);
+    fails += run_mm_cpy16(be, reg, GGML_TYPE_Q4_K,   256,   64,  8192);
     ggml_backend_free(be);
     printf("test-mmid-d16-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;

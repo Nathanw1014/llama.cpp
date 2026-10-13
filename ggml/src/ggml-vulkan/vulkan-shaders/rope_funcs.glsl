@@ -1,4 +1,16 @@
 
+// f16 rope outputs (ROPE_D_F16: the KV-cache write of RMS_NORM_MUL_ROPE(_VIEW_SET_ROWS) / ROPE_VIEW_SET_ROWS): the rotated value
+// goes through an XOR with a push-constant zero (bit 30 of rope_mode is never set) before the f16 conversion, so the compiler
+// cannot fold the last multiply-add and the conversion into one single-rounding op. The fused write then equals the unfused
+// chain (rope f32, then SET_ROWS f32 -> f16) bit for bit (test-mmid-d16-exact, 10-13).
+float rope_round(const float v, rope_params p) {
+#ifdef ROPE_D_F16
+    return uintBitsToFloat(floatBitsToUint(v) ^ (p.rope_mode & 0x40000000u));
+#else
+    return v;
+#endif
+}
+
 float rope_yarn_ramp(const float low, const float high, const uint i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -67,8 +79,8 @@ void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + 1]);
 
-    rope_data_d[idst + 0] = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + 1] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0] = ROPE_D_TYPE(rope_round(x0*cos_theta - x1*sin_theta, p));
+    rope_data_d[idst + 1] = ROPE_D_TYPE(rope_round(x0*sin_theta + x1*cos_theta, p));
 }
 
 void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
@@ -104,8 +116,8 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + p.n_dims/2]);
 
-    rope_data_d[idst + 0]          = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0]          = ROPE_D_TYPE(rope_round(x0*cos_theta - x1*sin_theta, p));
+    rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(rope_round(x0*sin_theta + x1*cos_theta, p));
 }
 
 
@@ -170,8 +182,8 @@ void rope_multi(const uint i0, const uint i1, const uint i2, const uint i3, rope
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + p.n_dims/2]);
 
-    rope_data_d[idst + 0]          = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0]          = ROPE_D_TYPE(rope_round(x0*cos_theta - x1*sin_theta, p));
+    rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(rope_round(x0*sin_theta + x1*cos_theta, p));
 }
 
 void rope_vision(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
@@ -204,7 +216,7 @@ void rope_vision(const uint i0, const uint i1, const uint i2, const uint i3, rop
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + p.n_dims]);
 
-    rope_data_d[idst + 0]        = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_dims] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0]        = ROPE_D_TYPE(rope_round(x0*cos_theta - x1*sin_theta, p));
+    rope_data_d[idst + p.n_dims] = ROPE_D_TYPE(rope_round(x0*sin_theta + x1*cos_theta, p));
 }
 

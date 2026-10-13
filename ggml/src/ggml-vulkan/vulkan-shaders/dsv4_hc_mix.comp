@@ -66,7 +66,13 @@ void main() {
             for (uint c = 0; c < p.hc; ++c) {
                 s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(float(data_g[gate_row(c, k) + it * p.sg1]));
             }
+#ifdef D_F16
+            // the f32 product through an XOR with a push-constant zero (gil is 0 or 1), so its f32 rounding survives the f16
+            // conversion: equal to the f32 variant followed by a CPY (test-mmid-d16-exact, 10-13)
+            data_d[k + it * p.sd1] = D_TYPE(uintBitsToFloat(floatBitsToUint(p.scale * s) ^ (p.gil & ~1u)));
+#else
             data_d[k + it * p.sd1] = D_TYPE(p.scale * s);
+#endif
         }
     }
 }
