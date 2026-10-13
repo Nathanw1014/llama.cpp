@@ -9786,6 +9786,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // the 35B-A3B down projection shape: 2048 x 512 experts, top-8 of 32 here (256 in the model), k = 512
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_K, 32, 8, true, 2048, 96, 512));
+    // LLAMA_NORM_F16B (qwen35moe): the f16 norm output read by the f32-weight projections (router m=256, ssm_alpha/beta
+    // m=32, shared-expert gate m=1) and by the expert gate/up MUL_MAT_ID as is
+    for (int64_t m : {256, 32, 1}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F16, m, 2048, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F16, m, 77, 2048, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F16, 32, 8, false, 512, 96, 2048));
     // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged
     // M/N; GGML_VK_MM_XL=2 routes every large-tile shape above to XL as well
     for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {

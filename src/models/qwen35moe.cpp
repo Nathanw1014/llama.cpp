@@ -179,6 +179,29 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+    // LLAMA_NORM_F16B (default on, =0 off): at prefill the attention and post-attention norms store f16 (the Vulkan
+    // RMS_NORM_MUL_CPY fusion) and every projection reads that f16 B, the f32-weight ones too (router, ssm_alpha/beta,
+    // shared-expert gate: the f32 x f16 GEMMs), as the release does for its mixed stream. The quantized projections
+    // rounded B to f16 before anyway, in a separate conversion pass per norm (Qwen3.6-35B-A3B pp2048: 80 of the 160
+    // MM_B_TO_F16 sub-ops per ubatch, x35 per-op 10-13); the f32-weight ones now see f16-rounded inputs (KLD-gated).
+    // Only where every consumer weight of the layer is on a GPU buffer and not bf16, without LoRA.
+    static const bool norm_f16b = [] { const char * e = getenv("LLAMA_NORM_F16B"); return e == nullptr || atoi(e) != 0; }();
+    auto gpu_w = [](const ggml_tensor * w) {
+        return w == nullptr || (w->type != GGML_TYPE_BF16 && llm_graph_weights_on_gpu(w->buffer));
+    };
+    auto f16b_attn = [&](int il) {
+        const auto & L = model.layers[il];
+        return norm_f16b && n_tokens >= 32 && loras->empty() &&
+            (hparams.is_recr(il) ? gpu_w(L.wqkv) && gpu_w(L.wqkv_gate) && gpu_w(L.ssm_beta) && gpu_w(L.ssm_alpha) && L.wqkv != nullptr
+                                 : gpu_w(L.wq) && gpu_w(L.wk) && gpu_w(L.wv) && L.wq != nullptr);
+    };
+    auto f16b_ffn = [&](int il) {
+        const auto & L = model.layers[il];
+        return norm_f16b && n_tokens >= 32 && loras->empty() && L.ffn_gate_inp != nullptr && gpu_w(L.ffn_gate_inp) &&
+            gpu_w(L.ffn_up_exps) && gpu_w(L.ffn_gate_exps) && gpu_w(L.ffn_gate_up_exps) && gpu_w(L.ffn_down_exps) &&
+            gpu_w(L.ffn_up_shexp) && gpu_w(L.ffn_gate_shexp) && gpu_w(L.ffn_gate_inp_shexp);
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -186,6 +209,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+        if (f16b_attn(il)) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);   // right behind the norm's MUL: RMS_NORM_MUL_CPY
+            cb(cur, "attn_norm_f16", il);
+            ggml_build_forward_expand(gf, cur);
+        }
 
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
@@ -215,6 +243,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
+        if (f16b_ffn(il)) {
+            attn_post_norm = ggml_cast(ctx0, attn_post_norm, GGML_TYPE_F16);
+            cb(attn_post_norm, "attn_post_norm_f16", il);
+            ggml_build_forward_expand(gf, attn_post_norm);
+        }
 
         // MOE FFN layer
         cur = build_layer_ffn(attn_post_norm, il);
