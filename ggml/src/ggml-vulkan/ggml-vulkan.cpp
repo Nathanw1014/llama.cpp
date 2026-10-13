@@ -689,7 +689,7 @@ static bool ggml_vk_gdn_norm_f16_wiring(const ggml_cgraph * g, int i) {
     }
     ggml_tensor * const * n = g->nodes + i;
     return n[0]->op == GGML_OP_RMS_NORM && n[1]->op == GGML_OP_MUL && (n[1]->src[0] == n[0] || n[1]->src[1] == n[0]) &&
-           n[2]->op == GGML_OP_UNARY && ggml_get_unary_op(n[2]) == GGML_UNARY_OP_SIGMOID &&
+           n[2]->op == GGML_OP_UNARY && (ggml_get_unary_op(n[2]) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(n[2]) == GGML_UNARY_OP_SILU) &&
            n[3]->op == GGML_OP_MUL && ((n[3]->src[0] == n[1] && n[3]->src[1] == n[2]) || (n[3]->src[0] == n[2] && n[3]->src[1] == n[1])) &&
            n[4]->op == GGML_OP_CPY && n[4]->src[0] == n[3] && n[4]->type == GGML_TYPE_F16;
 }
@@ -1082,6 +1082,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_mul_small_f32;  // + second multiplier (gated norm)
     vk_pipeline pipeline_rms_norm_mul_sigmul_small_f32_f16;  // gated norm, sigmoid on the multiplier, f16 out
+    vk_pipeline pipeline_rms_norm_mul_silumul_small_f32_f16; // gated norm, silu on the multiplier, f16 out
     vk_pipeline pipeline_rms_norm_scale_small_f32;    // + SCALE (the GDN q/k l2 norm)
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
@@ -2789,6 +2790,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_rms_norm_scale {};   // RMS_NORM+SCALE (the GDN q/k l2 norm)
     bool fused_rms_norm_sig {};     // RMS_NORM+MUL+SIGMOID+MUL+CPY(f16) (the GDN output norm, f16 only)
+    bool fused_rms_norm_silu {};    // with fused_rms_norm_sig: the gate is SILU(z), not SIGMOID(z) (qwen35moe)
     bool fused_mmid_swiglu {};      // MUL_MAT_ID+CPY+MUL_MAT_ID+CPY+GLU (gate/up/swiglu in one REG_A dispatch)
     bool fused_mul_add {};          // MUL+ADD with a broadcast multiplier (MUL_ADD)
     bool fused_hc_post_gate {};     // SCALE -> SIGMOID -> SCALE folded into DSV4_HC_POST(+NORM) as the post weights (HC_POST_GATE)
@@ -6688,6 +6690,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32, "rms_norm_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_small_f32, "rms_norm_mul_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_sigmul_small_f32_f16, "rms_norm_mul_sigmul_small_f32_f16", rms_norm_small_f32_f16_len, rms_norm_small_f32_f16_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1, 0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_silumul_small_f32_f16, "rms_norm_mul_silumul_small_f32_f16", rms_norm_small_f32_f16_len, rms_norm_small_f32_f16_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1, 0, 0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_small_f32, "rms_norm_scale_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
@@ -15511,7 +15514,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_RMS_NORM:
         if (ctx->fused_rms_norm_sig) {
-            return ctx->device->pipeline_rms_norm_mul_sigmul_small_f32_f16;
+            return ctx->fused_rms_norm_silu ? ctx->device->pipeline_rms_norm_mul_silumul_small_f32_f16
+                                            : ctx->device->pipeline_rms_norm_mul_sigmul_small_f32_f16;
         }
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16 && ctx->num_additional_fused_ops == 2 && !ctx->do_add_rms_partials) {
             return ctx->device->pipeline_rms_norm_mul_f32_f16;
@@ -21596,7 +21600,12 @@ static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, c
         const ggml_tensor *mul2 = cgraph->nodes[node_idx + 3];
         const ggml_tensor *cpy  = cgraph->nodes[node_idx + 4];
         const ggml_tensor *z    = sig->src[0];
-        if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        // RMS_NORM+MUL+SILU+MUL+CPY(f16): the qwen35moe GDN output norm (normalised * gamma * silu(z)), the same kernel with
+        // unary.comp's op_silu on z (10-13, Qwen3.6-35B-A3B: the f32 norm output, the SILU pass and the ssm_out B conversion
+        // go). GGML_VK_GDN_NORM_SILU_F16=0 keeps that form unfused.
+        static const bool silu_ok = [] { const char * e = getenv("GGML_VK_GDN_NORM_SILU_F16"); return e == nullptr || atoi(e) != 0; }();
+        const bool is_silu = ggml_get_unary_op(sig) == GGML_UNARY_OP_SILU;
+        if ((ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID && !(is_silu && silu_ok)) ||
             !((mul2->src[0] == mul && mul2->src[1] == sig) || (mul2->src[0] == sig && mul2->src[1] == mul)) ||
             cpy->src[0] != mul2 || cpy->type != GGML_TYPE_F16 || z->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32) {
             return false;
@@ -23219,6 +23228,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa_out_scratch = false;
         ctx->fused_rms_norm_scale = false;
         ctx->fused_rms_norm_sig = false;
+        ctx->fused_rms_norm_silu = false;
         ctx->fused_mmid_swiglu = false;
         ctx->fused_mul_add = false;
         ctx->fused_qsa_score = false;
@@ -23379,7 +23389,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse_gdn_norm_f16(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 ctx->fused_rms_norm_sig = true;
-                fusion_string = "RMS_NORM_MUL_SIGMUL_CPY";
+                ctx->fused_rms_norm_silu = ggml_get_unary_op(cgraph->nodes[i + 2]) == GGML_UNARY_OP_SILU;
+                fusion_string = ctx->fused_rms_norm_silu ? "RMS_NORM_MUL_SILUMUL_CPY" : "RMS_NORM_MUL_SIGMUL_CPY";
                 for (int k = 0; k < 5; ++k) {
                     op_srcs_fused_elementwise[k] = true;    // row-wise; the CPY's src[1] is its own destination
                 }
@@ -23617,6 +23628,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa_out_scratch = false;
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_rms_norm_sig = false;
+                ctx->fused_rms_norm_silu = false;
                 ctx->fused_mmid_swiglu = false;
                 ctx->fused_mul_add = false;
                 ctx->fused_qsa_score = false;

@@ -3864,26 +3864,53 @@ struct test_rms_norm_mul_mul : public test_case {
 };
 
 // RMS_NORM + MUL(weight) + SIGMOID(z) + MUL + CPY(f16): the qwen4exp gated GDN norm under LLAMA_GDN_NORM_F16,
-// in that node order (Vulkan fuses all five as RMS_NORM_MUL_SIGMUL_CPY, writing only the f16 output)
+// in that node order (Vulkan fuses all five as RMS_NORM_MUL_SIGMUL_CPY, writing only the f16 output).
+// silu: the qwen35moe form, SILU(z) as the gate (RMS_NORM_MUL_SILUMUL_CPY); that variant also asserts the fused dispatch ran.
 struct test_rms_norm_mul_sigmul_cpy : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "RMS_NORM_MUL_SIGMUL_CPY";
+        return silu ? "RMS_NORM_MUL_SILUMUL_CPY" : "RMS_NORM_MUL_SIGMUL_CPY";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, eps);
+        return silu ? VARS_TO_STR3(ne, eps, silu) : VARS_TO_STR2(ne, eps);   // the sigmoid cases keep their names
     }
 
     const int64_t pad;   // LLAMA_GDN_NORM_PAD: the f16 rows land in a view of [ne0*ne1 + pad, ne2] (read back packed)
+    const bool silu;
 
-    test_rms_norm_mul_sigmul_cpy(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, int64_t pad = 0)
-        : ne(ne), eps(eps), pad(pad) {}
+    test_rms_norm_mul_sigmul_cpy(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, int64_t pad = 0, bool silu = false)
+        : ne(ne), eps(eps), pad(pad), silu(silu) {}
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (!silu || count == nullptr) {
+            return true;
+        }
+        // one chain, one graph run: exactly one fused dispatch
+        const uint64_t c = count("RMS_NORM_MUL_SILUMUL_CPY");
+        if (c != 1) {
+            msg = "fused dispatch RMS_NORM_MUL_SILUMUL_CPY ran " + std::to_string(c) + " times, expected 1";
+            return false;
+        }
+        return true;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -3894,7 +3921,7 @@ struct test_rms_norm_mul_sigmul_cpy : public test_case {
         ggml_set_name(z, "z");
 
         ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
-        ggml_tensor * gated = ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z));
+        ggml_tensor * gated = ggml_mul(ctx, normalized, silu ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z));
         ggml_tensor * out;
         if (pad > 0) {
             ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne[0] * ne[1] + pad, ne[2]);
@@ -9816,6 +9843,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 33, 1}, 1e-6f, 128));     // LLAMA_GDN_NORM_PAD
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 48, 2048, 1}, 1e-6f, 128));
     test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({256, 8, 3, 1}));
+    // qwen35moe: SILU(z) gate; 35B-A3B GDN output norm shape (128 x 32 heads)
+    test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 32, 9, 1},    1e-6f, 0, true));
+    test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({128, 32, 2048, 1}, 1e-6f, 0, true));
+    test_cases.emplace_back(new test_rms_norm_mul_sigmul_cpy({100, 3, 5, 2},     1e-6f, 0, true));
     test_cases.emplace_back(new test_mul_add_bcast({2560, 33, 1, 1}));
     test_cases.emplace_back(new test_mul_add_bcast({2560, 33, 1, 1}, true));
     test_cases.emplace_back(new test_mul_add_bcast({100, 7, 3, 2}));

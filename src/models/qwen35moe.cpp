@@ -275,6 +275,20 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // LLAMA_GDN_NORM_F16 (default on, =0 off), as in qwen4exp with the silu gate: at prefill emit RMS_NORM, MUL(gamma),
+    // SILU(z), MUL, CPY(f16) back to back, which the Vulkan backend runs as one pass (RMS_NORM_MUL_SILUMUL_CPY) writing
+    // only the f16 B operand of ssm_out: no silu pass, no f32 norm output and no B conversion in the GEMM (Qwen3.6-35B-A3B
+    // pp2048: 30 of the 160 MM_B_TO_F16 sub-ops per ubatch, x35 per-op 10-13). The GEMM's B was rounded to f16 before
+    // either way. Only when ssm_out is a GPU weight, not bf16, without LoRA (the CPU and a LoRA delta take no f16 B).
+    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * w_out = model.layers[layer].ssm_out;
+    if (norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
+        model.layers[layer].ssm_out_s == nullptr && llm_graph_weights_on_gpu(w_out->buffer)) {
+        ggml_build_forward_expand(gf, gate);   // keep gate's own view nodes ahead of the chain
+        ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+        ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_silu(ctx0, gate));
+        return ggml_cast(ctx0, out, GGML_TYPE_F16);
+    }
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 

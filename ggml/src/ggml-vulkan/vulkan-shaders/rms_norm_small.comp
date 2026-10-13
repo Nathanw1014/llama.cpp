@@ -29,6 +29,8 @@ layout (constant_id = 3) const bool do_post_scale = false;
 // expression, and the f16 variant of this shader stores the ssm_out GEMM's B operand directly. Idea from
 // Strata's GDN_NOY (only the f16 image the out projection consumes is written).
 layout (constant_id = 4) const bool do_sigmoid_c = false;
+// the qwen35moe form of the same norm: normalised * gamma * silu(z), with unary.comp's op_silu expression
+layout (constant_id = 5) const bool do_silu_c = false;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -68,6 +70,9 @@ void main() {
             float c = data_c[c_offset + col];
             if (do_sigmoid_c) {
                 c = 1.0f / (1.0f + exp(-c));
+            }
+            if (do_silu_c) {
+                c = c / (1.0f + exp(-c));
             }
             data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * g * FLOAT_TYPE(c));
         }
