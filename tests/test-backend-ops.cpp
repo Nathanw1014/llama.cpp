@@ -9750,13 +9750,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 2560));
     }
-    // id-only f16-output types (Unsloth UD-Q3_K_XL expert gate/up)
-    for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+    // id-only f16-output types (Unsloth UD-Q3_K_XL expert gate/up; UD-Q4_K_XL 35B-A3B expert down: q2_K / q3_K / q5_K)
+    for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q5_K}) {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 2560));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  256, 64, 2560));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 200, 70, 2560));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  640, 130, 512));
     }
+    // the 35B-A3B down projection shape: 2048 x 512 experts, top-8 of 32 here (256 in the model), k = 512
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_K, 32, 8, true, 2048, 96, 512));
     // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged
     // M/N; GGML_VK_MM_XL=2 routes every large-tile shape above to XL as well
     for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {

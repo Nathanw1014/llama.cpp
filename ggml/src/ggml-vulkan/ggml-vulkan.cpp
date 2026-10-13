@@ -5853,6 +5853,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ4_NL], matmul_id_subgroup_iq4_nl_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ3_XXS, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         // MUL_MAT_ID_SWIGLU: the same aligned medium REG_A == 3 pipeline with SWIGLU set (mul_mm.comp constantID 16)
         if (mmid_rega == 3 && device->mul_mat_id_m[GGML_TYPE_IQ3_XXS]) {
             std::vector<uint32_t> sw = mmid_m_aligned_spec(GGML_TYPE_IQ3_XXS, m_warptile_mmq);
@@ -22745,6 +22748,13 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     // CPY(640,10,2048) casts per ubatch (29.6 ms of 2.11 s) disappear and the matmuls cost the same (464.6 vs 467.1 ms)
     const vk_matmul_pipeline2 & pd16 = ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16[src0->type];
     if (pd16.f16acc->is_empty() && pd16.f32acc->is_empty()) { ggml_vk_cpy16_reject(cgraph, node_idx, "weight type"); return false; }
+    // Q2_K / Q3_K / Q5_K f16-output id pipelines (10-13): the UD-Q4_K_XL 35B-A3B expert down projections are Q5_K on 36 of
+    // 40 layers, which ran MUL_MAT_ID_MUL (116.5 ms) plus a separate CPY(2048,8,2048) to f16 (33.8 ms) per 2048-token ubatch
+    // while the Q6_K layers fused (x35 per-op, 10-13). GGML_VK_MMID_D16_KQ=0 keeps those three types unfused.
+    static const bool d16_kq = [] { const char * e = getenv("GGML_VK_MMID_D16_KQ"); return e == nullptr || atoi(e) != 0; }();
+    if (!d16_kq && (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q5_K)) {
+        ggml_vk_cpy16_reject(cgraph, node_idx, "weight type (GGML_VK_MMID_D16_KQ=0)"); return false;
+    }
     if (!ggml_is_contiguous(src0) || mmid->type != GGML_TYPE_F32) { ggml_vk_cpy16_reject(cgraph, node_idx, "src0 layout / dst type"); return false; }
     if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_mmid_f16b_enabled()))) {
         ggml_vk_cpy16_reject(cgraph, node_idx, "src1 type"); return false;
