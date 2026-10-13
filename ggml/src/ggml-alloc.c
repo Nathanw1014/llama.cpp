@@ -209,6 +209,7 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, struct buff
 
 // GGML_ALLOC_TRACE: 1 logs reallocations (below), 2 also prints, each time a chunk's peak grows, the largest tensors
 // allocated at that moment: what the compute buffer's size is made of (names, ops, shapes), without a debug build
+// 3 also prints every tensor the graph allocator places (chunk, offset, size), to compare layouts offline
 static int ggml_alloc_trace_level(void) {
     static int level = -1;
     if (level < 0) {
@@ -514,6 +515,21 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
+// GGML_ALLOC_PAD_MB=N (default 0, diagnostic): allocate chunk 0 of every non-host graph buffer N MiB larger than the
+// allocator needs and leave the extra unused. The layout is unchanged; only the buffer's size (and so where the driver
+// places it and the buffers allocated after it) moves. Separates a buffer-level effect from a tensor-offset one.
+static size_t ggml_alloc_pad_bytes(ggml_backend_buffer_type_t buft, int chunk) {
+    static long long mb = -1;
+    if (mb < 0) {
+        const char * e = getenv("GGML_ALLOC_PAD_MB");
+        mb = e != NULL ? atoll(e) : 0;
+        if (mb < 0) {
+            mb = 0;
+        }
+    }
+    return chunk == 0 && mb > 0 && !ggml_backend_buft_is_host(buft) ? (size_t) mb << 20 : 0;
+}
+
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
@@ -526,7 +542,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size + ggml_alloc_pad_bytes(buft, n));
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;
@@ -551,7 +567,7 @@ static bool ggml_vbuffer_grow(struct vbuffer * buf, ggml_backend_buffer_type_t b
             continue;
         }
         ggml_backend_buffer_free(buf->chunks[n]);
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need);
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need + ggml_alloc_pad_bytes(buft, n));
         if (buf->chunks[n] == NULL) {
             return false;
         }
@@ -757,7 +773,7 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
-static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
+static void ggml_gallocr_allocate_node_impl(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
@@ -834,6 +850,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
     }
 }
 
+static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
+    const bool placed_before = ggml_gallocr_is_allocated(galloc, node) || ggml_impl_is_view(node);
+    ggml_gallocr_allocate_node_impl(galloc, node, buffer_id);
+    if (!placed_before && ggml_alloc_trace_level() >= 3) {
+        const struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+        fprintf(stderr, "ggml_alloc: place buf %d chunk %d off %zu size %zu %s %s %s %lldx%lldx%lldx%lld\n", hn->buffer_id, hn->addr.chunk,
+            hn->addr.offset, ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node), node->name, ggml_op_name(node->op),
+            ggml_type_name(node->type), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+    }
+}
+
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
@@ -865,6 +892,9 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
 }
 
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    if (ggml_alloc_trace_level() >= 3) {
+        fprintf(stderr, "ggml_alloc: layout graph %d nodes %d leafs\n", graph->n_nodes, graph->n_leafs);
+    }
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
