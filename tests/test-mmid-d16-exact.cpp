@@ -492,55 +492,6 @@ static int run_f16b(ggml_backend_t be, int64_t m, int64_t n, int64_t k, bool mmi
     return fails;
 }
 
-// Engagement through the scheduler: graph_optimize's alloc deps and ggml-alloc's buffer reuse only exist there (the cases above
-// allocate every tensor separately, so an output can never land on a freed input). which = 0: the GDN output norm with the silu
-// gate (RMS_NORM_MUL_SILUMUL_CPY); 1: the attention output gate (SIGMOID_MUL). Each chain's inputs are computed nodes whose
-// last use is inside the fusion, so without the deps ggml-alloc may place the fused output on them and graph_compute drops
-// the fusion. Requires the fused dispatch; GGML_VK_ALLOC_DEPS=0 is the positive control (expected to drop it).
-static int run_sched_engage(ggml_backend_t be, ggml_backend_reg_t reg, int which, int64_t nt) {
-    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
-    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
-    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    ggml_backend_t bes[2] = { be, cpu };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(bes, nullptr, 2, 4096, false, false);
-    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
-    std::vector<ggml_tensor *> ins;
-    auto input = [&](ggml_tensor * t) { ggml_set_input(t); ins.push_back(t); return t; };
-    const char * fname = which == 0 ? "RMS_NORM_MUL_SILUMUL_CPY" : "SIGMOID_MUL";
-    ggml_tensor * out;
-    if (which == 0) {
-        ggml_tensor * x = ggml_scale(ctx, input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 32, nt)), 1.0f);
-        ggml_tensor * z = ggml_scale(ctx, input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 32, nt)), 1.0f);
-        ggml_tensor * g = input(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128));
-        ggml_tensor * m = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
-        out = ggml_cast(ctx, ggml_mul(ctx, m, ggml_silu(ctx, z)), GGML_TYPE_F16);
-    } else {
-        ggml_tensor * qg  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * 4096, nt));
-        ggml_tensor * att = ggml_scale(ctx, input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, nt)), 1.0f);
-        ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, qg, 4096, nt, qg->nb[1], 4096 * sizeof(float)));
-        out = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
-    }
-    ggml_set_output(out);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, out);
-    ggml_backend_sched_alloc_graph(sched, gf);
-    std::mt19937 rng(5 + which);
-    for (ggml_tensor * t : ins) fill(t, rng, -1.0f, 1.0f);
-    reset();
-    ggml_backend_sched_graph_compute(sched, gf);
-    ggml_backend_sched_synchronize(sched);
-    const uint64_t n = count(fname);
-    static const bool deps_on = [] { const char * e = getenv("GGML_VK_ALLOC_DEPS"); return e == nullptr || atoi(e) != 0; }();
-    const bool fail = deps_on && n != 1;
-    printf("%s %-36s through the scheduler, nt=%lld: fused dispatches %llu (alloc deps %s)\n", fail ? "FAIL" : deps_on ? "ok" : "CONTROL",
-           fname, (long long) nt, (unsigned long long) n, deps_on ? "on" : "off");
-    ggml_backend_sched_free(sched);
-    ggml_backend_free(cpu);
-    ggml_free(ctx);
-    return fail;
-}
-
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
@@ -585,8 +536,8 @@ int main() {
     // LLAMA_NORM_F16B: the router / alpha-beta / shared-gate f32 x f16 GEMMs and an expert gate/up with f16 B
     for (int64_t m : {256, 32, 1}) { fails += run_f16b(be, m, 2048, 2048, false); fails += run_f16b(be, m, 77, 2048, false); }
     fails += run_f16b(be, 512, 96, 2048, true);
-    // the alloc-dep engagement of the 35B GDN output norm and attention gate, through the scheduler
-    for (int64_t nt : {512, 77}) { fails += run_sched_engage(be, reg, 0, nt); fails += run_sched_engage(be, reg, 1, nt); }
+    // (the alloc-dep engagement of the 35B GDN output norm and attention gate is checked in-model by fusion counts: a synthetic
+    // scheduler graph, run_sched_engage, fused neither pattern with or without the deps on 10-13, so it could not tell them apart)
     ggml_backend_free(be);
     printf("test-mmid-d16-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
