@@ -4330,6 +4330,18 @@ struct test_mul_mat_f16b : public test_case {
         dispatch_census_reset(backend);
     }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        // wave 6 (A): GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
+        // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
+        static const bool req_native = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_F16B_NATIVE"); return e != nullptr && atoi(e) != 0; }();
+        static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
+        const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
+        if (req_native && native >= 0) {
+            const bool want = native_on && type_a == GGML_TYPE_Q8_0 && k >= 1024 && n >= 32;
+            if ((native > 0) != want) {
+                msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(native) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
+                return false;
+            }
+        }
         const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B");
         if (pad == 0 || c < 0 || n <= 8) {
             return true;   // unpadded; not Vulkan; a mat-vec width (B is the vector side there and is copied)
