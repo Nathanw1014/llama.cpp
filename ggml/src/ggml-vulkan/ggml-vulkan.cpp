@@ -23859,7 +23859,18 @@ static void ggml_vk_graph_add_alloc_deps(ggml_backend_vk_context * ctx, const st
         int n_fused = 0;   // additional fused ops behind node i
         const char * what = nullptr;
         int idx;
-        if (const int gate_n = ggml_vk_can_fuse_hc_post_gate(ctx, graph, i)) {
+        if (ggml_vk_can_fuse_gdn_norm_f16(ctx, graph, i)) {
+            // RMS_NORM_MUL_SIGMUL_CPY / SILUMUL_CPY: the kernel reads x, gamma and z while it writes the f16 rows. Without the
+            // dep ggml-alloc freed z at the gate's UNARY and put the f16 output on it, and the overlap check dropped the fusion
+            // (35B pp2048: 33 of 90 GDN output norms, GGML_VK_FUSION_DEBUG 10-13)
+            n_fused = 4;
+            what = "RMS_NORM_MUL_SIGMUL_CPY";
+        } else if (ggml_vk_can_fuse(ctx, graph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
+            // SIGMOID_MUL (the attention output gate) and the other UNARY+MUL pairs: the gate stays allocated through the MUL
+            // (35B: every attention gate's SIGMOID_MUL was dropped, "gate_reshaped CONT overlaps output attn_gated")
+            n_fused = 1;
+            what = "UNARY_MUL";
+        } else if (const int gate_n = ggml_vk_can_fuse_hc_post_gate(ctx, graph, i)) {
             n_fused = gate_n;
             what = gate_n == 6 ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE";
         } else if (ggml_vk_can_fuse_hc_post_norm(ctx, graph, i)) {
