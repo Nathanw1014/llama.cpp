@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <random>
+#include <utility>
 #include <vector>
 
 typedef uint64_t (*fusion_count_t)(const char *);
@@ -145,6 +146,74 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     return fails;
 }
 
+// The f16-output norm fusions under the same contract: RMS_NORM + MUL(gamma) (+ SILU/SIGMOID(z) + MUL) + CPY(f16) against the
+// same chain with every intermediate as a graph output. gate: 0 = RMS_NORM_MUL_CPY, 1 = RMS_NORM_MUL_SILUMUL_CPY (qwen35moe),
+// 2 = RMS_NORM_MUL_SIGMUL_CPY (qwen4exp).
+static int run_norm(ggml_backend_t be, ggml_backend_reg_t reg, int64_t ne0, int64_t ne1, int64_t nt, int gate) {
+    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
+    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
+    const char * fname = gate == 0 ? "RMS_NORM_MUL_CPY" : gate == 1 ? "RMS_NORM_MUL_SILUMUL_CPY" : "RMS_NORM_MUL_SIGMUL_CPY";
+    ggml_init_params ip = { 32 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, nt);
+    ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+    ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, nt);
+    auto chain = [&](bool ref) {
+        ggml_tensor * n = ggml_rms_norm(ctx, x, 1e-6f);
+        if (ref) ggml_set_output(n);
+        ggml_tensor * m = ggml_mul(ctx, n, g);
+        if (ref) ggml_set_output(m);
+        if (gate != 0) {
+            ggml_tensor * a = gate == 1 ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z);
+            if (ref) ggml_set_output(a);
+            m = ggml_mul(ctx, m, a);
+            if (ref) ggml_set_output(m);
+        }
+        ggml_tensor * o = ggml_cast(ctx, m, GGML_TYPE_F16);
+        ggml_set_output(o);
+        return std::make_pair(m, o);
+    };
+    auto fz = chain(false);
+    auto rz = chain(true);
+    ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, fz.second);
+    ggml_cgraph * gr = ggml_new_graph(ctx); ggml_build_forward_expand(gr, rz.second);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(777 + (int) ne0 + gate);
+    std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+    std::vector<float> xv(ne0 * ne1 * nt), gv(ne0), zv(ne0 * ne1 * nt);
+    for (auto & v : xv) v = u(rng);
+    for (auto & v : gv) v = u(rng);
+    for (auto & v : zv) v = u(rng);
+    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * 4);
+    ggml_backend_tensor_set(g, gv.data(), 0, gv.size() * 4);
+    ggml_backend_tensor_set(z, zv.data(), 0, zv.size() * 4);
+    const size_t ne = xv.size();
+    std::vector<ggml_fp16_t> o_f(ne), o_f2(ne), o_r(ne), o_p(ne);
+    std::vector<float> r32(ne);
+    uint64_t n_f = 0, n_r = 0;
+    auto run = [&](ggml_cgraph * gg, ggml_tensor * out, std::vector<ggml_fp16_t> & o, uint64_t * n) {
+        reset(); ggml_backend_graph_compute(be, gg); if (n) *n = count(fname);
+        ggml_backend_tensor_get(out, o.data(), 0, ne * 2);
+    };
+    run(gf, fz.second, o_f, &n_f);
+    run(gr, rz.second, o_r, &n_r);
+    ggml_backend_tensor_get(rz.first, r32.data(), 0, ne * 4);
+    run(gf, fz.second, o_f2, nullptr);
+    size_t ndiff = 0, n_rte = 0;
+    for (size_t i = 0; i < ne; ++i) { ndiff += o_f[i] != o_r[i]; n_rte += o_f[i] == ggml_fp32_to_fp16(r32[i]); }
+    const uint64_t h1 = fnv1a(o_f.data(), ne * 2), h2 = fnv1a(o_f2.data(), ne * 2);
+    xv[0] += 0.5f; ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * 4);
+    run(gf, fz.second, o_p, nullptr);
+    const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
+    const int fails = (ndiff != 0) + (n_rte != ne) + (n_f != 1 || n_r != 0) + (h1 != h2) + !ctl;
+    printf("%s %-24s %lldx%lldx%lld: byte-equal=%s rte=%zu/%zu fused on/ref=%llu/%llu hash=%016llx run2=%s control=%s\n",
+           fails ? "FAIL" : "ok", fname, (long long) ne0, (long long) ne1, (long long) nt, ndiff ? "NO" : "yes", n_rte, ne,
+           (unsigned long long) n_f, (unsigned long long) n_r, (unsigned long long) h1, h1 == h2 ? "same" : "DIFF", ctl ? "differs" : "SAME");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
@@ -165,6 +234,13 @@ int main() {
         };
         for (const auto & sh : shapes) fails += run_shape(be, reg, sh);
     }
+    // f16-output norms: the 35B attn / post-attn norm (2048 wide, rms_norm.comp), the 35B GDN output norm (128 x 32, silu gate,
+    // rms_norm_small.comp) and the Flash-Next one (128 x 48, sigmoid gate)
+    fails += run_norm(be, reg, 2048,  1, 512, 0);
+    fails += run_norm(be, reg, 2048,  1,  77, 0);
+    fails += run_norm(be, reg,  128, 32, 512, 1);
+    fails += run_norm(be, reg,  128, 32,  77, 1);
+    fails += run_norm(be, reg,  128, 48, 512, 2);
     ggml_backend_free(be);
     printf("test-mmid-d16-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;

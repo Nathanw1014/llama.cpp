@@ -21577,6 +21577,31 @@ static bool ggml_vk_fuse_mul_add_enabled() {
 }
 
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops);
+// GGML_VK_FUSION_DEBUG: at a short-row f32 RMS_NORM whose output, two nodes on, is gated by a SIGMOID / SILU somewhere in the
+// next 8 nodes but not in the fusable order, print the order (why a GDN output norm did not fuse). Always returns true.
+static bool ggml_vk_gdn_norm_f16_dbg(const struct ggml_cgraph * cgraph, int i) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    const ggml_tensor * n = cgraph->nodes[i];
+    if (!dbg || n->op != GGML_OP_RMS_NORM || n->ne[0] > 256 || n->ne[1] < 2 || i + 4 >= cgraph->n_nodes) {
+        return true;
+    }
+    if (ggml_vk_gdn_norm_f16_wiring(cgraph, i)) {
+        return true;
+    }
+    bool gated = false;
+    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 9) && !gated; ++j) {
+        gated = cgraph->nodes[j]->op == GGML_OP_CPY && cgraph->nodes[j]->type == GGML_TYPE_F16;
+    }
+    if (gated) {
+        std::string order;
+        for (int j = i; j < std::min(cgraph->n_nodes, i + 7); ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            order += std::string(" ") + ggml_op_name(t->op) + (t->op == GGML_OP_UNARY ? std::string("/") + ggml_unary_op_name(ggml_get_unary_op(t)) : "") + ":" + t->name;
+        }
+        fprintf(stderr, "ggml_vulkan: gdn norm f16 not in order at node %d:%s\n", i, order.c_str());
+    }
+    return true;
+}
 // RMS_NORM+MUL+SIGMOID+MUL+CPY(f16). The SIGMOID does not consume the MUL before it, so this is matched as a
 // subgraph (intermediates used only inside it, the CPY the one output) rather than a ggml_can_fuse chain.
 static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -23386,7 +23411,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse_gdn_norm_f16(ctx, cgraph, i)) {
+            } else if (ggml_vk_gdn_norm_f16_dbg(cgraph, i) && ggml_vk_can_fuse_gdn_norm_f16(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 ctx->fused_rms_norm_sig = true;
                 ctx->fused_rms_norm_silu = ggml_get_unary_op(cgraph->nodes[i + 2]) == GGML_UNARY_OP_SILU;

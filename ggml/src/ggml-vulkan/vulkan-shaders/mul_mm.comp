@@ -451,6 +451,22 @@ uint abl_first(uvec4 r[2]) { return r[0].x; }
 uint abl_first(uvec4 r[3]) { return r[0].x; }
 #endif
 
+#ifdef MUL_MAT_ID
+// The fused MUL_MAT_ID + MUL (+ CPY to f16) store. It must equal the unfused chain bit for bit: the id kernel stores the
+// f32 accumulator, the MUL rounds acc * scale to f32, the CPY rounds that to f16. Written plainly, the f16 build let the
+// compiler turn the multiply and the f16 conversion into one single-rounding mixed-precision op: about 6 values in 100000
+// came out one f16 ulp away from the unfused chain (double rounding vs single, test-mmid-d16-exact 10-13). The product goes
+// through an XOR with a push-constant zero (p.fusion_flags is 1 whenever the scale is applied) so its f32 rounding is kept.
+D_TYPE mmid_scaled_store(const float acc, const float scale) {
+#ifdef D_F16
+    const float prod = uintBitsToFloat(floatBitsToUint(acc * scale) ^ (p.fusion_flags & ~1u));
+    return D_TYPE(prod);
+#else
+    return D_TYPE(acc * scale);
+#endif
+}
+#endif
+
 void main() {
     uint ic = gl_WorkGroupID.y;
 
@@ -935,7 +951,7 @@ void main() {
                 if (dr + cm_row * TM + store_r < p.M) {
                     const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
                     if (p.fusion_flags != 0) {
-                        data_d[didx] = D_TYPE(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) * data_fscale[row_idx.y * p.nei0 + row_idx.x]);
+                        data_d[didx] = mmid_scaled_store(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), data_fscale[row_idx.y * p.nei0 + row_idx.x]);
                     } else {
                         data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                     }
@@ -1062,11 +1078,11 @@ void main() {
 #ifdef MUL_MAT_ID
                     if (dr_warp + 2 * cr < p.M) {
                         const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr;
-                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].x) * fscale) : D_TYPE(sums[sums_idx].x);
+                        data_d[didx] = do_scale ? mmid_scaled_store(float(sums[sums_idx].x), fscale) : D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
                         const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1;
-                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].y) * fscale) : D_TYPE(sums[sums_idx].y);
+                        data_d[didx] = do_scale ? mmid_scaled_store(float(sums[sums_idx].y), fscale) : D_TYPE(sums[sums_idx].y);
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {

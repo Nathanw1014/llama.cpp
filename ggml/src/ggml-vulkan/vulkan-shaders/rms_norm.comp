@@ -34,6 +34,17 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 
 layout (constant_id = 1) const bool do_multiply = false;
 
+// f16 builds (D_F16): store through an XOR with a push-constant zero (param3 is 0 on every f16 path: partials are f32-only),
+// so the compiler cannot merge the last f32 multiply and the f16 conversion into one single-rounding mixed-precision op.
+// The fused f16 store then equals the unfused chain (f32 store, then CPY to f16) bit for bit (test-mmid-d16-exact, 10-13).
+D_TYPE store_d(const float x) {
+#ifdef D_F16
+    return D_TYPE(uintBitsToFloat(floatBitsToUint(x) ^ uint(p.param3)));
+#else
+    return D_TYPE(x);
+#endif
+}
+
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
@@ -92,14 +103,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                data_d[d_offset + col] = store_d(float(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)])));
             }
         } else {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                data_d[d_offset + col] = store_d(float(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col])));
             }
         }
     } else {
@@ -107,7 +118,7 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[d_offset + col] = store_d(float(scale * FLOAT_TYPE(data_a[a_offset + col])));
         }
     }
 #if RMS_NORM_ROPE_FUSION
