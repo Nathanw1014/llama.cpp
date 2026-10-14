@@ -179,13 +179,14 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    // LLAMA_NORM_F16B (default on, =0 off): at prefill the attention and post-attention norms store f16 (the Vulkan
+    // LLAMA_NORM_F16B (default off, =1 on; 10-14 forkrc ABBA on Qwen3.6-35B-A3B: off is 3.2% faster at pp2048 d0 and 2.5% at d8k):
+    // at prefill the attention and post-attention norms store f16 (the Vulkan
     // RMS_NORM_MUL_CPY fusion) and every projection reads that f16 B, the f32-weight ones too (router, ssm_alpha/beta,
     // shared-expert gate: the f32 x f16 GEMMs), as the release does for its mixed stream. The quantized projections
     // rounded B to f16 before anyway, in a separate conversion pass per norm (Qwen3.6-35B-A3B pp2048: 80 of the 160
     // MM_B_TO_F16 sub-ops per ubatch, x35 per-op 10-13); the f32-weight ones now see f16-rounded inputs (KLD-gated).
     // Only where every consumer weight of the layer is on a GPU buffer and not bf16, without LoRA.
-    static const bool norm_f16b = [] { const char * e = getenv("LLAMA_NORM_F16B"); return e == nullptr || atoi(e) != 0; }();
+    static const bool norm_f16b = [] { const char * e = getenv("LLAMA_NORM_F16B"); return e != nullptr && atoi(e) != 0; }();
     auto gpu_w = [](const ggml_tensor * w) {
         return w == nullptr || (w->type != GGML_TYPE_BF16 && llm_graph_weights_on_gpu(w->buffer));
     };
@@ -308,12 +309,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
-    // LLAMA_GDN_NORM_F16 (default on, =0 off), as in qwen4exp with the silu gate: at prefill emit RMS_NORM, MUL(gamma),
+    // LLAMA_GDN_NORM_F16 (here default off, =1 on; 10-14 forkrc ABBA on Qwen3.6-35B-A3B: off is 2.4% faster at pp2048 d0 and 1.0%
+    // at d8k; qwen4exp's sigmoid form reads the same variable with its own default, on), as in qwen4exp with the silu gate: at prefill emit RMS_NORM, MUL(gamma),
     // SILU(z), MUL, CPY(f16) back to back, which the Vulkan backend runs as one pass (RMS_NORM_MUL_SILUMUL_CPY) writing
     // only the f16 B operand of ssm_out: no silu pass, no f32 norm output and no B conversion in the GEMM (Qwen3.6-35B-A3B
     // pp2048: 30 of the 160 MM_B_TO_F16 sub-ops per ubatch, x35 per-op 10-13). The GEMM's B was rounded to f16 before
     // either way. Only when ssm_out is a GPU weight, not bf16, without LoRA (the CPU and a LoRA delta take no f16 B).
-    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e == nullptr || atoi(e) != 0; }();
+    static const bool norm_f16 = [] { const char * e = getenv("LLAMA_GDN_NORM_F16"); return e != nullptr && atoi(e) != 0; }();
     const ggml_tensor * w_out = model.layers[layer].ssm_out;
     if (norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
         model.layers[layer].ssm_out_s == nullptr && llm_graph_weights_on_gpu(w_out->buffer)) {
