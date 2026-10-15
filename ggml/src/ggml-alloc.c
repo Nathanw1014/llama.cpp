@@ -659,7 +659,25 @@ struct ggml_gallocr {
     int delay_at_max;
     long long hold_at_max;
     size_t held;    // bytes currently in the FIFO
+    // GGML_ALLOC_REUSE_TRACE=1: the last plan's figures, for the per-alloc line
+    int n_plans;
+    int n_allocs;
+    int plans_at_last_alloc;
+    size_t last_base;   // the plan without hold-back (0 = not computed: no MAX_FRAC)
+    size_t last_planned;
 };
+
+// GGML_ALLOC_REUSE_TRACE=1 (diagnostic, default off): one line per plan (every reserve, and every allocation that has to re-plan) with
+// the hold-back in effect, the plan without hold-back, the cap and the planned size, and one line per ggml_gallocr_alloc_graph saying
+// whether it re-planned or reused the last plan. Separate from GGML_ALLOC_TRACE, whose levels 2 and 3 print every live / placed tensor.
+static bool ggml_gallocr_reuse_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_ALLOC_REUSE_TRACE");
+        on = e != NULL && atoi(e) != 0;
+    }
+    return on;
+}
 
 struct delayed_free {
     struct ggml_dyn_tallocr * alloc;
@@ -1150,6 +1168,7 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 
+    galloc->last_base = 0;
     if (galloc->delay_cfg < 0) {
         galloc->delay_cfg = ggml_gallocr_reuse_delay();
         galloc->hold_cfg = ggml_gallocr_reuse_hold();
@@ -1188,6 +1207,7 @@ static bool ggml_gallocr_reserve_n_impl(
         galloc->hold = 0;
         ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
         const size_t base = ggml_gallocr_plan_total(galloc);
+        galloc->last_base = base;
         galloc->delay = d0;
         galloc->hold = h0;
         if (base >= galloc->base_max) {
@@ -1219,6 +1239,14 @@ static bool ggml_gallocr_reserve_n_impl(
     if (worst) {
         galloc->delay_at_max = galloc->delay;
         galloc->hold_at_max = galloc->hold;
+    }
+    galloc->n_plans++;
+    galloc->last_planned = ggml_gallocr_plan_total(galloc);
+    if (ggml_gallocr_reuse_trace()) {
+        fprintf(stderr, "ggml_gallocr: plan %d: graph %d nodes, reuse delay %d / hold %lld MiB, base %.1f MiB (worst %.1f), cap %.1f MiB, "
+                "planned %.1f MiB%s\n", galloc->n_plans, graph->n_nodes, galloc->delay, galloc->hold >> 20, galloc->last_base / 1048576.0,
+                galloc->base_max / 1048576.0, cap == SIZE_MAX ? -1.0 : cap / 1048576.0, galloc->last_planned / 1048576.0,
+                no_alloc ? " (size query)" : "");
     }
 
     // set the node_allocs from the hash table
@@ -1492,6 +1520,13 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             return false;
         }
     }
+    galloc->n_allocs++;
+    if (ggml_gallocr_reuse_trace()) {
+        fprintf(stderr, "ggml_gallocr: alloc %d: graph %d nodes, %s, reuse delay %d / hold %lld MiB, planned %.1f MiB\n", galloc->n_allocs,
+                graph->n_nodes, galloc->n_plans != galloc->plans_at_last_alloc ? "re-planned since the last alloc" : "plan reused",
+                galloc->delay, galloc->hold >> 20, galloc->last_planned / 1048576.0);
+    }
+    galloc->plans_at_last_alloc = galloc->n_plans;
 
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
