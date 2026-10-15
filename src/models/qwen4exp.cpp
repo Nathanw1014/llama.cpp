@@ -394,11 +394,12 @@ static bool qwen4exp_hc_gate16() {
 }
 
 // LLAMA_HC_STRIP=<tokens>: strip-mine the hc up GEMM -> f16 gate -> DSV4_HC_MIX chain per token strip (E6, re-ported onto the
-// release's hc chain 10-10). 0 = off. On the 83c9 line 512-token strips read +1.8% d0 / +2.9% 8k Flash-Next pp (the mix and the
-// inject mat-vec stayed MALL-resident); here the down + inject GEMM (LLAMA_HC_DOWN_INJECT) stays full width and only the
-// up -> gate -> mix part is stripped, so the gain is to be re-measured on this line.
+// release's hc chain 10-10). Default 512, 0 = off, other values as given. Up -> gate -> mix only; the down + inject GEMM
+// (LLAMA_HC_DOWN_INJECT) stays full width. E6 measured +0-2% d0 / +2-3.5% d8k Flash-Next pp at 512-token strips (the strip's gate and
+// xn stay MALL-resident across the mix; at 1024 they no longer fit the 32 MB MALL and the gain vanishes), KLD-inert. The strip loop's
+// dangling-view leak (every mix output allocated to graph end) is fixed in cc9f0ae50; the fork RC gate (forkrc) ran with it on.
 static int64_t qwen4exp_hc_strip() {
-    static const int64_t v = [] { const char * e = getenv("LLAMA_HC_STRIP"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    static const int64_t v = [] { const char * e = getenv("LLAMA_HC_STRIP"); return e ? (int64_t) atoll(e) : (int64_t) 512; }();
     return v;
 }
 
@@ -904,7 +905,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         }
     }
 
-    // E6 strip-mining (LLAMA_HC_STRIP=<tokens>, default off): the up GEMM, its f16 gate cast and the mix run per token strip
+    // E6 strip-mining (LLAMA_HC_STRIP=<tokens>, default 512): the up GEMM, its f16 gate cast and the mix run per token strip
     // so each strip's lo / gate / xn stay MALL-resident across the three ops; the results land in views of one full-width
     // mixed tensor (strip 0 allocates it), so no concat pass is added, and the strips are expanded here, before any consumer
     // of the full tensor, which orders them in the graph. The "hc_strip" names keep the Vulkan graph optimizer from hoisting
@@ -914,6 +915,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32 && qwen4exp_takes_f16_b(model) &&
         llm_graph_weights_on_gpu(w_up->buffer) && xn->type == GGML_TYPE_F16 && lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) &&
         gate_logits->op == GGML_OP_CPY && !static_cast<const llama_model_qwen4exp &>(model).hc_up_interleaved()) {
+        // engagement: one info line the first time a graph takes the strip path (grep a server log for it), a debug line per graph
+        static std::atomic<bool> strip_logged{false};
+        if (!strip_logged.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: hc strip engaged: %lld strips of %lld tokens (nt %lld)\n", (long long) (nt / hc_strip),
+                           (long long) hc_strip, (long long) nt);
+        } else if (il == 0) {
+            LLAMA_LOG_DEBUG("qwen4exp: hc strip engaged: %lld strips of %lld tokens (nt %lld)\n", (long long) (nt / hc_strip),
+                            (long long) hc_strip, (long long) nt);
+        }
         const ggml_type mix_type = GGML_TYPE_F16;
         const size_t xn_row = xn_padded ? xn->nb[1] : ggml_row_size(xn->type, hc_dim);
         ggml_tensor * mixed_full = nullptr;
