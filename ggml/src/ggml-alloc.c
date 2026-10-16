@@ -690,10 +690,11 @@ struct delayed_free {
 // cap (DELAY 128 + MAX_FRAC 1.0, the compute buffer at most doubles) and the plain form (DELAY 128 + MAX_MIB 7406) without a re-port.
 // Each variable falls back to its default only when it is unset itself; GGML_ALLOC_REUSE_DELAY=0 turns the hold-back off.
 // max_frac / max_mib < 0 = no such cap.
-static const struct { int delay; double max_frac; long long max_mib; } ggml_gallocr_reuse_default = { 128, 1.0, -1 };
+static const struct { int delay; double max_frac; long long max_mib; } ggml_gallocr_reuse_default = { 0, 1.0, -1 };
 
 // GGML_ALLOC_REUSE_DELAY=N: hold every freed compute-buffer block back from reuse until N more graph nodes have been allocated (default
-// ggml_gallocr_reuse_default.delay). Applied in the planning pass, so the reserved size grows with N (printed by sched_reserve as usual).
+// ggml_gallocr_reuse_default.delay = 0, off: in llama-server the delay cost 4-6% prompt throughput on Flash-Next while llama-bench
+// gained 5%; opt in with GGML_ALLOC_REUSE_DELAY=128 for batch / bench use). Applied in the planning pass, so the reserved size grows with N (printed by sched_reserve as usual).
 // On Flash-Next prefill the dense GEMMs and the gated delta net scan run ~1.3x longer per wave in-model when recently freed blocks are
 // reused at once; delayed reuse removes most of that (pp2048 +8.3% at N 128).
 // GGML_ALLOC_REUSE_HOLD_MIB=X (the byte form, default 0): freed blocks queue in free order and the oldest return to the allocator once
