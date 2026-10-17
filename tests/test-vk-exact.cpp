@@ -650,10 +650,10 @@ struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true
 static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
     ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    const int64_t M = 4 * sh.n_embd;
-    ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.k, M);
+    const int64_t hc_dim = 4 * sh.n_embd;
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.k, hc_dim);
     ggml_tensor * lo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sh.k, sh.nt);
-    ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, M + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
+    ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
     ggml_tensor * x   = ggml_view_3d(ctx, xb, sh.n_embd, 4, sh.nt, sh.n_embd * sizeof(ggml_fp16_t), xb->nb[1], 0);
     ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
     ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
@@ -668,12 +668,12 @@ static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
 
     std::mt19937 rng(1234 + (int) sh.n_embd + (int) sh.nt);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
-    std::vector<float> wf(sh.k * M), lv(sh.k * sh.nt);
+    std::vector<float> wf(sh.k * hc_dim), lv(sh.k * sh.nt);
     for (auto & v : wf) v = u(rng);
     for (auto & v : lv) v = u(rng);
     std::vector<uint8_t> wq(ggml_nbytes(w));
-    ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq.data(), 0, M, sh.k, nullptr);
-    std::vector<ggml_fp16_t> xv((M + sh.pad) * sh.nt);
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq.data(), 0, hc_dim, sh.k, nullptr);
+    std::vector<ggml_fp16_t> xv((hc_dim + sh.pad) * sh.nt);
     for (auto & v : xv) v = ggml_fp32_to_fp16(u(rng));
     ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
     ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
