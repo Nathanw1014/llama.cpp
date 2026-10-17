@@ -562,11 +562,17 @@ ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t 
     return *slot;
 }
 
+// a row pad in f16 elements from the environment: a multiple of 8 in [0, 4096] (a huge value would make a huge leaf)
+static int64_t qwen4exp_env_pad(const char * name) {
+    const char * e = getenv(name);
+    return e ? (int64_t) (std::clamp(atoi(e), 0, 4096) & ~7) : (int64_t) 128;
+}
+
 // LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8, default 128, 0 = off): xn token stride hc_dim + N, so packed 80 x 256 B rows
 // (Flash-Next) do not all start on one DRAM channel; the norm writes and every reader reads through the stride, no repack
 static int64_t qwen4exp_hc_xn_pad() {
-    static const int64_t pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
-    return pad > 0 ? pad : 0;
+    static const int64_t pad = qwen4exp_env_pad("LLAMA_HC_XN_PAD");
+    return pad;
 }
 
 // the f16 mixed stream needs an f16 B on every reader; Vulkan has no bf16 x f16 matmul, so a bf16 matmul weight keeps it f32
@@ -900,7 +906,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
         // LLAMA_GDN_NORM_PAD=N (as LLAMA_HC_XN_PAD): token stride value_dim + N where the packed rows all start on one DRAM
         // channel (256 B multiples sharing a factor of 8+ with the 16 channels, Flash-Next's 48 x 256 B); one buffer per graph
-        static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
+        static const int64_t pad = qwen4exp_env_pad("LLAMA_GDN_NORM_PAD");
         const int64_t row = out->ne[0] * out->ne[1];
         if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
             ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, out->ne[2], "gdn_norm_pad");
