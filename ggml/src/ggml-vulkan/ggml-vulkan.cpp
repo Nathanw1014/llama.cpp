@@ -4940,59 +4940,70 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
     }
 
     constexpr size_t n_out = 515;
-    vk_buffer buf = ggml_vk_create_buffer_check(device, n_out * sizeof(float),
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    const vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT);
-    const vk::DescriptorPool pool = device->device.createDescriptorPool({ {}, 1, pool_size });
-    const vk::DescriptorSet set = device->device.allocateDescriptorSets({ pool, 1, &device->dsl })[0];
-    const vk::DescriptorBufferInfo info{ buf->buffer, 0, n_out * sizeof(float) };
-    device->device.updateDescriptorSets({ vk::WriteDescriptorSet{ set, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &info } }, {});
-
+    // an optional feature: a Vulkan error here (allocation, submit, fence) reports the check as failed instead of aborting init
+    vk_buffer buf;
+    vk::DescriptorPool pool;
     bool ok = true;
-    for (uint32_t i = 0; i < 2 && ok; i++) {
-        vk_pipeline & pipeline = device->pipeline_coopmat_layout_check[i];
-        const uint32_t sg = 32 << i;
-        ggml_vk_load_shaders(device, pipeline);
-        memset(buf->ptr, 0, n_out * sizeof(float));
+    try {
+        buf = ggml_vk_create_buffer_check(device, n_out * sizeof(float),
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        const vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT);
+        pool = device->device.createDescriptorPool({ {}, 1, pool_size });
+        const vk::DescriptorSet set = device->device.allocateDescriptorSets({ pool, 1, &device->dsl })[0];
+        const vk::DescriptorBufferInfo info{ buf->buffer, 0, n_out * sizeof(float) };
+        device->device.updateDescriptorSets({ vk::WriteDescriptorSet{ set, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &info } }, {});
 
-        {
-            std::lock_guard<std::recursive_mutex> guard(device->mutex);
-            vk_context subctx = ggml_vk_create_temporary_context(device->compute_queue->cmd_pool);
-            ggml_vk_ctx_begin(device, subctx);
-            const vk::CommandBuffer cb = subctx->s->buffer->buf;
-            const uint32_t pc = 0;
-            cb.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
-            cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
-            cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { set }, {});
-            cb.dispatch(1, 1, 1);
-            cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
-                { vk::MemoryBarrier{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
-            ggml_vk_ctx_end(subctx);
-            ggml_vk_submit(subctx, device->fence);
-            VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "coopmat layout check waitForFences", device);
-            device->device.resetFences({ device->fence });
-            ggml_vk_queue_command_pools_cleanup(device);
-        }
+        for (uint32_t i = 0; i < 2 && ok; i++) {
+            vk_pipeline & pipeline = device->pipeline_coopmat_layout_check[i];
+            const uint32_t sg = 32 << i;
+            ggml_vk_load_shaders(device, pipeline);
+            memset(buf->ptr, 0, n_out * sizeof(float));
 
-        const float * out = (const float *) buf->ptr;
-        const bool lengths = out[512] == 16.0f && out[513] == 16.0f && out[514] == (float) (256 / sg);
-        bool store = true;
-        bool lanes = true;
-        // WMMA on gfx11 is a few ULP off the exact sum even for integer operands, while a layout error moves an
-        // entry by at least 1 (all entries are integers), so compare with a tolerance well under 1
-        for (uint32_t j = 0; j < 256; j++) {
-            store = store && fabsf(out[j] - ref[j]) < 0.0625f;
-            lanes = lanes && fabsf(out[256 + j] - ref[j]) < 0.0625f;
+            {
+                std::lock_guard<std::recursive_mutex> guard(device->mutex);
+                vk_context subctx = ggml_vk_create_temporary_context(device->compute_queue->cmd_pool);
+                ggml_vk_ctx_begin(device, subctx);
+                const vk::CommandBuffer cb = subctx->s->buffer->buf;
+                const uint32_t pc = 0;
+                cb.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+                cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+                cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { set }, {});
+                cb.dispatch(1, 1, 1);
+                cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
+                    { vk::MemoryBarrier{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, device->fence);
+                VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "coopmat layout check waitForFences", device);
+                device->device.resetFences({ device->fence });
+                ggml_vk_queue_command_pools_cleanup(device);
+            }
+
+            const float * out = (const float *) buf->ptr;
+            const bool lengths = out[512] == 16.0f && out[513] == 16.0f && out[514] == (float) (256 / sg);
+            bool store = true;
+            bool lanes = true;
+            // WMMA on gfx11 is a few ULP off the exact sum even for integer operands, while a layout error moves an
+            // entry by at least 1 (all entries are integers), so compare with a tolerance well under 1
+            for (uint32_t j = 0; j < 256; j++) {
+                store = store && fabsf(out[j] - ref[j]) < 0.0625f;
+                lanes = lanes && fabsf(out[256 + j] - ref[j]) < 0.0625f;
+            }
+            if (!(lengths && store && lanes)) {
+                GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout at wave%u is not the expected RDNA3 one "
+                              "(lengths %.0f/%.0f/%.0f, product %s, lane layout %s); MUL_MAT_ID keeps the coopMatLoad matmuls\n",
+                              device->name.c_str(), sg, out[512], out[513], out[514], store ? "ok" : "wrong", lanes ? "ok" : "wrong");
+                ok = false;
+            }
         }
-        if (!(lengths && store && lanes)) {
-            GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout at wave%u is not the expected RDNA3 one "
-                          "(lengths %.0f/%.0f/%.0f, product %s, lane layout %s); MUL_MAT_ID keeps the coopMatLoad matmuls\n",
-                          device->name.c_str(), sg, out[512], out[513], out[514], store ? "ok" : "wrong", lanes ? "ok" : "wrong");
-            ok = false;
-        }
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout check failed (%s); MUL_MAT_ID keeps the coopMatLoad matmuls\n",
+                      device->name.c_str(), e.what());
+        ok = false;
     }
 
-    device->device.destroyDescriptorPool(pool);
+    if (pool) {
+        device->device.destroyDescriptorPool(pool);
+    }
     ggml_vk_destroy_buffer(buf);
     return ok;
 }
