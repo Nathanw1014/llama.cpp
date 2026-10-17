@@ -11545,12 +11545,12 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
-    const bool gated_x = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
     // the gated form also takes an f16 x and an f16 gate
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated_x && x->type == GGML_TYPE_F16));
-    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated_x && weights->type == GGML_TYPE_F16));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16));
     // the gated form may write an f16 mixed stream (ggml_dsv4_hc_pre_gated_ext)
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || (gated_x && dst->type == GGML_TYPE_F16));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || (gated && dst->type == GGML_TYPE_F16));
     const bool d_f16 = dst->type == GGML_TYPE_F16;
     const bool x_f16 = x->type == GGML_TYPE_F16;
     const bool g_f16 = weights->type == GGML_TYPE_F16;
@@ -11560,7 +11560,6 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const int64_t n_tokens = x->ne[2];
 
     const float scale = ggml_get_op_params_f32(dst, 0);
-    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == n_tokens);
