@@ -1098,7 +1098,7 @@ static bool ggml_gallocr_reserve_n_impl(
         if (total <= cap) {
             break;
         }
-        fprintf(stderr, "ggml_gallocr: reuse delay %d / hold %lld MiB plans %.1f MiB > cap %.1f MiB: re-planning with delay %d / hold %lld MiB\n",
+        GGML_LOG_INFO("%s: reuse delay %d / hold %lld MiB plans %.1f MiB > cap %.1f MiB: re-planning with delay %d / hold %lld MiB\n", __func__,
                 galloc->delay, galloc->hold >> 20, total / 1048576.0, cap / 1048576.0, galloc->delay / 2, (galloc->hold / 2) >> 20);
         galloc->delay /= 2;
         galloc->hold /= 2;
@@ -1195,7 +1195,7 @@ static bool ggml_gallocr_reserve_n_impl(
             dry_run = e != NULL && atoi(e) != 0;
         }
         if (dry_run && realloc && !no_alloc) {
-            fprintf(stderr, "ggml_gallocr: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d, hold %lld MiB\n",
+            GGML_LOG_INFO("%s: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d, hold %lld MiB\n", __func__,
                     ggml_backend_buft_name(galloc->bufts[i]), new_size / 1048576.0, galloc->buf_tallocs[i]->n_chunks, galloc->delay,
                     galloc->hold >> 20);
             dry_run_hit = true;
@@ -1226,7 +1226,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
     if (dry_run_hit) {
         // a library must not exit the process: the caller treats a failed reserve as an error
-        fprintf(stderr, "ggml_gallocr: DRY RUN: failing the reserve before the allocation\n");
+        GGML_LOG_WARN("%s: DRY RUN: failing the reserve before the allocation\n", __func__);
         return false;
     }
     return true;
