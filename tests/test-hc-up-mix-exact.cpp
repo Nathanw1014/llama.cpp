@@ -16,6 +16,22 @@
 #include <random>
 #include <vector>
 
+// setenv / unsetenv are POSIX only; _putenv_s with an empty value removes the variable on Windows
+static void set_env(const char * name, const char * value, bool overwrite = true) {
+    if (!overwrite && getenv(name)) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 // the Vulkan dispatch census test hooks (off until the first reset)
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
@@ -60,7 +76,7 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
 
     std::vector<float> out_on(sh.n_embd * sh.nt), out_off(sh.n_embd * sh.nt), out_pert(sh.n_embd * sh.nt);
     auto run = [&](const char * knob, std::vector<float> & out, uint64_t & n) {
-        setenv("GGML_VK_HC_UP_MIX", knob, 1);
+        set_env("GGML_VK_HC_UP_MIX", knob);
         reset();
         ggml_backend_graph_compute(be, gf);
         n = count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");

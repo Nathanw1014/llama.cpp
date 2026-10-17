@@ -34,6 +34,22 @@
 #include <tuple>
 #include <vector>
 
+// setenv / unsetenv are POSIX only; _putenv_s with an empty value removes the variable on Windows
+static void set_env(const char * name, const char * value, bool overwrite = true) {
+    if (!overwrite && getenv(name)) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 // the Vulkan dispatch census test hooks (off until the first reset)
 typedef uint64_t (*fusion_count_t)(const char *);
 typedef void     (*fusion_reset_t)(void);
@@ -148,7 +164,7 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     const size_t ne = ggml_nelements(out_f);
     std::vector<ggml_fp16_t> o_f(ne), o_f2(ne), o_r(ne), o_p(ne);
     auto run = [&](ggml_cgraph * g, bool fused, uint64_t * n) {
-        if (c.knob) setenv(c.knob, fused ? "1" : "0", 1);
+        if (c.knob) set_env(c.knob, fused ? "1" : "0");
         g_reset();
         ggml_backend_graph_compute(be, g);
         if (n) *n = c.fname ? g_count(c.fname) : 0;
@@ -171,7 +187,7 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     c.perturb();
     run(gf, true, nullptr);
     ggml_backend_tensor_get(out_f, o_p.data(), 0, ne * 2);
-    if (c.knob) unsetenv(c.knob);
+    if (c.knob) set_env(c.knob, nullptr);
     const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
     const bool engaged = c.fname == nullptr || (n_f == (uint64_t) c.expect && n_r == 0);
     const bool rte_ok = !c.rte || r_match == r_total;
@@ -574,7 +590,7 @@ static void case_rope_set_rows(ggml_backend_t be, bool norm, int mode, int64_t h
 
 int main() {
     // the routed f16-B pf path (mul_mm.comp MMID_SCALE d16) for iq3_xxs (no int8 MMQ pipeline) and q6_K; read once per process
-    setenv("GGML_VK_MMID_F16COOPMAT", "iq3_xxs,q6_K", 0);
+    set_env("GGML_VK_MMID_F16COOPMAT", "iq3_xxs,q6_K", false);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
     if (!dev) { printf("test-f16-store-exact: no Vulkan0 device, skipped\n"); return 0; }

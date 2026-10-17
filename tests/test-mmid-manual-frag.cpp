@@ -22,6 +22,22 @@
 #include <string>
 #include <vector>
 
+// setenv / unsetenv are POSIX only; _putenv_s with an empty value removes the variable on Windows
+static void set_env(const char * name, const char * value, bool overwrite = true) {
+    if (!overwrite && getenv(name)) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 // the Vulkan dispatch census test hooks (off until the first reset)
 typedef uint64_t (*fusion_count_t)(const char *);
 typedef void     (*fusion_reset_t)(void);
@@ -112,7 +128,7 @@ static void run_case(ggml_backend_t be, ggml_type ta, ggml_type tb, int64_t m, i
 }
 
 int main() {
-    setenv("GGML_VK_MMID_F16COOPMAT", "all", 0);
+    set_env("GGML_VK_MMID_F16COOPMAT", "all", false);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
     if (!dev) { printf("test-mmid-manual-frag: no Vulkan0 device, skipped\n"); return 0; }
