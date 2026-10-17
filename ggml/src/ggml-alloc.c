@@ -561,10 +561,8 @@ static long long ggml_gallocr_reuse_hold(void) {
     static long long hold = -1;
     if (hold < 0) {
         const char * e = getenv("GGML_ALLOC_REUSE_HOLD_MIB");
-        hold = e ? atoll(e) << 20 : 0;
-        if (hold < 0) {
-            hold = 0;
-        }
+        const long long mib = e ? atoll(e) : 0;
+        hold = mib <= 0 ? 0 : mib >= (LLONG_MAX >> 20) ? LLONG_MAX : mib << 20;
     }
     return hold;
 }
@@ -846,7 +844,8 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
             galloc->delayed = (struct delayed_free *) realloc(galloc->delayed, galloc->cap_delayed*sizeof(struct delayed_free));
             GGML_ASSERT(galloc->delayed != NULL);
         }
-        galloc->delayed[galloc->n_delayed++] = (struct delayed_free) { alloc, hn->addr, size, delay > 0 ? galloc->cur_node + delay : INT_MAX };
+        const int release_at = delay > 0 && galloc->cur_node <= INT_MAX - delay ? galloc->cur_node + delay : INT_MAX;
+        galloc->delayed[galloc->n_delayed++] = (struct delayed_free) { alloc, hn->addr, size, release_at };
         galloc->held += size;
         // the byte hold: return the oldest blocks while more than the hold is queued
         int k = 0;
@@ -865,12 +864,12 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     hn->allocated = false;
 }
 
-// return the delayed blocks whose hold-back has expired (all of them with flush) to their allocators
-static void ggml_gallocr_release_delayed(ggml_gallocr_t galloc, bool flush) {
+// return the delayed blocks whose hold-back has expired to their allocators
+static void ggml_gallocr_release_delayed(ggml_gallocr_t galloc) {
     int k = 0;
     for (int i = 0; i < galloc->n_delayed; i++) {
         struct delayed_free * d = &galloc->delayed[i];
-        if (flush || d->release_at <= galloc->cur_node) {
+        if (d->release_at <= galloc->cur_node) {
             ggml_dyn_tallocr_free_bytes(d->alloc, d->addr, d->size);
             galloc->held -= d->size;
         } else {
@@ -938,7 +937,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         galloc->cur_node = i;
         if (galloc->n_delayed > 0) {
-            ggml_gallocr_release_delayed(galloc, false);
+            ggml_gallocr_release_delayed(galloc);
         }
 
         // allocate parents (only leafs need to be allocated at this point)
@@ -996,8 +995,10 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
-    // the plan is complete; return what is still held back (the allocators are reset before the next plan anyway)
-    ggml_gallocr_release_delayed(galloc, true);
+    // the plan is complete: drop what is still held back without freeing it. The allocators are reset before the next plan,
+    // and freeing it all at once could need more free blocks (MAX_FREE_BLOCKS) than the incremental frees of the plan did
+    galloc->n_delayed = 0;
+    galloc->held = 0;
 }
 
 // one planning pass over the graph from empty allocators
@@ -1068,7 +1069,7 @@ static bool ggml_gallocr_reserve_n_impl(
     }
     size_t cap = SIZE_MAX;
     if (cap_mib >= 0) {
-        cap = (size_t) cap_mib << 20;
+        cap = (unsigned long long) cap_mib > (SIZE_MAX >> 20) ? SIZE_MAX : (size_t) cap_mib << 20;
     }
     bool worst = false;
     if (cap_frac >= 0 && (galloc->delay > 0 || galloc->hold > 0)) {
@@ -1087,7 +1088,10 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->delay = MIN(galloc->delay, galloc->delay_at_max);
             galloc->hold = MIN(galloc->hold, galloc->hold_at_max);
         }
-        cap = MIN(cap, (size_t) ((double) galloc->base_max * (1.0 + cap_frac)));
+        const double lim = (double) galloc->base_max * (1.0 + cap_frac);
+        if (lim < (double) SIZE_MAX) {
+            cap = MIN(cap, (size_t) lim);
+        }
     }
     for (;;) {
         ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
@@ -1165,8 +1169,16 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
-    // reallocate buffers if needed
+    // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and fail the reserve instead
+    // of allocating (a sweep checks a reuse delay's size against its cap without risking the allocation)
+    static int dry_run = -1;
+    if (dry_run < 0) {
+        const char * e = getenv("GGML_ALLOC_DRY_RUN");
+        dry_run = e != NULL && atoi(e) != 0;
+    }
     bool dry_run_hit = false;
+
+    // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
         for (int j = 0; j < i; j++) {
@@ -1186,13 +1198,6 @@ static bool ggml_gallocr_reserve_n_impl(
             if (new_chunk_size > cur_chunk_size) {
                 realloc = true;
             }
-        }
-        // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and fail the reserve instead
-        // of allocating (a sweep checks a reuse delay's size against its cap without risking the allocation)
-        static int dry_run = -1;
-        if (dry_run < 0) {
-            const char * e = getenv("GGML_ALLOC_DRY_RUN");
-            dry_run = e != NULL && atoi(e) != 0;
         }
         if (dry_run && realloc && !no_alloc) {
             GGML_LOG_INFO("%s: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d, hold %lld MiB\n", __func__,
