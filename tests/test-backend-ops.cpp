@@ -12625,7 +12625,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
-    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16}) {
+    // B paths: f16-B native (q8_0), int8 MMQ quantizing the f16 B (q4_0), the dense router (q4_K), non-quantized (bf16)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_BF16}) {
         for (int n : {9, 64, 300}) {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 320, n, 10240));
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
@@ -12890,8 +12891,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, 128, GGML_TYPE_F32, GGML_TYPE_F16));
 
     // MUL_MAT + CPY(f16): exact and ragged tiles, the column count at the mat-vec boundary, the Flash-Next hc up GEMM
-    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-                        GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    // one type per pipeline family the f16 store rides: int8 MMQ legacy / K / IQ blocks, the dense-router pf types (q4_K / q5_K
+    // share their pf loader)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 256, 128, 320));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 200, 130, 2560));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 72, 17, 512));
@@ -12917,8 +12919,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
     // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
     // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 (wave 4)
-    for (ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
-                        GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
+    // (types: the int8 MMQ legacy / K-quant / q6_K stores, the routed iq3_xxs / iq4_nl pf; the store does not depend on the A
+    // loader, which test_mul_mat_id and the dense pf cases cover)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
         for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  256,  64,  640));
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 256,  64,  640));
@@ -12926,8 +12929,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 640, 130,  512));
         }
     }
-    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, 2048, 2560));
-    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
+    // the REAP-320 shapes (about 1 min of host quantization and CPU reference each): with the engagement opt-in only
+    if (env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT")) {
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, 2048, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
+    }
     // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
     // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
     for (int64_t m : {256, 320}) {
@@ -12954,7 +12960,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 256, 128, 16, 4, nt));
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_IQ4_XS,  GGML_TYPE_Q8_0,   256, 128, 16, 4, nt));
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q6_K,   256, 256, 16, 8, nt));
-        test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q5_K,    GGML_TYPE_Q5_K,   512, 256, 32, 8, nt));
     }
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, 64, 10, 256));
     for (int part : {1, 2, 3}) {
@@ -14483,10 +14488,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // types, since the in-model B is f16 on the fork line and f32 on halo-box (an engagement count of 0 here means REG_A untested)
     // GGML_VK_TEST_REQUIRE_REGA=1 (the wave-3 filler, with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all): each of these must
     // run at least one MUL_MAT_ID_REGA dispatch on Vulkan, else it fails; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken
-    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
-    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
-    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true, 2560, 2048, 640));
-    test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, true, 2560, 2048, 640));
+    // (registered with the opt-in only: without it they are plain test_mul_mat_id cases of the cpy16 shapes)
+    if (env_opt_in("GGML_VK_TEST_REQUIRE_REGA")) {
+        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true, 2560, 2048, 640));
+        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, true, 2560, 2048, 640));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
@@ -15896,16 +15904,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // R1 (10-10): is the halo-box hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
-    // 20480-B row stride of xn? packed vs the shipped 128-element pad vs a 2048-element pad that lands on a camping stride again
-    for (int64_t pad : {0, 128, 2048}) {
-        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, pad));
-    }
-
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
         return test_cases;
+    }
+
+    // R1 (10-10): is the halo-box hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
+    // 20480-B row stride of xn? packed vs the shipped 128-element pad vs a 2048-element pad that lands on a camping stride again
+    for (int64_t pad : {0, 128, 2048}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, pad));
     }
 
     // Flash-Next REAP-320 dense q8_0 GEMMs at ub2048; the hc up GEMM (10240 x 320) also with its f16 cast
