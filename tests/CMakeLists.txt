@@ -321,6 +321,13 @@ if (NOT GGML_BACKEND_DL)
         llama_build_and_test(test-tqp.cpp)
         target_compile_definitions(test-tqp PRIVATE TQP_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     endif()
+    if (GGML_EXL3)
+        # EXL3 decode self-test, kept next to the decoder under ggml/exl3
+        llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c
+                             ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
+                             NAME test-exl3)
+        target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3 ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+    endif()
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
