@@ -1465,8 +1465,8 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
-    // If tiled is supported, it will execute the full op here and we return (it reads an F32 or Q8_K src1)
-    if (src1->type != GGML_TYPE_F16 && ggml_compute_forward_mul_mat_tiled(params, dst)) {
+    // If tiled is supported, it will execute the full op here and we return
+    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
         return;
     }
 
@@ -1899,9 +1899,8 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h); it reads an F32 or Q8_K src1
-        if (src1->type != GGML_TYPE_F16 &&
-            ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h)
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
