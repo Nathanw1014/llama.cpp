@@ -7762,7 +7762,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             static bool xl_logged = false;
             if (!xl_logged) {
                 xl_logged = true;
-                fprintf(stderr, "ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) ne11, (unsigned) ne10);
+                GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) ne11, (unsigned) ne10);
             }
             pipeline = itx->second[0].aligned;
         }
@@ -7787,7 +7787,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         static bool y_row_pad_logged = false;
         if (!y_row_pad_logged) {
             y_row_pad_logged = true;
-            fprintf(stderr, "ggml_vulkan: MUL_MAT f16-B row pad engaged (GGML_VK_DENSE_YPAD=%u, first k=%u -> stride %u)\n", y_row_pad, (uint32_t) ne10, (uint32_t) y_row);
+            GGML_LOG_INFO("ggml_vulkan: MUL_MAT f16-B row pad engaged (GGML_VK_DENSE_YPAD=%u, first k=%u -> stride %u)\n", y_row_pad, (uint32_t) ne10, (uint32_t) y_row);
         }
     }
     const uint64_t x_ne = ggml_nelements(src0);
@@ -9202,7 +9202,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         static std::set<std::string> rega_said;
         auto rega_reject = [&](const char * why) {
             if (dbg && rega_said.insert(why).second) {
-                fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A not taken (%s m=%u n=%u k=%u experts=%u used=%u): %s\n", ggml_type_name(src0->type),
+                GGML_LOG_DEBUG("ggml_vulkan: MUL_MAT_ID REG_A not taken (%s m=%u n=%u k=%u experts=%u used=%u): %s\n", ggml_type_name(src0->type),
                         (unsigned) ne01, (unsigned) nei1, (unsigned) ne10, (unsigned) ne02, (unsigned) nei0, why);
             }
         };
@@ -9239,7 +9239,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 rega_reject("REG_A d16 pipeline lacks the router-weight binding");
             } else {
                 static bool rega_logged = false;
-                if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
+                if (!rega_logged) { rega_logged = true; GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
                 if (ggml_vk_dispatch_census_enabled()) {   // the per-type names build a string: only while the census counts
                     ggml_vk_path_census_add("MUL_MAT_ID_REGA");
                     ggml_vk_path_census_add((std::string("MUL_MAT_ID_REGA:") + ggml_type_name(src0->type)).c_str());
@@ -17097,7 +17097,7 @@ static bool ggml_vk_gdn_norm_f16_reject(const char * why) {
     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
     static std::set<std::string> seen;
     if (dbg && seen.insert(why).second) {
-        fprintf(stderr, "ggml_vulkan: RMS_NORM_MUL_SIGMUL_CPY not taken: %s\n", why);
+        GGML_LOG_DEBUG("ggml_vulkan: RMS_NORM_MUL_SIGMUL_CPY not taken: %s\n", why);
     }
     return false;
 }
@@ -17111,7 +17111,7 @@ static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, c
         static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
         if (dbg && node_idx + 4 < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_RMS_NORM &&
             cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
-            fprintf(stderr, "ggml_vulkan: RMS_NORM at node %d not wired as the GDN norm f16 chain: %s %s %s %s %s\n", node_idx,
+            GGML_LOG_DEBUG("ggml_vulkan: RMS_NORM at node %d not wired as the GDN norm f16 chain: %s %s %s %s %s\n", node_idx,
                     ggml_op_desc(cgraph->nodes[node_idx]), ggml_op_desc(cgraph->nodes[node_idx + 1]), ggml_op_desc(cgraph->nodes[node_idx + 2]),
                     ggml_op_desc(cgraph->nodes[node_idx + 3]), ggml_op_desc(cgraph->nodes[node_idx + 4]));
         }
@@ -18258,6 +18258,7 @@ static uint64_t ggml_backend_vk_dispatch_census_count(const char * name) {
     return n;
 }
 
+// runs at exit (GGML_VK_DISPATCH_CENSUS_LOG=1), when the application's log callback may already be gone: plain stderr
 static void ggml_vk_dispatch_census_print() {
     std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
     fprintf(stderr, "ggml_vulkan: dispatch census:");
@@ -19045,7 +19046,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                 need_disable = true;
                                 static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
                                 if (dbg && fusion_string) {
-                                    fprintf(stderr, "ggml_vulkan: %s disabled at node %d: source %s (%s) of fused node %d overlaps the output %s\n",
+                                    GGML_LOG_DEBUG("ggml_vulkan: %s disabled at node %d: source %s (%s) of fused node %d overlaps the output %s\n",
                                             fusion_string, i, src->name, ggml_op_desc(src), k, dst->name);
                                 }
                             }
