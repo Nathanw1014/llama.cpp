@@ -6,10 +6,9 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_cooperative_matrix : require
 
-// One-time device check of the cooperative-matrix register layout that gdn_chunk_scan.comp (wave32) and
-// flash_attn_sel_cm.comp (wave64) assume when they build fragments by hand. It is the gfx11 WMMA layout as RADV
-// lowers KHR cooperative matrices; the spec does not guarantee it, so the host creates those kernels only when this
-// check passes:
+// One-time device check of the cooperative-matrix register layout that the MUL_MAT_ID manual-fragment ("_mf") builds and
+// the REG_A tile of mul_mm.comp assume when they build fragments by hand. It is the gfx11 WMMA layout as RADV lowers KHR
+// cooperative matrices; the spec does not guarantee it, so the host uses those pipelines only when this check passes:
 //   A (f16):          lane L holds row L % 16,    element i = column i (16 elements)
 //   B (f16):          lane L holds column L % 16, element i = row i    (16 elements)
 //   f32 accumulator:  lane L holds column L % 16, element i = row L / 16 + (SG / 16) i (256 / SG elements)

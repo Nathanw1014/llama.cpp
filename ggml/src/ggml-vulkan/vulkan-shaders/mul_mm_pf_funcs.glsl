@@ -22,9 +22,9 @@ bool a_fetch_all = true;
 // ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
 // One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned).
 // fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
-// dword(b-2), dword(b+2) and a 16-bit load of b+6: it never touches a byte outside [b-2, b+8), which
-// stays inside the block for every group these loaders use (the misaligned case only occurs for
-// odd block indices, whose groups start >= 2 bytes into the block). The first version read whole
+// dword(b-2), dword(b+2) and a 16-bit load of b+6: it never touches a byte outside [b-2, b+8). q8_0 / q5_0 / iq4_nl groups
+// start after d, so b-2 stays inside the block; a q6_K / q3_K group at the start of an odd block reads the last 2 bytes of
+// the previous block of the same tensor (block 0 is 4-aligned, so nothing before the tensor). The first version read whole
 // dwords past the group and faulted on the last block of an mmap'd tensor (GPUVM fault, 2026-09-13).
 // Scales and d are read through the typed block members. Index math is split into a uniform part
 // (pos_a: superblock column and the position inside the block are the same for every lane) and a
