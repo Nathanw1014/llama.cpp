@@ -1533,7 +1533,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src->view_src != NULL) {
                     // views are always on the same backend as the source; a source no node reads directly (a
                     // scratch tensor written only through views) is still unassigned here and takes this node's
-                    if (tensor_backend_id(src->view_src) == -1) {
+                    if (*cur_backend_id != -1 && tensor_backend_id(src->view_src) == -1) {
                         tensor_backend_id(src->view_src) = *cur_backend_id;
                         SET_CAUSE(src->view_src, "4.cur");
                     }
