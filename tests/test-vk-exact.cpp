@@ -40,6 +40,15 @@ typedef void     (*fusion_reset_t)(void);
 
 static fusion_count_t g_count = nullptr;
 static fusion_reset_t g_reset = nullptr;
+static void (*g_env_reload)(void) = nullptr;   // the backend caches knobs it reads per graph; null on a backend without the hook
+
+// a Vulkan knob flipped at run time: the backend re-reads it on its next use
+static void set_vk_knob(const char * name, const char * value) {
+    set_env(name, value);
+    if (g_env_reload) {
+        g_env_reload();
+    }
+}
 
 static uint64_t fnv1a(const void * p, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -157,7 +166,7 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     const size_t ne = ggml_nelements(out_f);
     std::vector<ggml_fp16_t> o_f(ne), o_f2(ne), o_r(ne), o_p(ne);
     auto run = [&](ggml_cgraph * g, bool fused, uint64_t * n) {
-        if (c.knob) set_env(c.knob, fused ? "1" : "0");
+        if (c.knob) set_vk_knob(c.knob, fused ? "1" : "0");
         g_reset();
         ggml_backend_graph_compute(be, g);
         if (n) *n = c.fname ? g_count(c.fname) : 0;
@@ -180,7 +189,7 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     c.perturb();
     run(gf, true, nullptr);
     ggml_backend_tensor_get(out_f, o_p.data(), 0, ne * 2);
-    if (c.knob) set_env(c.knob, nullptr);
+    if (c.knob) set_vk_knob(c.knob, nullptr);
     const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
     const bool engaged = c.fname == nullptr || (n_f == (g_fusion ? (uint64_t) c.expect : 0) && n_r == 0);
     const bool rte_ok = !c.rte || r_match == r_total;
@@ -672,7 +681,7 @@ static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
 
     std::vector<float> out_on(sh.n_embd * sh.nt), out_off(sh.n_embd * sh.nt), out_pert(sh.n_embd * sh.nt);
     auto run = [&](const char * knob, std::vector<float> & out, uint64_t & n) {
-        set_env("GGML_VK_HC_UP_MIX", knob);
+        set_vk_knob("GGML_VK_HC_UP_MIX", knob);
         g_reset();
         ggml_backend_graph_compute(be, gf);
         n = g_count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");
@@ -881,6 +890,7 @@ int main(int argc, char ** argv) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     g_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
     g_reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    g_env_reload = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
     if (!g_count || !g_reset) {
         printf("FAIL: no dispatch census counters\n");
         return 1;

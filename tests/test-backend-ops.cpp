@@ -4343,13 +4343,8 @@ struct test_mul_mat_f16b : public test_case {
         static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
-            // the counter also counts the dense router (GGML_VK_DENSE_F16COOPMAT, default q4_K / q5_K / q6_K / iq4_xs) when B is f16
-            static const char * dl = getenv("GGML_VK_DENSE_F16COOPMAT");
-            const bool dense_default = dl == nullptr && (type_a == GGML_TYPE_Q4_K || type_a == GGML_TYPE_Q5_K || type_a == GGML_TYPE_Q6_K || type_a == GGML_TYPE_IQ4_XS);
-            if (dl != nullptr && type_a != GGML_TYPE_Q8_0) {
-                return true;   // a custom dense list: not modelled here
-            }
-            const bool want = k >= 1024 && n >= 32 && ((native_on && type_a == GGML_TYPE_Q8_0) || dense_default);
+            // the counter counts only GEMMs the native list routed (not the GGML_VK_DENSE_F16COOPMAT dense router)
+            const bool want = k >= 1024 && n >= 32 && native_on && type_a == GGML_TYPE_Q8_0;
             if ((native > 0) != want) {
                 msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(native) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
                 return false;
