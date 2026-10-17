@@ -602,7 +602,6 @@ void main() {
                     const vec2 v = lo_half ? vec2(own0, recv) : vec2(recv, own1);
                     if (col_i < _ne1) {
                         const u16vec2 row_idx = row_ids[col_i - ic * BN];
-                        const float w = scale_rows ? data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0;
                         const uint idx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
 #ifdef GLU_UP
                         const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
@@ -618,6 +617,7 @@ void main() {
                             data_d[idx] = mmid_store16(acc_gate ? glu_silu_mul(v16, o) : glu_silu_mul(o, v16));
                         }
 #else
+                        const float w = scale_rows ? data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0;
                         if (row_g + 1 < p.M) {
                             data_d2[idx / 2] = mmid_store16x2(v * w);
                         } else if (row_g < p.M) {
@@ -644,10 +644,12 @@ void main() {
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
                 float val = float(sums[tile_idx * CM_ELEMS + e]);
+#ifndef GLU_UP
                 if (scale_rows) {
                     val *= data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
                 }
-#ifdef GLU_UP
+#else
+                // no router weight with the SwiGLU store (the host asserts it): neither GLU path reads data_fscale
                 {
                     const float o = float(data_up[store_offset]);
                     const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
