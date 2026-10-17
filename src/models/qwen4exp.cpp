@@ -2011,7 +2011,7 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
     const int64_t t0 = ggml_time_us();
     bool do_advise = advise_mode != 0;
     int resident = -1;
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)   // macOS declares mincore with a char vector: there the table is always advised
     if (advise_mode == 2 && n_rows >= 256) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page > 0) {
