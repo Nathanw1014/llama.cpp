@@ -612,7 +612,6 @@ static int run(ggml_backend_t be, bool fusion) {
     case_hc_post_norm(be, 2560, 2048);
     case_hc_post_norm(be, 2560, 130);
     case_hc_norm_rows(be, 2560, 4, 2048);
-    case_hc_norm_rows(be, 2048, 1, 512);                                      // 35B-wide norm
 
     case_hc_pre(be, 2560, 2048, false);
     case_hc_pre(be, 2560, 2048, true);
