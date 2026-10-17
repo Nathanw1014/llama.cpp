@@ -521,6 +521,17 @@ static int64_t dispatch_census_count(ggml_backend_t backend, const char * name) 
     return count ? (int64_t) count(name) : -1;
 }
 
+// a default-on backend knob (unset or non-zero) and an opt-in test switch (set and non-zero)
+static bool env_knob_on(const char * name) {
+    const char * e = getenv(name);
+    return e == nullptr || atoi(e) != 0;
+}
+
+static bool env_opt_in(const char * name) {
+    const char * e = getenv(name);
+    return e != nullptr && atoi(e) != 0;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1316,9 +1327,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
-    // engagement: called on backend1 right before the compare and right after it; a test that requires a fused dispatch
-    // or a path resets the census in the first (dispatch_census_reset) and FAILS from the second when its count is wrong
-    virtual void before_compute(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    // engagement: when checks_engagement() is true the census of backend1 is reset right before the compare, and
+    // verify_engagement FAILS the case right after it when a fused dispatch or path count is wrong
+    virtual bool checks_engagement() { return false; }
     virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
@@ -1612,7 +1623,9 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
         bool cmp_ok = true;
-        before_compute(backend1);
+        if (checks_engagement()) {
+            dispatch_census_reset(backend1);
+        }
         if (!second_backend_nodes().empty()) {
             // compute backend1's splits through the scheduler, the reference as one graph on backend2
             struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, gf);
@@ -4208,22 +4221,16 @@ struct test_hc_post_norm : public test_case {
         return pad == 0 ? VARS_TO_STR5(embd, hc, tokens, mode, type_down) : VARS_TO_STR6(embd, hc, tokens, mode, type_down, pad);
     }
 
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
-    static bool knob_on(const char * name) {
-        const char * e = getenv(name);
-        return e == nullptr || atoi(e) != 0;
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (pad == 0 || dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B") < 0) {
             return true;   // the unpadded cases check values only; not the Vulkan backend
         }
         struct { const char * name; bool want; } checks[] = {
-            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", knob_on("GGML_VK_FUSE_HC_POST_NORM") },
+            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", env_knob_on("GGML_VK_FUSE_HC_POST_NORM") },
             // the readers take the row stride at prefill sizes (more tokens than the mat-vec columns)
-            { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 && knob_on("GGML_VK_ROWSTRIDE") },
-            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && knob_on("GGML_VK_ROWSTRIDE") },
+            { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
+            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
         };
         for (const auto & c : checks) {
             const int64_t n = dispatch_census_count(backend, c.name);
@@ -4326,13 +4333,11 @@ struct test_mul_mat_f16b : public test_case {
         }
     }
 
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         // wave 6 (A): GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
         // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
-        static const bool req_native = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_F16B_NATIVE"); return e != nullptr && atoi(e) != 0; }();
+        const bool req_native = env_opt_in("GGML_VK_TEST_REQUIRE_F16B_NATIVE");
         static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
@@ -4352,7 +4357,7 @@ struct test_mul_mat_f16b : public test_case {
         if (pad == 0 || c < 0 || n <= 8) {
             return true;   // unpadded; not Vulkan; a mat-vec width (B is the vector side there and is copied)
         }
-        static const bool knob_on = [] { const char * e = getenv("GGML_VK_ROWSTRIDE"); return e == nullptr || atoi(e) != 0; }();
+        const bool knob_on = env_knob_on("GGML_VK_ROWSTRIDE");
         if ((c > 0) != knob_on) {
             msg = "MUL_MAT_ROWSTRIDE_B dispatches: " + std::to_string(c) + (knob_on ? " (B was copied to packed rows)" : " (the knob is off)");
             return false;
@@ -4681,22 +4686,16 @@ struct test_gdn_norm_f16 : public test_case {
         }
     }
 
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
-    static bool knob_on(const char * name) {
-        const char * e = getenv(name);
-        return e == nullptr || atoi(e) != 0;
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (dispatch_census_count(backend, "RMS_NORM_MUL_SIGMUL_CPY") < 0) {
             return true;   // not the Vulkan backend
         }
-        const bool fuse = knob_on("GGML_VK_GDN_NORM_F16") && knob_on("GGML_VK_FUSE_NORM_EXTRA") && knob_on("GGML_VK_NORM_SMALL");
+        const bool fuse = env_knob_on("GGML_VK_GDN_NORM_F16") && env_knob_on("GGML_VK_FUSE_NORM_EXTRA") && env_knob_on("GGML_VK_NORM_SMALL");
         struct { const char * name; int64_t want_min, want_max; } checks[] = {
             { "RMS_NORM_MUL_SIGMUL_CPY", fuse ? 1 : 0, fuse ? 1 : 0 },
-            { "path:MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 && knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0,
-                                          pad > 0 && ne[2] > 8 && knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0 },
+            { "path:MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0,
+                                          pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0 },
         };
         for (const auto & c : checks) {
             const int64_t n = dispatch_census_count(backend, c.name);
@@ -6657,12 +6656,10 @@ struct test_hc_up_mix_f16 : public test_case {
         return out;
     }
 
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        static const bool require = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_HC_UP_MIX"); return e != nullptr && atoi(e) != 0; }();
-        static const bool knob_on = [] { const char * e = getenv("GGML_VK_HC_UP_MIX"); return e == nullptr || atoi(e) != 0; }();
+        const bool require = env_opt_in("GGML_VK_TEST_REQUIRE_HC_UP_MIX");
+        const bool knob_on = env_knob_on("GGML_VK_HC_UP_MIX");
         const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
         const int64_t n = dispatch_census_count(backend, name), want = knob_on ? 1 : 0;
         if (!require || n < 0) {
@@ -7153,12 +7150,9 @@ struct test_mul_mat_id_rega : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
 
     static bool required() {
-        static const bool r = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_REGA"); return e != nullptr && atoi(e) != 0; }();
-        return r;
+        return env_opt_in("GGML_VK_TEST_REQUIRE_REGA");
     }
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_REGA");
         if (n < 0 || !required()) {
@@ -7550,11 +7544,9 @@ struct test_mul_mat_id_cpy16 : public test_case {
         init_mul_mat_id_tensors(ctx, n_mats);
     }
 
-    void before_compute(ggml_backend_t backend) override {
-        dispatch_census_reset(backend);
-    }
+    bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        static const bool require = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_MMID_F16OUT"); return e != nullptr && atoi(e) != 0; }();
+        const bool require = env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT");
         const char * name = with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
         const int64_t n = dispatch_census_count(backend, name);
         if (!require || n < 0) {
