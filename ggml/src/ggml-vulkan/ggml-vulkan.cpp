@@ -18320,10 +18320,22 @@ static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struc
 
 // HC_UP_MIX (wave 5): MUL_MAT(q8_0 hc up weight, lo) + CPY(f16 gate) + RESHAPE + DSV4_HC_PRE(gated, f16 x, f16 gate) -> one int8 MMQ GEMM
 // whose epilogue rounds each gate to f16 and applies the gated mix in DSV4_HC_PRE's order: bit-exact with the unfused chain, and the
-// [4*n_embd, N] gate is neither written nor read. GGML_VK_HC_UP_MIX=0 disables; read per call (the exactness test flips it at run time).
+// [4*n_embd, N] gate is neither written nor read. GGML_VK_HC_UP_MIX=0 disables; read once, and again after the
+// "ggml_backend_debug_env_reload" test hook (the exactness test flips it between graphs).
+static std::atomic<int> vk_hc_up_mix_env {-1};
 static bool ggml_vk_hc_up_mix_enabled() {
-    const char * e = getenv("GGML_VK_HC_UP_MIX");
-    return e == nullptr || atoi(e) != 0;
+    int v = vk_hc_up_mix_env.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_HC_UP_MIX");
+        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        vk_hc_up_mix_env.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+// test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX) are read again on their next use
+static void ggml_backend_vk_debug_env_reload() {
+    vk_hc_up_mix_env.store(-1, std::memory_order_relaxed);
 }
 
 // Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the
@@ -20997,6 +21009,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
         return (void *) ggml_backend_vk_dispatch_census_count;
+    }
+    if (strcmp(name, "ggml_backend_debug_env_reload") == 0) {
+        return (void *) ggml_backend_vk_debug_env_reload;
     }
     return nullptr;
 }
