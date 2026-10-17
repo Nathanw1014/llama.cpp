@@ -1187,8 +1187,8 @@ static bool ggml_gallocr_reserve_n_impl(
                 realloc = true;
             }
         }
-        // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and exit before allocating it
-        // (a sweep checks a reuse delay's size against its cap without risking the allocation)
+        // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and fail the reserve instead
+        // of allocating (a sweep checks a reuse delay's size against its cap without risking the allocation)
         static int dry_run = -1;
         if (dry_run < 0) {
             const char * e = getenv("GGML_ALLOC_DRY_RUN");
@@ -1225,9 +1225,9 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     if (dry_run_hit) {
-        fprintf(stderr, "ggml_gallocr: DRY RUN: exiting before the allocation\n");
-        fflush(stderr);
-        exit(0);
+        // a library must not exit the process: the caller treats a failed reserve as an error
+        fprintf(stderr, "ggml_gallocr: DRY RUN: failing the reserve before the allocation\n");
+        return false;
     }
     return true;
 }
