@@ -532,6 +532,16 @@ static bool env_opt_in(const char * name) {
     return e != nullptr && atoi(e) != 0;
 }
 
+// engagement asserts are opt-in (require_env) and need the census hooks; a fusion the backend says it cannot emit on
+// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted
+static bool engagement_required(ggml_backend_t backend, const char * require_env, const char * fusion = nullptr) {
+    if (!env_opt_in(require_env) || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
+        return false;
+    }
+    auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+    return fusion == nullptr || skip == nullptr || skip(backend, fusion) == nullptr;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -4205,7 +4215,7 @@ struct test_mmb_quant_hc : test_case {
 //       3 combine + f16 norm with an extra reader of the f32 MUL (the cast must not fuse; the combine + f32 norm may)
 // pad > 0 (modes 1 and 2): the f16 norm is written into a view of one [hc*embd + pad, tokens] buffer (LLAMA_HC_XN_PAD) and
 // its readers take the token stride; on Vulkan the norm must still fuse and the GEMM / mat-vec read the rows in place
-// (counted, so the test fails if the chain runs unfused or the readers copy xn back to packed rows)
+// (with GGML_VK_TEST_REQUIRE_HC_POST_NORM=1 the test fails if the chain runs unfused or the readers copy xn back to packed rows)
 struct test_hc_post_norm : public test_case {
     const int embd, hc, tokens, mode;
     const ggml_type type_down;
@@ -4223,8 +4233,8 @@ struct test_hc_post_norm : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (pad == 0 || dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B") < 0) {
-            return true;   // the unpadded cases check values only; not the Vulkan backend
+        if (pad == 0 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_POST_NORM", mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY")) {
+            return true;   // the unpadded cases check values only; not asked, or the device cannot fuse
         }
         struct { const char * name; bool want; } checks[] = {
             { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", env_knob_on("GGML_VK_FUSE_HC_POST_NORM") },
@@ -4318,7 +4328,8 @@ struct test_hc_post_norm : public test_case {
 
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM): int8 MMQ quantizes the f16 B directly
 // pad > 0: B is a view of a [k + pad, n] buffer (rows packed, row stride k + pad: the padded hc xn / GDN norm rows); Vulkan
-// must read it in place (int8 MMQ quantizes through the stride, an f16 A's GEMM reads B through stride_b), counted
+// must read it in place (int8 MMQ quantizes through the stride, an f16 A's GEMM reads B through stride_b), counted with
+// GGML_VK_TEST_REQUIRE_ROWSTRIDE=1
 struct test_mul_mat_f16b : public test_case {
     const ggml_type type_a;
     const int m, n, k;
@@ -4337,7 +4348,7 @@ struct test_mul_mat_f16b : public test_case {
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         // wave 6 (A): GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
         // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
-        const bool req_native = env_opt_in("GGML_VK_TEST_REQUIRE_F16B_NATIVE");
+        const bool req_native = engagement_required(backend, "GGML_VK_TEST_REQUIRE_F16B_NATIVE");
         static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
@@ -4353,10 +4364,10 @@ struct test_mul_mat_f16b : public test_case {
                 return false;
             }
         }
-        const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B");
-        if (pad == 0 || c < 0 || n <= 8) {
-            return true;   // unpadded; not Vulkan; a mat-vec width (B is the vector side there and is copied)
+        if (pad == 0 || n <= 8 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROWSTRIDE")) {
+            return true;   // unpadded; a mat-vec width (B is the vector side there and is copied); not asked
         }
+        const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B");
         const bool knob_on = env_knob_on("GGML_VK_ROWSTRIDE");
         if ((c > 0) != knob_on) {
             msg = "MUL_MAT_ROWSTRIDE_B dispatches: " + std::to_string(c) + (knob_on ? " (B was copied to packed rows)" : " (the knob is off)");
@@ -4660,7 +4671,8 @@ struct test_rms_norm_mul_mul : public test_case {
 // LLAMA_GDN_NORM_F16, in the node order qwen4exp emits (Vulkan fuses the five as RMS_NORM_MUL_SIGMUL_CPY, writing only
 // the f16 rows). pad > 0: the f16 rows land in a view of one [ne0*ne1 + pad, ne2] buffer (LLAMA_GDN_NORM_PAD), its VIEW
 // node ahead of the chain, and ssm_out reads them through the stride. Allocated through the scheduler so graph_optimize
-// runs (it must keep the chain together). Fails unless the fused norm ran (and, padded at prefill widths, the row-strided B).
+// runs (it must keep the chain together). GGML_VK_TEST_REQUIRE_GDN_NORM=1: fails unless the fused norm ran (and, padded at
+// prefill widths, the row-strided B).
 struct test_gdn_norm_f16 : public test_case {
     const std::array<int64_t, 3> ne;   // head_v_dim, heads, tokens
     const int64_t pad;
@@ -4688,8 +4700,8 @@ struct test_gdn_norm_f16 : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (dispatch_census_count(backend, "RMS_NORM_MUL_SIGMUL_CPY") < 0) {
-            return true;   // not the Vulkan backend
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_NORM", "RMS_NORM_MUL_SIGMUL_CPY")) {
+            return true;
         }
         const bool fuse = env_knob_on("GGML_VK_GDN_NORM_F16") && env_knob_on("GGML_VK_FUSE_NORM_EXTRA") && env_knob_on("GGML_VK_NORM_SMALL");
         struct { const char * name; int64_t want_min, want_max; } checks[] = {
@@ -6658,13 +6670,11 @@ struct test_hc_up_mix_f16 : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const bool require = env_opt_in("GGML_VK_TEST_REQUIRE_HC_UP_MIX");
-        const bool knob_on = env_knob_on("GGML_VK_HC_UP_MIX");
         const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
-        const int64_t n = dispatch_census_count(backend, name), want = knob_on ? 1 : 0;
-        if (!require || n < 0) {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_UP_MIX", name)) {
             return true;
         }
+        const int64_t n = dispatch_census_count(backend, name), want = env_knob_on("GGML_VK_HC_UP_MIX") ? 1 : 0;
         if (n != want) {
             msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
@@ -7149,15 +7159,12 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
 struct test_mul_mat_id_rega : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
 
-    static bool required() {
-        return env_opt_in("GGML_VK_TEST_REQUIRE_REGA");
-    }
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_REGA");
-        if (n < 0 || !required()) {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_REGA")) {
             return true;
         }
+        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_REGA");
         if (n == 0) {
             msg = "MUL_MAT_ID_REGA dispatches: 0 (GGML_VK_TEST_REQUIRE_REGA=1; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken)";
             return false;
@@ -7546,12 +7553,11 @@ struct test_mul_mat_id_cpy16 : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const bool require = env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT");
         const char * name = with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
-        const int64_t n = dispatch_census_count(backend, name);
-        if (!require || n < 0) {
-            return true;   // not asked, or not the Vulkan backend
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_MMID_F16OUT", name)) {
+            return true;   // not asked, not the Vulkan backend, or the device cannot fuse
         }
+        const int64_t n = dispatch_census_count(backend, name);
         if (n != 1) {
             msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected 1; GGML_VK_TEST_REQUIRE_MMID_F16OUT=1)";
             return false;
