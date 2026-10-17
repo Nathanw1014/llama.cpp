@@ -1963,7 +1963,7 @@ void llama_model_qwen4exp::prefetch_begin(std::unique_ptr<llama_model_prefetch> 
     llama_ple_async * async = qwen4exp_ring(state.get());
     static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
     if (stats) {
-        fprintf(stderr, "ple_async: batch of %" PRId64 " tokens, %" PRId64 " unknown here, window %u\n", n, n_unknown, n_ubatch);
+        LLAMA_LOG_INFO("ple_async: batch of %" PRId64 " tokens, %" PRId64 " unknown here, window %u\n", n, n_unknown, n_ubatch);
     }
     async->start(std::move(idx), n, (int64_t) n_ubatch);
 }
@@ -1975,7 +1975,7 @@ void llama_model_qwen4exp::prefetch_end(llama_model_prefetch * state) const {
     if (async && async->active()) {
         static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
         if (stats) {
-            fprintf(stderr, "ple_async: totals %llu ubatches, %llu tokens from the ring, %llu gathered synchronously, %.1f ms waited\n",
+            LLAMA_LOG_INFO("ple_async: totals %llu ubatches, %llu tokens from the ring, %llu gathered synchronously, %.1f ms waited\n",
                     (unsigned long long) async->st_ubatches, (unsigned long long) async->st_hits,
                     (unsigned long long) async->st_misses, async->st_wait_ms);
         }
@@ -2092,7 +2092,7 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
     }
     if (stats) {
         const int64_t t1 = ggml_time_us();
-        fprintf(stderr, "ple_gather(mmap): %zu rows, resident sample %d/64, advise %s %.1f ms, dequant %.1f ms, %d threads\n",
+        LLAMA_LOG_INFO("ple_gather(mmap): %zu rows, resident sample %d/64, advise %s %.1f ms, dequant %.1f ms, %d threads\n",
                 n_rows, resident, do_advise ? "on" : "off", (t_adv - t0) / 1000.0, (t1 - t_adv) / 1000.0, n_thr);
     }
 }
@@ -2211,7 +2211,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
             const int64_t t2 = ggml_time_us();
             if (stats) {
-                fprintf(stderr, "ple_async: ubatch %" PRId64 " tokens, %" PRId64 " from the ring, %" PRId64 " gathered now | wait %.1f ms, fallback %.1f ms\n",
+                LLAMA_LOG_INFO("ple_async: ubatch %" PRId64 " tokens, %" PRId64 " from the ring, %" PRId64 " gathered now | wait %.1f ms, fallback %.1f ms\n",
                         n_tokens, hits, n_tokens - hits, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
             }
             if (check) {
@@ -2219,7 +2219,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                 std::vector<float> ref(embd_buf.size());
                 qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), ref.data());
                 const bool same = memcmp(ref.data(), embd_buf.data(), ref.size() * sizeof(float)) == 0;
-                fprintf(stderr, "ple_async check: ubatch %" PRId64 " tokens, %" PRId64 " from the ring: bytes %s the synchronous gather\n",
+                LLAMA_LOG_INFO("ple_async check: ubatch %" PRId64 " tokens, %" PRId64 " from the ring: bytes %s the synchronous gather\n",
                         n_tokens, hits, same ? "IDENTICAL to" : "DIFFER from");
                 GGML_ASSERT(same && "ple_async: ring rows differ from the synchronous gather");
             }
