@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -502,6 +503,7 @@ enum test_mode {
     MODE_PERF,
     MODE_GRAD,
     MODE_SUPPORT,
+    MODE_CENSUS,
 };
 
 // Output format support similar to llama-bench
@@ -1322,7 +1324,7 @@ struct test_case {
     }
 
     void add_sentinel(ggml_context * ctx) {
-        if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT) {
+        if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT || mode == MODE_CENSUS) {
             return;
         }
         ggml_tensor * sentinel = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sentinel_size);
@@ -1615,6 +1617,73 @@ struct test_case {
         print_test_result_locked(output_printer, result);
 
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
+    }
+
+    // census mode: the whole graph on backend through the scheduler, so graph_optimize's reorders apply as in a model.
+    // Returns false with the reason in `why` when the graph cannot run there.
+    bool eval_census(ggml_backend_t backend, ggml_backend_t backend_cpu, std::string & why) {
+        mode = MODE_CENSUS;
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        const bool use_weights = use_weight_context();
+
+        ggml_context_ptr ctx(ggml_init(params));
+        GGML_ASSERT(ctx);
+        ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
+        GGML_ASSERT(!use_weights || ctx_weights);
+
+        gf = ggml_new_graph(ctx.get());
+        ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
+        current_op_name   = op_desc(out);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!ggml_backend_supports_op(backend, t)) {
+                why = std::string("op not supported: ") + ggml_op_desc(t);
+                return false;
+            }
+            // inputs live outside the compute buffer, as a model's do; no output flag, which would stop fusions there
+            if (t->op == GGML_OP_NONE) {
+                ggml_set_input(t);
+            }
+        }
+
+        ggml_backend_buffer_ptr buf_weights(nullptr);
+        if (ctx_weights) {
+            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            if (buf_weights == NULL) {
+                why = "failed to allocate weight tensors";
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        ggml_build_forward_expand(gf, out);
+
+        ggml_backend_t backends[] = {backend, backend_cpu};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), t, backend);
+        }
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            why = "failed to allocate the graph through the scheduler";
+            return false;
+        }
+
+        initialize_tensors(ctx.get());
+        if (ctx_weights) {
+            initialize_tensors(ctx_weights.get());
+        }
+
+        if (ggml_backend_sched_graph_compute(sched.get(), gf) != GGML_STATUS_SUCCESS) {
+            why = "graph compute failed";
+            return false;
+        }
+        ggml_backend_sched_synchronize(sched.get());
+        return true;
     }
 
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
@@ -16028,6 +16097,163 @@ static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_f
     return ok;
 }
 
+// Fusion census: one minimal graph per fusion label a backend can emit, run through the scheduler, and the exact set of
+// fused dispatches it reports ("LABEL/n" = label and fused node count -> times). A missing, extra or renamed label, a
+// shorter or longer fusion, or a second dispatch fails. Backends opt in by returning these test hooks (not a stable API)
+// from ggml_backend_reg_get_proc_address:
+//   void         ggml_backend_debug_fusion_census_reset(void)                        clear the counts and start counting
+//   size_t       ggml_backend_debug_fusion_census_get(char * buf, size_t size)       "LABEL/n=count;..." in label order
+//   const char * ggml_backend_debug_fusion_census_skip(ggml_backend_t, const char * label)   why the device cannot emit it, or NULL
+typedef void         (*census_reset_t)(void);
+typedef size_t       (*census_get_t)(char * buf, size_t size);
+typedef const char * (*census_skip_t)(ggml_backend_t backend, const char * label);
+
+struct census_case {
+    std::string                          label;   // the fusion this graph is for (skip reasons are asked for it)
+    std::unique_ptr<test_case>           tc;
+    std::map<std::string, uint64_t>      expect;  // "LABEL/n" -> count
+};
+
+static std::map<std::string, uint64_t> census_parse(const std::string & s) {
+    std::map<std::string, uint64_t> m;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t end = s.find(';', pos);
+        const std::string item = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+            m[item.substr(0, eq)] = std::stoull(item.substr(eq + 1));
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return m;
+}
+
+static std::string census_str(const std::map<std::string, uint64_t> & m) {
+    std::string out;
+    for (const auto & it : m) {
+        out += (out.empty() ? "" : ",") + it.first + "=" + std::to_string(it.second);
+    }
+    return out.empty() ? "none" : out;
+}
+
+// Expected dispatches are those of the Vulkan backend; another backend adding the hooks keys its own table by reg name.
+static std::vector<census_case> make_census_cases_vulkan() {
+    std::vector<census_case> cases;
+    auto add = [&](const char * label, test_case * tc, const char * expect) {
+        cases.push_back({ label, std::unique_ptr<test_case>(tc), census_parse(expect) });
+    };
+    add("MULTI_ADD",           new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { 64, 5, 4, 3 }, false, false), "MULTI_ADD/2=1");
+    add("MULTI_ADD",           new test_rms_norm_mul_add(GGML_TYPE_F32, { 511, 1, 1, 1 }, 1e-6f, false, true), "MULTI_ADD/4=1;RMS_NORM_MUL_ADD/3=1");
+    add("MUL_MAT_ADD_ADD",     new test_mul_mat_vec_fusion(GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256, false, 1, 1, false, true, false, false, { 1, 1 }), "MUL_MAT_ADD_ADD/3=1");
+    add("MUL_MAT_ADD",         new test_mul_mat_add(GGML_TYPE_F16, 1000, 1, 1024, MUL_MAT_ADD_MM_RES), "MUL_MAT_ADD/2=1");
+    add("MUL_MAT_ADD",         new test_mul_mat_add(GGML_TYPE_Q4_0, 1000, 1, 1024, MUL_MAT_ADD_RES_MM), "MUL_MAT_ADD/2=1");
+    add("MUL_MAT_ID_ADD_ID",   new test_mul_mat_vec_fusion(GGML_TYPE_Q4_0, GGML_GLU_OP_SWIGLU, 1, 32, 256, true, 16, 8, false, true, true), "MUL_MAT_ID_ADD_ID/2=2");
+    add("MUL_MAT_ID_MUL",      new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 1, 32, 1, true), "MUL_MAT_ID_MUL/2=1");
+    add("MUL_MAT_ID_MUL",      new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 512, 129, 256, 1, true), "MUL_MAT_ID_MUL/2=1");
+    add("RMS_NORM_MUL",        new test_rms_norm_mul_add(GGML_TYPE_F32, { 64, 5, 4, 3 }, 1e-6f, false, false, false, false, false, false), "MULTI_ADD/2=1;RMS_NORM_MUL/2=1");
+    add("RMS_NORM_MUL_ADD",    new test_rms_norm_mul_add(GGML_TYPE_F32, { 64, 5, 4, 3 }, 1e-6f, false), "MULTI_ADD/2=1;RMS_NORM_MUL_ADD/3=1");
+    add("RMS_NORM_MUL_ADD_MUL", new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true), "MULTI_ADD/2=1;RMS_NORM_MUL_ADD_MUL/4=1");
+    add("RMS_NORM_MUL_MUL",    new test_rms_norm_mul_mul({ 128, 48, 9, 1 }, 1e-6f, true), "RMS_NORM_MUL_MUL/3=1");
+    add("RMS_NORM_SCALE",      new test_rms_norm_scale({ 128, 16, 9, 1 }), "RMS_NORM_SCALE/2=1");
+    add("RMS_NORM_MUL_ROPE",   new test_rms_norm_mul_rope({ 128, 4, 7, 2 }), "RMS_NORM_MUL_ROPE/3=1");
+    add("RMS_NORM_MUL_ROPE_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 7, 1 }, 1e-6f, false, true), "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS/5=1");
+    add("RMS_NORM_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false), "RMS_NORM_VIEW_SET_ROWS/3=1");
+    add("ROPE_VIEW_SET_ROWS",  new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_NORMAL), "ROPE_VIEW_SET_ROWS/3=1");
+    add("HC_POST_GATE",        new test_dsv4_hc_post(4096, 21, false, true), "HC_POST_GATE/4=1");
+    add("GELU_MUL",            new test_unary_mul(GGML_UNARY_OP_GELU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "GELU_MUL/2=1");
+    add("SIGMOID_MUL",         new test_unary_mul(GGML_UNARY_OP_SIGMOID,  GGML_TYPE_F32, { 128, 2, 2, 2 }), "SIGMOID_MUL/2=1");
+    add("SILU_MUL",            new test_unary_mul(GGML_UNARY_OP_SILU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "SILU_MUL/2=1");
+    add("SOFTPLUS_MUL",        new test_unary_mul(GGML_UNARY_OP_SOFTPLUS, GGML_TYPE_F32, { 128, 2, 2, 2 }), "SOFTPLUS_MUL/2=1");
+    add("SSM_CONV_SILU",       new test_ssm_conv_bias_silu(GGML_TYPE_F32, { 4, 1024, 1, 1 }, { 4, 1024, 1, 1 }, false), "SSM_CONV_SILU/2=1");
+    add("SSM_CONV_BIAS_SILU",  new test_ssm_conv_bias_silu(GGML_TYPE_F32, { 4, 1024, 1, 1 }, { 4, 1024, 1, 1 }, true), "SSM_CONV_BIAS_SILU/3=1");
+    add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
+    add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
+    add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
+    add("TOPK_MOE_EARLY_SOFTMAX",      new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX/5=1");
+    add("TOPK_MOE_EARLY_SOFTMAX_NORM", new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX_NORM/10=1");
+    add("TOPK_MOE_LATE_SOFTMAX",       new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX_WEIGHT), "TOPK_MOE_LATE_SOFTMAX/6=1");
+    add("TOPK_MOE_SIGMOID_NORM_BIAS",  new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  true,  GATING_FUNC_SIGMOID), "TOPK_MOE_SIGMOID_NORM_BIAS/11=1");
+    add("TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS", new test_topk_moe({ 32, 22, 1, 1 }, 8, true, true, GATING_FUNC_SQRT_SOFTPLUS), "TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS/12=1");
+    add("TOPK_MOE_EARLY_SOFTMAX_NORM", new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  false, GATING_FUNC_SOFTMAX, 2.0f), "TOPK_MOE_EARLY_SOFTMAX_NORM/11=1");
+    return cases;
+}
+
+static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const char * params_filter) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_reset");
+    auto get   = (census_get_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_get");
+    auto skip  = (census_skip_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_skip");
+    if (!reset || !get) {
+        printf("  CENSUS skipped: %s has no fusion census hooks\n", ggml_backend_reg_name(reg));
+        return true;
+    }
+
+    std::vector<census_case> cases;
+    if (strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+        cases = make_census_cases_vulkan();
+    } else {
+        printf("  CENSUS skipped: no expectations for %s\n", ggml_backend_reg_name(reg));
+        return true;
+    }
+
+    ggml_backend_ptr backend_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
+    if (backend_cpu == NULL) {
+        printf("  CENSUS: failed to initialize the CPU backend\n");
+        return false;
+    }
+
+    std::unique_ptr<std::regex> filter;
+    if (params_filter != nullptr) {
+        filter.reset(new std::regex(params_filter));
+    }
+
+    std::set<std::string> labels_seen;
+    size_t n_ok = 0, n_fail = 0, n_skip = 0;
+    for (auto & c : cases) {
+        const std::string name = c.label + " " + c.tc->vars();
+        if (filter && !std::regex_search(name, *filter)) {
+            continue;
+        }
+        const char * reason = skip ? skip(backend, c.label.c_str()) : nullptr;
+        std::string why;
+        if (reason != nullptr) {
+            why = reason;
+        } else {
+            reset();
+            if (c.tc->eval_census(backend, backend_cpu.get(), why)) {
+                std::vector<char> buf(get(nullptr, 0) + 1);
+                get(buf.data(), buf.size());
+                const auto got = census_parse(buf.data());
+                for (const auto & it : got) {
+                    labels_seen.insert(it.first);
+                }
+                const bool ok = got == c.expect;
+                printf("  CENSUS %-34s %s: %s%s%s\n", c.label.c_str(), c.tc->vars().c_str(), ok ? "OK" : "MISMATCH",
+                       ok ? "" : (" expected " + census_str(c.expect)).c_str(), ok ? "" : (" got " + census_str(got)).c_str());
+                if (ok) {
+                    n_ok++;
+                } else {
+                    n_fail++;
+                }
+                continue;
+            }
+        }
+        printf("  CENSUS %-34s %s: SKIPPED (%s)\n", c.label.c_str(), c.tc->vars().c_str(), why.c_str());
+        n_skip++;
+    }
+    std::string seen;
+    for (const auto & l : labels_seen) {
+        seen += (seen.empty() ? "" : ",") + l;
+    }
+    printf("  CENSUS labels: %s\n", seen.empty() ? "none" : seen.c_str());
+    printf("  CENSUS %zu/%zu OK, %zu mismatched, %zu skipped\n", n_ok, n_ok + n_fail, n_fail, n_skip);
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers, bool mmb) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -16047,10 +16273,15 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         }
     };
 
+    if (mode == MODE_CENSUS) {
+        return test_census(backend, dev, params_filter);
+    }
+
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     if (test_file_path == nullptr) {
         switch (mode) {
+        case MODE_CENSUS:
         case MODE_TEST:
         case MODE_GRAD:
         case MODE_SUPPORT:
@@ -16321,7 +16552,8 @@ static void usage(char ** argv) {
     printf("  test     (default) compare with CPU backend for correctness\n");
     printf("  grad     compare gradients from backpropagation with method of finite differences\n");
     printf("  perf     performance evaluation\n");
-    printf("  support  probe backend operation support\n\n");
+    printf("  support  probe backend operation support\n");
+    printf("  census   check the fused dispatches of a minimal graph per fusion (backends with the census test hooks)\n\n");
     printf("Options:\n");
     printf("  -o <op|regex,..>            comma separated list of exact op names (as given by ggml_op_desc()),\n");
     printf("                              full test case strings, and/or regexes matched against the op name\n");
@@ -16361,6 +16593,8 @@ int main(int argc, char ** argv) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
             mode = MODE_SUPPORT;
+        } else if (strcmp(argv[i], "census") == 0) {
+            mode = MODE_CENSUS;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 op_names_filter = argv[++i];
