@@ -535,8 +535,7 @@ struct ggml_gallocr {
     long long hold; // the byte hold of the plan being made (GGML_ALLOC_REUSE_HOLD_MIB in bytes), likewise
     int delay_cfg;      // GGML_ALLOC_REUSE_DELAY; -1 = unread
     long long hold_cfg; // GGML_ALLOC_REUSE_HOLD_MIB in bytes; -1 = unread
-    // MAX_FRAC reference: the largest no-hold-back plan seen by this gallocr (the reserve's worst-case graph) and the delay / hold that
-    // graph landed on under its cap; smaller graphs (the tg graph, runtime graphs with fewer outputs) start from that landing
+    // GGML_ALLOC_REUSE_DELAY_MAX_FRAC: the largest plan without hold-back seen so far and the delay / hold it landed on
     size_t base_max;
     int delay_at_max;
     long long hold_at_max;
@@ -550,13 +549,8 @@ struct delayed_free {
     int release_at; // node index from which the block may be reused
 };
 
-// GGML_ALLOC_REUSE_DELAY=N (A/B diagnostic, default 0 = off): hold every freed compute-buffer block back from reuse until N more graph
-// nodes have been allocated. Applied in the planning pass, so the reserved size grows with N (printed by sched_reserve as usual). On
-// Flash-Next prefill the consumer-less view pins (LLAMA_KEEP_PINS) speed the dense GEMMs / GDN up ~25% per call by keeping blocks out of
-// circulation; this knob tests whether delayed reuse alone does that, at a bounded size.
-// GGML_ALLOC_REUSE_HOLD_MIB=X (the byte form): freed blocks queue in free order and the oldest return to the allocator once more than X
-// MiB is held, so the hold spans the same memory on every model whatever its node count. Combines with the node delay (a block returns
-// at whichever comes first).
+// A/B diagnostics, off by default: a freed block is reused only N graph nodes later (GGML_ALLOC_REUSE_DELAY=N) or once more than
+// X MiB is held back (GGML_ALLOC_REUSE_HOLD_MIB=X), whichever comes first; the planned buffer grows accordingly
 static long long ggml_gallocr_reuse_hold(void) {
     static long long hold = -1;
     if (hold < 0) {
@@ -1045,20 +1039,11 @@ static bool ggml_gallocr_reserve_n_impl(
         galloc->delay_cfg = ggml_gallocr_reuse_delay();
         galloc->hold_cfg = ggml_gallocr_reuse_hold();
     }
-    // every reserve starts from the configured hold-back: a reduction forced on one graph must not carry over to the next (10-14: llama
-    // reserves pp, tg, pp on one gallocr; with MAX_FRAC a sticky halving from the tiny tg graph made the final pp reserve plan n64, while
-    // the dry run, which stops at the first pp reserve, had predicted n128)
+    // every reserve starts from the configured hold-back: a reduction forced on one graph must not carry over to the next
     galloc->delay = galloc->delay_cfg;
     galloc->hold = galloc->hold_cfg;
-    // Caps on the extra size the reuse hold-back may cost. A plan over the cap is redone with the delay and the byte hold halved, down to
-    // 0 (today's plan), so an over-sized buffer is never requested (10-14: GGML_ALLOC_REUSE_DELAY=1024 on Flash-Next asked for more than
-    // the box can map, BO_VA -12). The reduced values hold for this plan only.
-    //   GGML_ALLOC_REUSE_DELAY_MAX_MIB=M: the total over all buffers of the plan stays within M MiB
-    //   GGML_ALLOC_REUSE_DELAY_MAX_FRAC=f: the total stays within (1 + f) x the largest plan without any hold-back this gallocr has seen
-    //     (one extra planning pass per reserve). The cap is relative to that worst case, not to the graph at hand: a graph with a smaller
-    //     base (the tg graph, or a runtime pp graph with fewer outputs than the reserve's all-token one) starts from the delay / hold the
-    //     worst-case graph landed on and is capped against the same bound, so it keeps the reserve's effective N instead of re-planning
-    //     smaller (10-14: the runtime pp graph's own 2x cap took FN from n128 to n32 at runtime while the buffer stayed sized for n128).
+    // a plan over the cap (GGML_ALLOC_REUSE_DELAY_MAX_MIB=M total, or MAX_FRAC=f x the largest plan without hold-back) is redone with
+    // the delay and hold halved down to 0; a smaller graph starts from the worst case's landing so it keeps the reserve's effective N
     static long long cap_mib = -2;
     static double cap_frac = -2;
     if (cap_mib == -2) {
