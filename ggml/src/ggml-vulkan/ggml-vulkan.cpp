@@ -1856,7 +1856,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 
 // register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
-static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt);
+static const std::vector<std::string> & ggml_vk_mmid_route_list();
 // MUL_MAT_ID types routed off int8 MMQ onto the f16-B coopmat pf tile when GGML_VK_MMID_F16COOPMAT is unset (see ggml_vk_mmid_f16coopmat)
 static const char * const ggml_vk_mmid_route_default = "iq3_xxs,iq4_nl";
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
@@ -3578,7 +3578,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (!route_logged) {
             route_logged = true;
             const char * env = getenv("GGML_VK_MMID_F16COOPMAT");
-            const std::vector<std::string> & routed = ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default);
+            const std::vector<std::string> & routed = ggml_vk_mmid_route_list();
             std::string types;
             for (const auto & n : routed) {
                 types += (types.empty() ? "" : ",") + n;
@@ -7531,10 +7531,8 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
 // qualifies them). q3_K / q5_0 / iq4_nl stay on int8 until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
 // pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own list (GGML_VK_MMID_F16COOPMAT, default
 // "iq3_xxs,iq4_nl": the Flash-Next expert types, measured in-model; see ggml_vk_mmid_f16coopmat).
-static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt) {
-    static std::map<std::string, std::vector<std::string>> cache;
-    auto it = cache.find(env_name);
-    if (it != cache.end()) return it->second;
+// each caller keeps its list in a function-static const (thread-safe initialisation, nothing shared is filled later)
+static std::vector<std::string> ggml_vk_parse_route_list(const char * env_name, const char * dflt) {
     std::vector<std::string> v;
     const char * e = getenv(env_name);
     std::string str(e ? e : dflt);
@@ -7547,7 +7545,7 @@ static const std::vector<std::string> & ggml_vk_route_list(const char * env_name
             pos = nxt + 1;
         }
     }
-    return cache.emplace(env_name, v).first->second;
+    return v;
 }
 
 static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type t) {
@@ -7569,7 +7567,8 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
 // f16 hc norm output on both lines and took 1032 us/call on int8 MMQ vs 609 us/call on the release's f16-B coopmat path (95 calls).
 // "0" disables; a comma list (or "all") replaces the default. The K / N floors below still apply.
 static bool ggml_vk_dense_f16b_native(ggml_type t) {
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16B_NATIVE", "q8_0"), t);
+    static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_DENSE_F16B_NATIVE", "q8_0");
+    return ggml_vk_route_match(list, t);
 }
 
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16) {
@@ -7583,15 +7582,21 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
     // q4_K / q5_K / q6_K / iq4_xs at K 5120-17408, and flat on Flash-Next (-0.1% / +1.7%) and Qwen3.6-35B-A3B (-0.2% / -0.4%), whose
     // dense weights are all q8_0 (the int8 path is near-native for q8_0). GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8,
     // "all" routes every type with a pf pipeline, a comma list replaces the default.
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs"), t) || (b_f16 && ggml_vk_dense_f16b_native(t));
+    static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs");
+    return ggml_vk_route_match(list, t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
 // GGML_VK_MMID_F16COOPMAT (default "iq3_xxs,iq4_nl"): the listed expert types leave int8 MMQ for the f16-B coopmat pf tile, which
 // carries the REG_A tile, the f16-output expert store (d16) and the MMID_B_FULL load. Every gate since wave 4 ran with exactly this
 // list on every arm (the batch4 mmidrouteoff arm is the A/B of record), so a build without the env lost those paths. "" or "0" keeps
 // every expert type on int8 MMQ; "all" or a comma list replaces the default. Logged once at init ("MUL_MAT_ID f16-B route: ...").
+static const std::vector<std::string> & ggml_vk_mmid_route_list() {
+    static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default);
+    return list;
+}
+
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default), t);
+    return ggml_vk_route_match(ggml_vk_mmid_route_list(), t);
 }
 
 
