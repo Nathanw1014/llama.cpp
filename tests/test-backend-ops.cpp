@@ -498,6 +498,29 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+// Dispatch census test hooks (debug names, not a stable API): a backend that returns them from ggml_backend_reg_get_proc_address
+// counts its fused dispatches ("LABEL/n") and its recorded dispatch paths ("path:NAME") from the last reset. Engagement tests
+// use these two helpers; a backend without the hooks reports -1 and the test skips its engagement check.
+static void * census_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+static bool dispatch_census_reset(ggml_backend_t backend) {
+    auto reset = (void (*)(void)) census_proc(backend, "ggml_backend_debug_dispatch_census_reset");
+    if (reset) {
+        reset();
+    }
+    return reset != nullptr;
+}
+
+// times KEY ran since the reset: exactly "KEY" (e.g. "path:FA_EXACT") plus every fused dispatch "KEY/n"; -1 without the hooks
+static int64_t dispatch_census_count(ggml_backend_t backend, const char * name) {
+    auto count = (uint64_t (*)(const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_count");
+    return count ? (int64_t) count(name) : -1;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1293,6 +1316,10 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // engagement: called on backend1 right before the compare and right after it; a test that requires a fused dispatch
+    // or a path resets the census in the first (dispatch_census_reset) and FAILS from the second when its count is wrong
+    virtual void before_compute(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
     // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
@@ -1585,6 +1612,7 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
         bool cmp_ok = true;
+        before_compute(backend1);
         if (!second_backend_nodes().empty()) {
             // compute backend1's splits through the scheduler, the reference as one graph on backend2
             struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, gf);
@@ -1611,6 +1639,13 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        if (test_passed) {
+            std::string engage_msg;
+            if (!verify_engagement(backend1, engage_msg)) {
+                test_passed = false;
+                error_msg   = engage_msg;
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -16097,13 +16132,14 @@ static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_f
     return ok;
 }
 
-// Fusion census: one minimal graph per fusion label a backend can emit, run through the scheduler, and the exact set of
-// fused dispatches it reports ("LABEL/n" = label and fused node count -> times). A missing, extra or renamed label, a
-// shorter or longer fusion, or a second dispatch fails. Backends opt in by returning these test hooks (not a stable API)
-// from ggml_backend_reg_get_proc_address:
-//   void         ggml_backend_debug_fusion_census_reset(void)                        clear the counts and start counting
-//   size_t       ggml_backend_debug_fusion_census_get(char * buf, size_t size)       "LABEL/n=count;..." in label order
-//   const char * ggml_backend_debug_fusion_census_skip(ggml_backend_t, const char * label)   why the device cannot emit it, or NULL
+// Fusion census, over the dispatch census hooks: one minimal graph per fusion label a backend can emit, run through the
+// scheduler, and the exact set of fused dispatches it reports ("LABEL/n" = label and fused node count -> times). A missing,
+// extra or renamed label, a shorter or longer fusion, or a second dispatch fails; "path:NAME" keys are listed, not asserted.
+// Backends opt in by returning these test hooks (not a stable API) from ggml_backend_reg_get_proc_address:
+//   void         ggml_backend_debug_dispatch_census_reset(void)                        clear the counts and start counting
+//   size_t       ggml_backend_debug_dispatch_census_get(char * buf, size_t size)       "KEY=count;..." in key order ("LABEL/n", "path:NAME")
+//   const char * ggml_backend_debug_dispatch_census_skip(ggml_backend_t, const char * label)   why the device cannot emit it, or NULL
+//   uint64_t     ggml_backend_debug_dispatch_census_count(const char * name)                     exactly "KEY" plus every "KEY/n" (engagement checks)
 typedef void         (*census_reset_t)(void);
 typedef size_t       (*census_get_t)(char * buf, size_t size);
 typedef const char * (*census_skip_t)(ggml_backend_t backend, const char * label);
@@ -16184,9 +16220,9 @@ static std::vector<census_case> make_census_cases_vulkan() {
 
 static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const char * params_filter) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_reset");
-    auto get   = (census_get_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_get");
-    auto skip  = (census_skip_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_fusion_census_skip");
+    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    auto get   = (census_get_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_get");
+    auto skip  = (census_skip_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
     if (!reset || !get) {
         printf("  CENSUS skipped: %s has no fusion census hooks\n", ggml_backend_reg_name(reg));
         return true;
@@ -16212,6 +16248,7 @@ static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const ch
     }
 
     std::set<std::string> labels_seen;
+    std::set<std::string> paths_seen;
     size_t n_ok = 0, n_fail = 0, n_skip = 0;
     for (auto & c : cases) {
         const std::string name = c.label + " " + c.tc->vars();
@@ -16223,17 +16260,32 @@ static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const ch
         if (reason != nullptr) {
             why = reason;
         } else {
-            reset();
+            dispatch_census_reset(backend);
             if (c.tc->eval_census(backend, backend_cpu.get(), why)) {
+                // the by-name count (engagement checks) must agree with the map for this label
+                const int64_t by_name = dispatch_census_count(backend, c.label.c_str());
                 std::vector<char> buf(get(nullptr, 0) + 1);
                 get(buf.data(), buf.size());
-                const auto got = census_parse(buf.data());
+                // fused dispatches only ("LABEL/n"); path keys are listed, not asserted (they belong to the engagement checks)
+                auto got = census_parse(buf.data());
+                for (auto it = got.begin(); it != got.end();) {
+                    if (it->first.rfind("path:", 0) == 0) {
+                        paths_seen.insert(it->first);
+                        it = got.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
                 for (const auto & it : got) {
                     labels_seen.insert(it.first);
                 }
-                const bool ok = got == c.expect;
+                uint64_t label_sum = 0;
+                for (const auto & it : got) {
+                    label_sum += it.first.compare(0, c.label.size() + 1, c.label + "/") == 0 ? it.second : 0;
+                }
+                const bool ok = got == c.expect && (by_name < 0 || (uint64_t) by_name == label_sum);
                 printf("  CENSUS %-34s %s: %s%s%s\n", c.label.c_str(), c.tc->vars().c_str(), ok ? "OK" : "MISMATCH",
-                       ok ? "" : (" expected " + census_str(c.expect)).c_str(), ok ? "" : (" got " + census_str(got)).c_str());
+                       ok ? "" : (" expected " + census_str(c.expect)).c_str(), ok ? "" : (" got " + census_str(got) + " count(label)=" + std::to_string(by_name)).c_str());
                 if (ok) {
                     n_ok++;
                 } else {
@@ -16250,6 +16302,11 @@ static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const ch
         seen += (seen.empty() ? "" : ",") + l;
     }
     printf("  CENSUS labels: %s\n", seen.empty() ? "none" : seen.c_str());
+    std::string pseen;
+    for (const auto & l : paths_seen) {
+        pseen += (pseen.empty() ? "" : ",") + l;
+    }
+    printf("  CENSUS paths (not asserted): %s\n", pseen.empty() ? "none" : pseen.c_str());
     printf("  CENSUS %zu/%zu OK, %zu mismatched, %zu skipped\n", n_ok, n_ok + n_fail, n_fail, n_skip);
     return n_fail == 0;
 }

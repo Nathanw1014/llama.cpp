@@ -16876,24 +16876,27 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-// Test hook (test-backend-ops "census" mode): every fused dispatch, counted per label and fused node count ("LABEL/n").
-// Off until a test calls "ggml_backend_debug_fusion_census_reset" from ggml_backend_reg_get_proc_address; while off it
-// costs one relaxed load per fused dispatch. Not a stable API: names and output may change with the fusions.
-static std::atomic<bool> vk_fusion_census_on {false};
-static std::mutex vk_fusion_census_mutex;
-static std::map<std::string, uint64_t> vk_fusion_census;
+// Dispatch census, a test hook (test-backend-ops "census" mode and engagement checks): every fused dispatch, counted per
+// label and fused node count ("LABEL/n"), and every dispatch-path decision a backend function records with
+// ggml_vk_path_census_add ("path:NAME", a path or pipeline variant taken that is not a fusion). Off until a test calls
+// "ggml_backend_debug_dispatch_census_reset" from ggml_backend_reg_get_proc_address, or from load with
+// GGML_VK_DISPATCH_CENSUS_LOG=1 (printed at exit); while off it costs one relaxed load per fused dispatch or path decision.
+// Not a stable API: names and output may change with the fusions and paths.
+static std::atomic<bool> vk_dispatch_census_on {false};
+static std::mutex vk_dispatch_census_mutex;
+static std::map<std::string, uint64_t> vk_dispatch_census;
 
-static void ggml_backend_vk_fusion_census_reset() {
-    std::lock_guard<std::mutex> lock(vk_fusion_census_mutex);
-    vk_fusion_census.clear();
-    vk_fusion_census_on.store(true, std::memory_order_relaxed);
+static void ggml_backend_vk_dispatch_census_reset() {
+    std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+    vk_dispatch_census.clear();
+    vk_dispatch_census_on.store(true, std::memory_order_relaxed);
 }
 
-// "LABEL/n=count;LABEL/n=count;" in label order into buf (truncated to size, always NUL-terminated); returns the full length
-static size_t ggml_backend_vk_fusion_census_get(char * buf, size_t size) {
-    std::lock_guard<std::mutex> lock(vk_fusion_census_mutex);
+// "KEY=count;KEY=count;" in key order ("LABEL/n" fused dispatches, "path:NAME" path decisions) into buf (truncated to size, always NUL-terminated); returns the full length
+static size_t ggml_backend_vk_dispatch_census_get(char * buf, size_t size) {
+    std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
     std::string out;
-    for (const auto & it : vk_fusion_census) {
+    for (const auto & it : vk_dispatch_census) {
         out += it.first + "=" + std::to_string(it.second) + ";";
     }
     if (buf != nullptr && size > 0) {
@@ -16905,7 +16908,7 @@ static size_t ggml_backend_vk_fusion_census_get(char * buf, size_t size) {
 }
 
 // why this device or configuration cannot emit a fusion label at all, or nullptr when it can (shape checks aside)
-static const char * ggml_backend_vk_fusion_census_skip(ggml_backend_t backend, const char * label) {
+static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend, const char * label) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     const vk_device & dev = ctx->device;
     const std::string l = label;
@@ -16933,10 +16936,54 @@ static const char * ggml_backend_vk_fusion_census_skip(ggml_backend_t backend, c
     return nullptr;
 }
 
-static void ggml_vk_fusion_census_add(const char * label, int n_nodes) {
-    if (label != nullptr && vk_fusion_census_on.load(std::memory_order_relaxed)) {
-        std::lock_guard<std::mutex> lock(vk_fusion_census_mutex);
-        vk_fusion_census[std::string(label) + "/" + std::to_string(n_nodes)]++;
+static void ggml_vk_dispatch_census_add(const char * label, int n_nodes) {
+    if (label != nullptr && vk_dispatch_census_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+        vk_dispatch_census[std::string(label) + "/" + std::to_string(n_nodes)]++;
+    }
+}
+
+// call at a dispatch-path decision: counts "path:NAME" (e.g. ggml_vk_path_census_add("FA_EXACT")); master records none
+// yet, each path that wants an engagement check adds its own name
+[[maybe_unused]] static void ggml_vk_path_census_add(const char * name) {
+    if (vk_dispatch_census_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+        vk_dispatch_census[std::string("path:") + name]++;
+    }
+}
+
+// count of one key: exactly "NAME" (e.g. "path:FA_EXACT"), plus every fused dispatch "NAME/n" whatever its node count
+static uint64_t ggml_backend_vk_dispatch_census_count(const char * name) {
+    std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+    const std::string key = name;
+    uint64_t n = 0;
+    for (auto it = vk_dispatch_census.lower_bound(key); it != vk_dispatch_census.end(); ++it) {
+        if (it->first == key) {
+            n += it->second;
+        } else if (it->first.compare(0, key.size() + 1, key + "/") == 0) {
+            n += it->second;
+        } else if (it->first.compare(0, key.size(), key) != 0) {
+            break;
+        }
+    }
+    return n;
+}
+
+static void ggml_vk_dispatch_census_print() {
+    std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+    fprintf(stderr, "ggml_vulkan: dispatch census:");
+    for (const auto & it : vk_dispatch_census) {
+        fprintf(stderr, " %s=%llu", it.first.c_str(), (unsigned long long) it.second);
+    }
+    fprintf(stderr, "\n");
+}
+
+// GGML_VK_DISPATCH_CENSUS_LOG=1: count from load and print the census once at exit (engagement checks in llama-bench and the like)
+static void ggml_vk_dispatch_census_log_init() {
+    const char * e = getenv("GGML_VK_DISPATCH_CENSUS_LOG");
+    if (e != nullptr && atoi(e) != 0) {
+        vk_dispatch_census_on.store(true, std::memory_order_relaxed);
+        atexit(ggml_vk_dispatch_census_print);
     }
 }
 
@@ -17400,7 +17447,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const int fused_nodes = 1 + ctx->num_additional_fused_ops;
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
         if (enqueued && fusion_string) {
-            ggml_vk_fusion_census_add(fusion_string, fused_nodes);
+            ggml_vk_dispatch_census_add(fusion_string, fused_nodes);
         }
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -19125,15 +19172,18 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    // test hooks only (see ggml_vk_fusion_census_add)
-    if (strcmp(name, "ggml_backend_debug_fusion_census_reset") == 0) {
-        return (void *) ggml_backend_vk_fusion_census_reset;
+    // test hooks only (the dispatch census, see ggml_vk_dispatch_census_add)
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
+        return (void *) ggml_backend_vk_dispatch_census_reset;
     }
-    if (strcmp(name, "ggml_backend_debug_fusion_census_get") == 0) {
-        return (void *) ggml_backend_vk_fusion_census_get;
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_get") == 0) {
+        return (void *) ggml_backend_vk_dispatch_census_get;
     }
-    if (strcmp(name, "ggml_backend_debug_fusion_census_skip") == 0) {
-        return (void *) ggml_backend_vk_fusion_census_skip;
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_skip") == 0) {
+        return (void *) ggml_backend_vk_dispatch_census_skip;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
+        return (void *) ggml_backend_vk_dispatch_census_count;
     }
     return nullptr;
 }
@@ -19153,6 +19203,8 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
+        static const bool census_log = (ggml_vk_dispatch_census_log_init(), true);
+        GGML_UNUSED(census_log);
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
