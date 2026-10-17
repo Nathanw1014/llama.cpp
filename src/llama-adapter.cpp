@@ -6,6 +6,7 @@
 
 #include <map>
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -328,6 +329,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
         // device buft and device ctx
         const auto * model_tensor = model.get_tensor(name.c_str());
+        if (!model_tensor && !model.exl3.linears.empty() && str_endswith(name, ".weight") &&
+                model.get_tensor((name.substr(0, name.size() - strlen(".weight")) + ".exl3_trellis").c_str())) {
+            throw std::runtime_error("LoRA tensor '" + name + "' targets an EXL3 weight, which is not supported");
+        }
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }

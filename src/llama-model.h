@@ -685,6 +685,16 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// EXL3 linears (see ggml/exl3/README.md): the trellis tensor stands for the weight, its scales are found here
+struct llama_exl3_linear {
+    ggml_tensor * suh;
+    ggml_tensor * svh;
+};
+
+struct llama_exl3 {
+    std::unordered_map<const ggml_tensor *, llama_exl3_linear> linears; // trellis -> scales
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -695,6 +705,8 @@ struct llama_model {
     llama_vocab   vocab;
 
     llama_hadamard hdmd;
+
+    llama_exl3 exl3;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
@@ -931,6 +943,10 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: read the exl3.* metadata, and pair each EXL3 trellis with its scales after create_tensor made them
+    void load_hparams_exl3(llama_model_loader & ml);
+    void load_tensors_exl3();
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;
