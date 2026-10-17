@@ -7,7 +7,6 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -37,7 +36,13 @@ int main() {
     ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    // through the registry: with GGML_BACKEND_DL the CPU backend is a loadable module, not linked in
+    ggml_backend_load_all();
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!cpu) {
+        fprintf(stderr, "FAIL: no CPU backend\n");
+        return 1;
+    }
     ggml_backend_t backends[] = { cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
 
