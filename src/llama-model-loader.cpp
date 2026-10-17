@@ -1456,12 +1456,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const llama_tensor_weight * w = get_weight(tn.str().c_str());
         if (matmul_weight && dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && w) {
-            std::vector<uint16_t> vals(ggml_nelements(&t_meta));
-            const auto & file = files.at(w->idx);
-            file->seek(w->offs, SEEK_SET);
-            file->read_raw(vals.data(), vals.size() * sizeof(uint16_t));
             size_t n_rounded = 0;
-            if (llama_bf16_fits_f16(vals.data(), vals.size(), &n_rounded)) {
+            bool fits = true;
+            // the no_alloc (--fit) pass reads no data: it plans the tensor as f16, as a full load does for an exact one
+            if (!no_alloc) {
+                std::vector<uint16_t> vals(ggml_nelements(&t_meta));
+                const auto & file = files.at(w->idx);
+                file->seek(w->offs, SEEK_SET);
+                file->read_raw(vals.data(), vals.size() * sizeof(uint16_t));
+                fits = llama_bf16_fits_f16(vals.data(), vals.size(), &n_rounded);
+            }
+            if (fits) {
                 t_meta.type = GGML_TYPE_F16;   // same element size: ne/nb and the byte size are unchanged
                 f16_from_bf16.insert(tn.str());
                 f16_from_bf16_rounded += n_rounded;
@@ -1936,6 +1941,9 @@ bool llama_model_loader::load_all_data(
                 const auto & file = files.at(weight->idx);
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(src.data(), n_size);
+            }
+            if (check_tensors && !ggml_validate_row_data(GGML_TYPE_BF16, src.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
             }
             std::vector<ggml_fp16_t> dst(src.size());
             llama_bf16_to_f16_row(src.data(), dst.data(), src.size());
