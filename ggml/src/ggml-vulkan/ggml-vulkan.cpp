@@ -17036,6 +17036,11 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
     if (n_embd > 4096 || n_embd % 4 != 0 || res->ne[3] != 1 || hc * nt > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
         return false;
     }
+    // without a combine the chain is only the hc norm with several streams: a plain one-stream RMS_NORM -> MUL -> CPY(f16)
+    // stays on rms_norm + cpy, whose reduction order this kernel does not reproduce
+    if (!has_post && hc < 2) {
+        return false;
+    }
     if (res->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
         !ggml_are_same_shape(rms, res) || !ggml_are_same_shape(mul, rms) || !ggml_is_contiguous(mul)) {
         return false;
