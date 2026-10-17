@@ -571,25 +571,22 @@ static int64_t qwen4exp_hc_xn_pad() {
 
 // the f16 mixed stream needs an f16 B on every reader; Vulkan has no bf16 x f16 matmul, so a bf16 matmul weight keeps it f32
 static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
-    static std::mutex mtx;
-    static const llama_model * cached_model = nullptr;
-    static bool cached = false;
-    std::lock_guard<std::mutex> lock(mtx);
-    if (cached_model != &model) {
+    // the graph's model is the qwen4exp one; the count lives on it, so a freed and reallocated model is counted anew
+    const auto & m = static_cast<const llama_model_qwen4exp &>(model);
+    std::call_once(m.bf16_mm_once, [&m] {
         int n = 0;
-        for (const auto & it : model.tensors_by_name) {
+        for (const auto & it : m.tensors_by_name) {
             const ggml_tensor * t = it.second;
             if (t->type == GGML_TYPE_BF16 && ggml_n_dims(t) >= 2 && it.first.find("token_embd") == std::string::npos) {
                 ++n;
             }
         }
-        cached_model = &model;
-        cached = n > 0;
-        if (cached) {
+        m.bf16_mm = n > 0;
+        if (m.bf16_mm) {
             LLAMA_LOG_INFO("%s: %d bf16 matmul weights stay bf16: the hc mixed stream stays f32 (no bf16 x f16 matmul)\n", __func__, n);
         }
-    }
-    return cached;
+    });
+    return m.bf16_mm;
 }
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.

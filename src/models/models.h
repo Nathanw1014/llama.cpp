@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2561,6 +2562,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+    // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
+    mutable std::once_flag bf16_mm_once;
+    mutable bool           bf16_mm = false;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
