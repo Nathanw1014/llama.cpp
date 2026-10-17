@@ -2098,13 +2098,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // kernel, but the aligned loaders only need whole BK=32 K-tiles (K % 8 for the 8-wide f16 B loads), and ALIGNED=0 also
         // disables the register prefetch, so a GEMM with K % 128 != 0 would run the scalar-load, no-prefetch variant
         // (Flash-Next's hc up-GEMM, q5_0 10240xNx320: 1016 -> 650 us at op level on the fork). Default 32 on AMD + KHR
-        // coopmat; GGML_VK_MM_ALIGN_L=128 restores upstream, other values 32..128 for probing.
+        // coopmat; GGML_VK_MM_ALIGN_L=128 restores upstream, 32 or 64 for probing (whole BK=32 tiles only).
         if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2) {
             l_align = 32;
         }
         {
             static const uint32_t align_l_env = [] { const char * e = getenv("GGML_VK_MM_ALIGN_L"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
-            if (align_l_env >= 32 && align_l_env <= 128) {
+            if (align_l_env == 32 || align_l_env == 64 || align_l_env == 128) {
                 l_align = align_l_env;
             }
         }
