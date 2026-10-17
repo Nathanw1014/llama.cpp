@@ -6621,7 +6621,7 @@ struct test_mul_mat_cpy16 : public test_case {
 
 // HC_UP_MIX_F16 (wave 5; Vulkan fusion name HC_UP_MIX; not the HIP test_hc_up_mix below, which covers the unfused-graph chain): the qwen4exp hc up GEMM + f16 gate cast + gated hc pre, fused on Vulkan into one int8 MMQ GEMM whose epilogue
 // applies the mix (the gate is never written). x is the f16 hc norm output, optionally row-padded (LLAMA_HC_XN_PAD). The CPU reference
-// runs the unfused chain; bit-exactness against Vulkan's own unfused chain is test-hc-up-mix-exact. GGML_VK_TEST_REQUIRE_HC_UP_MIX=1
+// runs the unfused chain; bit-exactness against Vulkan's own unfused chain is test-vk-exact hc-up-mix. GGML_VK_TEST_REQUIRE_HC_UP_MIX=1
 // fails a case unless the fusion ran exactly once (knob-aware: none with GGML_VK_HC_UP_MIX=0).
 struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;

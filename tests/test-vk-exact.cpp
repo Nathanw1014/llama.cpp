@@ -1,22 +1,11 @@
-// f16 store exactness (wave 6b): a fused Vulkan dispatch that ends in f32 arithmetic and stores f16 must equal the unfused
-// chain, which stores the f32 result and then converts it (CPY / SET_ROWS / the f32 twin of the op + cast): two roundings,
-// f32 then f16. A store written D_TYPE(a * b) can be compiled into one single-rounding mixed-precision multiply (RADV/ACO), one
-// f16 ulp off in a few values per 100000.
-//
-// Per case: the fused graph and a reference graph over shared inputs (the reference keeps an intermediate as a graph output,
-// so the fusion cannot match, or flips the fusion's per-call knob), then
-//   byte-equal  fused f16 bytes == reference f16 bytes
-//   rte         fused f16 == RTE(the f32 value the same kernel family computes before the conversion), host conversion;
-//               separates rounding from accumulation order (n/a where no such f32 value exists)
-//   maxulp      largest f16 ulp distance fused vs reference
-//   on/off      fused-dispatch count of the fusion in the fused / reference graph (engagement; must be expect / 0)
-//   run2        the fused graph run again gives the same bytes
-//   control     one perturbed input changes the fused output (the comparison can fail)
-// Status: ok, FAIL, or acc-order: the reference is a chain whose reduction order differs from the fused kernel by design
-// (e.g. rms_norm_small vs rms_norm.comp), byte-equal is reported but not required there; every such line has a strict
-// same-kernel line next to it where one exists. Exit code 1 on any FAIL. Skips (exit 0) without a Vulkan device.
-//
+// Vulkan-vs-Vulkan exactness: fused dispatches must give the same bytes as the unfused chain on the same device, which
+// test-backend-ops (CPU reference + NMSE) cannot express. Groups (knobs a group sets are read once per process):
+//   f16-store  fused dispatches that store f16 == the unfused f32 store + convert (byte-equal, RTE, engagement, control)
+//   hc-up-mix  MUL_MAT + CPY(f16) + DSV4_HC_PRE fused as HC_UP_MIX == the unfused chain, GGML_VK_HC_UP_MIX=1 vs 0
+//   mmid-frag  manual coopmat fragment MUL_MAT_ID hashes, a tool: three runs compared by test-vk-exact-mmid-frag.py
+// Usage: test-vk-exact [group ...] (default: f16-store and hc-up-mix). Exit 1 on any FAIL, 0 (skipped) without Vulkan0.
 // Needs ggml_dsv4_hc_pre_gated_ext and the backend's dispatch census hooks, so it does not build on master.
+// GGML_VK_DISABLE_FUSION: no case expects a fused dispatch; the byte-equal and control checks still run.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -56,18 +45,11 @@ typedef void     (*fusion_reset_t)(void);
 
 static fusion_count_t g_count = nullptr;
 static fusion_reset_t g_reset = nullptr;
-static int g_n_ok = 0, g_n_acc = 0, g_n_fail = 0;
 
 static uint64_t fnv1a(const void * p, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; ++i) { h ^= ((const uint8_t *) p)[i]; h *= 1099511628211ull; }
     return h;
-}
-
-// distance in f16 ulps (sign-magnitude mapped onto a line)
-static int ulp16(ggml_fp16_t a, ggml_fp16_t b) {
-    auto key = [](ggml_fp16_t h) { return (h & 0x8000) ? -(int) (h & 0x7fff) : (int) h; };
-    return std::abs(key(a) - key(b));
 }
 
 static void set_vals(ggml_tensor * t, const std::vector<float> & v) {
@@ -82,6 +64,36 @@ static void set_vals(ggml_tensor * t, const std::vector<float> & v) {
         ggml_quantize_chunk(t->type, v.data(), q.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
         ggml_backend_tensor_set(t, q.data(), 0, q.size());
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// f16 store exactness (wave 6b): a fused Vulkan dispatch that ends in f32 arithmetic and stores f16 must equal the unfused
+// chain, which stores the f32 result and then converts it (CPY / SET_ROWS / the f32 twin of the op + cast): two roundings,
+// f32 then f16. A store written D_TYPE(a * b) can be compiled into one single-rounding mixed-precision multiply (RADV/ACO), one
+// f16 ulp off in a few values per 100000.
+//
+// Per case: the fused graph and a reference graph over shared inputs (the reference keeps an intermediate as a graph output,
+// so the fusion cannot match, or flips the fusion's per-call knob), then
+//   byte-equal  fused f16 bytes == reference f16 bytes
+//   rte         fused f16 == RTE(the f32 value the same kernel family computes before the conversion), host conversion;
+//               separates rounding from accumulation order (n/a where no such f32 value exists)
+//   maxulp      largest f16 ulp distance fused vs reference
+//   on/off      fused-dispatch count of the fusion in the fused / reference graph (engagement; must be expect / 0)
+//   run2        the fused graph run again gives the same bytes
+//   control     one perturbed input changes the fused output (the comparison can fail)
+// Status: ok, FAIL, or acc-order: the reference is a chain whose reduction order differs from the fused kernel by design
+// (e.g. rms_norm_small vs rms_norm.comp), byte-equal is reported but not required there; every such line has a strict
+// same-kernel line next to it where one exists.
+
+namespace f16_store {
+
+static int g_n_ok = 0, g_n_acc = 0, g_n_fail = 0;
+static bool g_fusion = true;
+
+// distance in f16 ulps (sign-magnitude mapped onto a line)
+static int ulp16(ggml_fp16_t a, ggml_fp16_t b) {
+    auto key = [](ggml_fp16_t h) { return (h & 0x8000) ? -(int) (h & 0x7fff) : (int) h; };
+    return std::abs(key(a) - key(b));
 }
 
 static void fill(ggml_tensor * t, std::mt19937 & rng, float lo, float hi) {
@@ -189,7 +201,7 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     ggml_backend_tensor_get(out_f, o_p.data(), 0, ne * 2);
     if (c.knob) set_env(c.knob, nullptr);
     const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
-    const bool engaged = c.fname == nullptr || (n_f == (uint64_t) c.expect && n_r == 0);
+    const bool engaged = c.fname == nullptr || (n_f == (g_fusion ? (uint64_t) c.expect : 0) && n_r == 0);
     const bool rte_ok = !c.rte || r_match == r_total;
     const bool beq = ndiff == 0;
     bool fail = !engaged || !run2 || !ctl || (c.strict && (!beq || !rte_ok));
@@ -588,19 +600,8 @@ static void case_rope_set_rows(ggml_backend_t be, bool norm, int mode, int64_t h
     ggml_free(ctx);
 }
 
-int main() {
-    // the routed f16-B pf path (mul_mm.comp MMID_SCALE d16) for iq3_xxs (no int8 MMQ pipeline) and q6_K; read once per process
-    set_env("GGML_VK_MMID_F16COOPMAT", "iq3_xxs,q6_K", false);
-    ggml_backend_load_all();
-    ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
-    if (!dev) { printf("test-f16-store-exact: no Vulkan0 device, skipped\n"); return 0; }
-    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    g_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
-    g_reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
-    if (!g_count || !g_reset) { printf("FAIL: no dispatch census counters\n"); return 1; }
-    printf("test-f16-store-exact: GGML_VK_MMID_F16COOPMAT=%s\n", getenv("GGML_VK_MMID_F16COOPMAT"));
-
+static int run(ggml_backend_t be, bool fusion) {
+    g_fusion = fusion;
     // Flash-Next (qwen4exp): n_embd 2560, 10 of 320 experts (32 here, for host quantization time), expert ffn 640 (768 for the
     // 256-block types), GDN 128 x 48, K/V heads 256 x 2 with an imrope over 64 dims, hc 4 x 2560, low rank 320; ubatch 2048 and
     // a ragged 130. Qwen3.6-35B-A3B: n_embd 2048, 8 experts of ffn 512, GDN 128 x 32.
@@ -648,7 +649,288 @@ int main() {
         case_rope_set_rows(be, true,  GGML_ROPE_TYPE_NORMAL, 128, 8, nt, 128);
     }
 
+    printf("f16-store: %s (%d ok, %d acc-order, %d FAIL)\n", g_n_fail ? "FAIL" : "OK", g_n_ok, g_n_acc, g_n_fail);
+    return g_n_fail;
+}
+
+} // namespace f16_store
+
+// ---------------------------------------------------------------------------------------------------------------------
+// HC_UP_MIX exactness (wave 5): the Vulkan backend fuses MUL_MAT(q8_0 hc up weight, lo) + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) into
+// one int8 MMQ GEMM whose epilogue applies the gated mix. It must be BIT-EXACT with the unfused chain (the fork's HC_UP_MIX was turned
+// off because a non-exact epilogue made cached multi-turn and full re-prefill diverge). Runs each shape with GGML_VK_HC_UP_MIX=1 and =0
+// (the backend reads the knob per graph), requires byte-equal mixed outputs and the expected fused-dispatch counts, then perturbs one
+// input as a positive control (the output must change).
+
+namespace hc_up_mix {
+
+struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; bool mix16 = false; };   // gate16 false: the f32-gate form; mix16: the f16 mixed stream (wave 6)
+
+static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
+    ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const int64_t M = 4 * sh.n_embd;
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.k, M);
+    ggml_tensor * lo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sh.k, sh.nt);
+    ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, M + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
+    ggml_tensor * x   = ggml_view_3d(ctx, xb, sh.n_embd, 4, sh.nt, sh.n_embd * sizeof(ggml_fp16_t), xb->nb[1], 0);
+    ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
+    ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
+    ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
+    ggml_tensor * mixed = ggml_dsv4_hc_pre_gated_ext(ctx, x, rs, 0.25f, sh.mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    const size_t es = ggml_element_size(mixed), nb_out = ggml_nbytes(mixed);   // f16 mixed: the float vectors below hold raw bytes
+    ggml_set_output(mixed);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, mixed);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) { fprintf(stderr, "FAIL: alloc\n"); return 1; }
+
+    std::mt19937 rng(1234 + (int) sh.n_embd + (int) sh.nt);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> wf(sh.k * M), lv(sh.k * sh.nt);
+    for (auto & v : wf) v = u(rng);
+    for (auto & v : lv) v = u(rng);
+    std::vector<uint8_t> wq(ggml_nbytes(w));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq.data(), 0, M, sh.k, nullptr);
+    std::vector<ggml_fp16_t> xv((M + sh.pad) * sh.nt);
+    for (auto & v : xv) v = ggml_fp32_to_fp16(u(rng));
+    ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+    ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
+    ggml_backend_tensor_set(xb, xv.data(), 0, xv.size() * sizeof(ggml_fp16_t));
+
+    std::vector<float> out_on(sh.n_embd * sh.nt), out_off(sh.n_embd * sh.nt), out_pert(sh.n_embd * sh.nt);
+    auto run = [&](const char * knob, std::vector<float> & out, uint64_t & n) {
+        set_env("GGML_VK_HC_UP_MIX", knob);
+        g_reset();
+        ggml_backend_graph_compute(be, gf);
+        n = g_count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");
+        ggml_backend_tensor_get(mixed, out.data(), 0, nb_out);
+    };
+    uint64_t n_on = 0, n_off = 0, n_p = 0;
+    run("1", out_on, n_on);
+    run("0", out_off, n_off);
+    int fails = 0;
+    const bool eq = memcmp(out_on.data(), out_off.data(), nb_out) == 0;
+    size_t ndiff = 0; for (size_t i = 0; i < out_on.size(); ++i) ndiff += memcmp((const char *) out_on.data() + i * es, (const char *) out_off.data() + i * es, es) != 0;
+    if (!eq) { fprintf(stderr, "FAIL n_embd=%lld nt=%lld k=%lld pad=%lld: fused != unfused in %zu of %zu values\n",
+                       (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, ndiff, out_on.size()); fails++; }
+    const bool want_fused = sh.expect_fused && fusion;
+    if (n_off != 0 || n_on != (want_fused ? 1u : 0u)) {
+        fprintf(stderr, "FAIL n_embd=%lld nt=%lld: HC_UP_MIX dispatches on=%llu off=%llu (expected %d / 0)\n",
+                (long long) sh.n_embd, (long long) sh.nt, (unsigned long long) n_on, (unsigned long long) n_off, want_fused ? 1 : 0); fails++; }
+    // positive control: one perturbed input must change the fused output (the comparison can fail)
+    lv[0] += 0.5f; ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
+    run("1", out_pert, n_p);
+    if (memcmp(out_on.data(), out_pert.data(), nb_out) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
+    printf("%s %s%s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok", sh.gate16 ? "f16-gate" : "f32-gate", sh.mix16 ? " f16-mix" : "",
+           (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, eq ? "yes" : "NO",
+           (unsigned long long) n_on, (unsigned long long) n_off, memcmp(out_on.data(), out_pert.data(), nb_out) ? "differs" : "SAME");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
+static int run(ggml_backend_t be, bool fusion) {
+    const shape shapes[] = {
+        {   64,   64,  96,   0, true },
+        {   64,  130,  96, 128, true },    // ragged N, padded x rows
+        { 2560, 2048, 320, 128, true },    // Flash-Next: hc_dim 10240, ub 2048, low rank 320, LLAMA_HC_XN_PAD 128
+        { 2560, 2051, 320, 128, true },    // the 2051 tail
+        {  128,    8,  96,   0, false },   // below the MUL_MAT_CPY16 shapes: unfused both ways, still byte-equal
+        // the f32-gate form (LLAMA_HC_GATE_F16=0): the unfused gate is the f32 accumulator, no rounding in the epilogue
+        {   64,  130,  96, 128, true, false },
+        { 2560, 2048, 320, 128, true, false },
+        { 2560, 2051, 320, 128, true, false },
+        {  128,    8,  96,   0, false, false },
+        // the f16 mixed stream (wave 6): both gate forms; the fused store and the unfused op both round once (RTE)
+        {   64,  130,  96, 128, true, false, true },
+        { 2560, 2051, 320, 128, true, false, true },
+        {   64,  130,  96, 128, true, true,  true },
+        { 2560, 2051, 320, 128, true, true,  true },
+    };
+    int fails = 0;
+    for (const auto & sh : shapes) fails += run_shape(be, sh, fusion);
+    printf("hc-up-mix: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails;
+}
+
+} // namespace hc_up_mix
+
+// ---------------------------------------------------------------------------------------------------------------------
+// MUL_MAT_ID manual coopmat fragments (GGML_VK_MMID_MANUAL_FRAG): per case, the output bytes of one MUL_MAT_ID graph on Vulkan0 as an
+// FNV-1a hash plus the dispatch census paths MUL_MAT_ID_ALL / MUL_MAT_ID_PF (coopmat register-prefetch and REG_A pipelines) /
+// MUL_MAT_ID_MANUAL_FRAG (the "_mf" builds). The manual-fragment choice is made once per device, so the comparison is across
+// processes: run `test-vk-exact mmid-frag` with the default (manual fragments where the RDNA3 layout probe passed), with
+// GGML_VK_MMID_MANUAL_FRAG=0 and with GGML_VK_TEST_MF_SKEW=1, then compare the hashes (tests/test-vk-exact-mmid-frag.py):
+//   default == off   on every case: the manual fragment reads give coopMatLoad's elements, so the WMMA sequence is the same
+//   skew != off      on every case that ran a "_mf" pipeline: the comparison can fail (positive control)
+//   mf / pf == 1     on the default run, 0 on the off run (engagement); rega_mf / rega == 1 likewise for the REG_A twins, and the
+//                    REG_A shapes (320 experts top-10 at n 2048 = 64 rows per expert) must run REG_A at all (rega > 0)
+// Inputs are seeded, so a process sees the same bytes every run. The routed f16-B coopmat path is forced (GGML_VK_MMID_F16COOPMAT=all)
+// so every type here reaches the pipelines that have an "_mf" build.
+
+namespace mmid_frag {
+
+
+static std::vector<float> randv(size_t n, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> v(n);
+    for (auto & x : v) x = u(rng);
+    return v;
+}
+
+enum epi { EPI_F32, EPI_CPY16, EPI_MUL_CPY16 };
+
+// a: [k, m, n_exp] experts; b: [k, n_used or 1 (bcast), n]; ids: [n_used, n] distinct experts per token
+static void run_case(ggml_backend_t be, ggml_type ta, ggml_type tb, int64_t m, int64_t k, int n_exp, int n_used, int64_t n,
+                     bool bcast, epi e, int64_t pad_b) {
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const int64_t nb_rows = bcast ? 1 : n_used;
+    ggml_tensor * a = ggml_new_tensor_3d(ctx, ta, k, m, n_exp);
+    // padded B rows: B is a view of a [k + pad_b, ...] tensor (the row stride a padded activation buffer gives)
+    ggml_tensor * bb = ggml_new_tensor_3d(ctx, tb, k + pad_b, nb_rows, n);
+    ggml_tensor * b = pad_b ? ggml_view_3d(ctx, bb, k, nb_rows, n, bb->nb[1], bb->nb[2], 0) : bb;
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+    ggml_tensor * out = ggml_mul_mat_id(ctx, a, b, ids);
+    if (e == EPI_MUL_CPY16) {
+        out = ggml_mul(ctx, out, w);
+    }
+    if (e != EPI_F32) {
+        out = ggml_cast(ctx, out, GGML_TYPE_F16);
+    }
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+    std::mt19937 rng(1234u + (uint32_t) ta * 7u + (uint32_t) m + (uint32_t) k + (uint32_t) n);
+    set_vals(a, randv(ggml_nelements(a), rng));
+    set_vals(bb, randv(ggml_nelements(bb), rng));
+    set_vals(w, randv(ggml_nelements(w), rng));
+    std::vector<int32_t> id((size_t) n_used * n);
+    std::vector<int> perm(n_exp);
+    for (int64_t t = 0; t < n; ++t) {
+        for (int i = 0; i < n_exp; ++i) perm[i] = i;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int u = 0; u < n_used; ++u) id[(size_t) t * n_used + u] = perm[u];
+    }
+    ggml_backend_tensor_set(ids, id.data(), 0, id.size() * sizeof(int32_t));
+
+    g_reset();
+    ggml_backend_graph_compute(be, gf);
+    ggml_backend_synchronize(be);
+    std::vector<uint8_t> bytes(ggml_nbytes(out));
+    ggml_backend_tensor_get(out, bytes.data(), 0, bytes.size());
+    const char * en = e == EPI_F32 ? "f32" : e == EPI_CPY16 ? "cpy16" : "mul_cpy16";
+    printf("case %s_x_%s m%lld k%lld E%d u%d n%lld %s %s pad%lld hash=%016llx all=%llu pf=%llu mf=%llu rega=%llu rega_mf=%llu\n",
+           ggml_type_name(ta), ggml_type_name(tb), (long long) m, (long long) k, n_exp, n_used, (long long) n, bcast ? "bcast" : "rows", en,
+           (long long) pad_b, (unsigned long long) fnv1a(bytes.data(), bytes.size()),
+           (unsigned long long) g_count("path:MUL_MAT_ID_ALL"), (unsigned long long) g_count("path:MUL_MAT_ID_PF"),
+           (unsigned long long) g_count("path:MUL_MAT_ID_MANUAL_FRAG"),
+           (unsigned long long) g_count("path:MUL_MAT_ID_REGA"), (unsigned long long) g_count("path:MUL_MAT_ID_REGA_MF"));
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
+static int run(ggml_backend_t be, bool fusion) {
+    GGML_UNUSED(fusion);
+    printf("mmid-frag: GGML_VK_MMID_MANUAL_FRAG=%s GGML_VK_TEST_MF_SKEW=%s\n",
+           getenv("GGML_VK_MMID_MANUAL_FRAG") ? getenv("GGML_VK_MMID_MANUAL_FRAG") : "(default)",
+           getenv("GGML_VK_TEST_MF_SKEW") ? getenv("GGML_VK_TEST_MF_SKEW") : "0");
+    // Flash-Next experts: gate/up iq3_xxs [2560 -> 640], down iq4_nl [640 -> 2560], 320 of them top-10 at ub 2048 (64 rows per
+    // expert: the REG_A medium tile), B broadcast for gate/up; q8_0 and the K-quants as the other pf types
+    for (ggml_type tb : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        run_case(be, GGML_TYPE_IQ3_XXS, tb, 640, 2560, 320, 10, 2048, true,  EPI_F32,       0);
+        run_case(be, GGML_TYPE_IQ3_XXS, tb, 640, 2560, 320, 10, 2048, true,  EPI_CPY16,     0);
+        run_case(be, GGML_TYPE_IQ4_NL,  tb, 2560, 640, 320, 10, 2048, false, EPI_MUL_CPY16, 0);
+        for (int64_t n : { 2048, 130 }) {
+            run_case(be, GGML_TYPE_Q8_0,    tb, 640, 2560, 32, 10, n, true,  EPI_F32,       0);
+            run_case(be, GGML_TYPE_IQ3_XXS, tb, 640, 2560, 32, 10, n, false, EPI_F32,       0);
+            run_case(be, GGML_TYPE_IQ4_NL,  tb, 2560, 640, 32, 10, n, false, EPI_MUL_CPY16, 0);
+            run_case(be, GGML_TYPE_Q4_K,    tb, 768, 2560, 32, 10, n, true,  EPI_F32,       0);
+            run_case(be, GGML_TYPE_Q6_K,    tb, 2560, 768, 32, 10, n, false, EPI_MUL_CPY16, 0);
+        }
+        // padded B rows, a k off the 64 alignment (unaligned pipeline: no _mf build, must be unchanged too)
+        run_case(be, GGML_TYPE_IQ3_XXS, tb, 640, 2560, 32, 10, 512, false, EPI_F32, 64);
+        run_case(be, GGML_TYPE_Q8_0,    tb, 640, 2592, 32, 10, 512, false, EPI_F32, 0);
+    }
+    printf("mmid-frag: done (compare three runs with test-vk-exact-mmid-frag.py)\n");
+    return 0;
+}
+
+} // namespace mmid_frag
+
+// the groups; mmid_f16coopmat: the GGML_VK_MMID_F16COOPMAT default the group sets (read once per process, kept if set)
+struct exact_group {
+    const char * name;
+    bool         by_default;
+    const char * mmid_f16coopmat;
+    int       (* run)(ggml_backend_t be, bool fusion);
+};
+
+static const exact_group groups[] = {
+    // the routed f16-B pf path (mul_mm.comp MMID_SCALE d16) for iq3_xxs (no int8 MMQ pipeline) and q6_K
+    { "f16-store", true,  "iq3_xxs,q6_K", f16_store::run },
+    { "hc-up-mix", true,  nullptr,        hc_up_mix::run },
+    // every type here reaches the pipelines that have an "_mf" build
+    { "mmid-frag", false, "all",          mmid_frag::run },
+};
+
+int main(int argc, char ** argv) {
+    std::vector<const exact_group *> sel;
+    for (int i = 1; i < argc; ++i) {
+        const exact_group * g = nullptr;
+        for (const auto & e : groups) {
+            if (strcmp(argv[i], e.name) == 0) g = &e;
+        }
+        if (!g) {
+            fprintf(stderr, "usage: %s [f16-store] [hc-up-mix] [mmid-frag]\n", argv[0]);
+            return 1;
+        }
+        sel.push_back(g);
+    }
+    if (sel.empty()) {
+        for (const auto & e : groups) {
+            if (e.by_default) sel.push_back(&e);
+        }
+    }
+    const char * f16coopmat = nullptr;
+    for (const auto * g : sel) {
+        if (g->mmid_f16coopmat && f16coopmat && strcmp(g->mmid_f16coopmat, f16coopmat) != 0) {
+            fprintf(stderr, "test-vk-exact: %s needs its own process (GGML_VK_MMID_F16COOPMAT=%s)\n", g->name, g->mmid_f16coopmat);
+            return 1;
+        }
+        f16coopmat = g->mmid_f16coopmat ? g->mmid_f16coopmat : f16coopmat;
+    }
+    if (f16coopmat) {
+        set_env("GGML_VK_MMID_F16COOPMAT", f16coopmat, false);
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
+    if (!dev) {
+        printf("test-vk-exact: no Vulkan0 device, skipped\n");
+        return 0;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    g_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
+    g_reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    if (!g_count || !g_reset) {
+        printf("FAIL: no dispatch census counters\n");
+        return 1;
+    }
+    const bool fusion = getenv("GGML_VK_DISABLE_FUSION") == nullptr;
+    printf("test-vk-exact: GGML_VK_MMID_F16COOPMAT=%s%s\n", getenv("GGML_VK_MMID_F16COOPMAT") ? getenv("GGML_VK_MMID_F16COOPMAT") : "(default)",
+           fusion ? "" : " GGML_VK_DISABLE_FUSION");
+
+    int fails = 0;
+    for (const auto * g : sel) {
+        fails += g->run(be, fusion);
+    }
     ggml_backend_free(be);
-    printf("test-f16-store-exact: %s (%d ok, %d acc-order, %d FAIL)\n", g_n_fail ? "FAIL" : "OK", g_n_ok, g_n_acc, g_n_fail);
-    return g_n_fail ? 1 : 0;
+    printf("test-vk-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails ? 1 : 0;
 }

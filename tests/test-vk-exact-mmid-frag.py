@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Compare three runs of test-mmid-manual-frag (see the .cpp): default (manual fragments where the layout probe passed),
+# Compare three runs of `test-vk-exact mmid-frag` (see the .cpp): default (manual fragments where the layout probe passed),
 # GGML_VK_MMID_MANUAL_FRAG=0 (coopMatLoad) and GGML_VK_TEST_MF_SKEW=1 (positive control).
-#   usage: test-mmid-manual-frag.py <default.log> <off.log> <skew.log>
+#   usage: test-vk-exact-mmid-frag.py <default.log> <off.log> <skew.log>
 # Exit 1 on any failed rule; every rule prints its counts, so a missing or empty run reads as a failure, never as a pass.
 import re
 import sys
