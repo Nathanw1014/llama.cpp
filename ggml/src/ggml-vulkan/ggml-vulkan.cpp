@@ -9202,7 +9202,6 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                         (unsigned) ne01, (unsigned) nei1, (unsigned) ne10, (unsigned) ne02, (unsigned) nei0, why);
             }
         };
-        const uint32_t rows_per_expert = (uint32_t) std::max<uint64_t>(1, (nei1 * nei0 + ne02 - 1) / ne02);
         if (quantize_y) {
             rega_reject("int8 MMQ route (GGML_VK_MMID_F16COOPMAT does not route this type, or the f16 cast is fused: d16 lives on MMQ)");
         } else if (glu) {
@@ -9213,7 +9212,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             rega_reject("not aligned (k vs the tile's align, or m / n <= 8)");
         } else if (!ggml_vk_mm_prefetch_enabled(ctx->device)) {
             rega_reject("prefetch pipelines off");
-        } else if (!ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, rows_per_expert)) {
+        } else if (!ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, n_for_tile)) {
             // the pf id map of iq3_xxs / iq4_nl carries two tiers (the large tile fails the shared-memory check with the LUT),
             // so the medium tile is found by its shape, not by index 1 of a three-entry map (tbo-f11: "fewer than 3 tiles")
             rega_reject("tile selector did not pick the medium tile for the rows per expert");
@@ -9229,6 +9228,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 rega_reject(d16 ? "no REG_A d16 pipeline for this (type, B type) key" : "no REG_A pipeline for this (type, B type) key: not created (shmem / acc support) or the B type differs");
             } else if (!itr->second[0].aligned) {
                 rega_reject("REG_A pipeline has no aligned variant");
+            } else if (itr->second[0].aligned->wg_denoms[1] != bn || ne10 % itr->second[0].align != 0) {
+                // the row map and max_tiles above are sized for the base tile's BN, and the REG_A K loop has no tail
+                rega_reject("REG_A tile BN differs from the base tile, or k is not a multiple of its align");
             } else if (d16 && itr->second[0].aligned->parameter_count != 6) {
                 rega_reject("REG_A d16 pipeline lacks the router-weight binding");
             } else {
