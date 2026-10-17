@@ -1455,9 +1455,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const bool matmul_weight = (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) && !(tn.suffix && strcmp(tn.suffix, "bias") == 0);
         if (matmul_weight && dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && get_weight(tn.str().c_str())) {
-            // planned as f16 and checked while load_all_data converts it; a tensor that is not exact goes back to bf16 there
-            t_meta.type = GGML_TYPE_F16;   // same element size: ne/nb and the byte size are unchanged
-            f16_from_bf16.insert(tn.str());
+            // planned as f16 and checked while load_all_data converts it; a tensor that is not exact goes back to bf16 there, so
+            // the buffer type chosen for bf16 must take the f16 weight as well
+            ggml_tensor t_f16 = t_meta;
+            t_f16.type = GGML_TYPE_F16;
+            if (weight_buft_supported(hparams, &t_f16, op, buft, dev)) {
+                t_meta.type = GGML_TYPE_F16;   // same element size: ne/nb and the byte size are unchanged
+                f16_from_bf16.insert(tn.str());
+            }
         }
     }
 
