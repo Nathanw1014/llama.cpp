@@ -5939,9 +5939,9 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
-        // needs the queues and the fence; the MUL_MAT_ID pipelines it gates take their SPIR-V in the second load_shaders
+        // needs the queues and the fence; the MUL_MAT_ID pipelines it gates (the "_mf" builds, REG_A) are created in the second load_shaders
         device->coopmat_rdna3_layout = ggml_vk_check_coopmat_rdna3_layout(device);
-        if (device->coopmat_rdna3_layout && ggml_vk_mmid_manual_frag_enabled()) {
+        if (device->coopmat_rdna3_layout && (ggml_vk_mmid_manual_frag_enabled() || ggml_vk_mmid_rega_enabled(device))) {
             ggml_vk_load_shaders(device);
         }
 
@@ -7507,11 +7507,11 @@ static bool ggml_vk_dense_ypad_camps(uint64_t k) {
 }
 
 // REG_A (PORT-MAP F, Halogen (Peonist) expert-loading design via the nathanw fork): register-direct A for the aligned
-// MUL_MAT_ID f16-coopmat tile of iq3_xxs / iq4_nl (mul_mm.comp MMID_REGA). GGML_VK_MMID_REGA=0 turns it off; default on for
-// AMD (the fragment element layout the loader assumes is gfx11's).
+// MUL_MAT_ID f16-coopmat tile of iq3_xxs / iq4_nl (mul_mm.comp MMID_REGA). GGML_VK_MMID_REGA=0 turns it off, =1 forces it on;
+// default on where the RDNA3 fragment layout probe passed (the loader writes A fragments in that layout by hand).
 static bool ggml_vk_mmid_rega_enabled(const vk_device& device) {
     static const int env = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : -1; }();
-    return env >= 0 ? env != 0 : device->vendor_id == VK_VENDOR_ID_AMD;
+    return env >= 0 ? env != 0 : device->coopmat_rdna3_layout;
 }
 
 static bool ggml_vk_mm_prefetch_type(ggml_type t) {
