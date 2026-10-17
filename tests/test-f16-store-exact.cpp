@@ -16,7 +16,7 @@
 // (e.g. rms_norm_small vs rms_norm.comp), byte-equal is reported but not required there; every such line has a strict
 // same-kernel line next to it where one exists. Exit code 1 on any FAIL. Skips (exit 0) without a Vulkan device.
 //
-// Uses only ops and knobs that exist before the store fix, so it builds on the unpatched tree (positive control).
+// Needs ggml_dsv4_hc_pre_gated_ext and the backend's dispatch census hooks, so it does not build on master.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
