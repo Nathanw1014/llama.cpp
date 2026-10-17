@@ -637,6 +637,15 @@ ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
     return it == bf16_twins.end() ? nullptr : it->second;
 }
 
+// the twins live outside the model's buffer list, so they are released here
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    for (ggml_backend_buffer_t buf : bf16_twin_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (ggml_context * ctx : bf16_twin_ctxs) {
+        ggml_free(ctx);
+    }
+}
 
 // decode-sized batches (<= 8 tokens take the mat-vec path): the bf16 twin of a weight where it exists, else the weight
 static ggml_tensor * qwen4exp_dec_weight(const llama_model & model, ggml_tensor * w, int64_t n_tokens, bool no_lora) {

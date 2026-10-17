@@ -2555,6 +2555,7 @@ struct llama_ple_disk;
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     class llm_graph_input_qsa;
     class llm_graph_input_qsa_k;
