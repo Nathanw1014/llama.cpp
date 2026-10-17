@@ -98,6 +98,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_ple_async;
 struct llama_mtp_draft_vocab;
 
 //
@@ -835,6 +836,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    llama_ple_async * ple_async = nullptr; // the context's PLE prefetch ring (qwen4exp), nullptr = none
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1078,6 +1081,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
+    llama_ple_async * ple_async; // nullptr = none
 
     const llm_graph_cb & cb_func;
 

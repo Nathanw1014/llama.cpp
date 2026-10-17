@@ -11,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-ple-async.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1877,16 +1878,16 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-// qwen4exp.cpp: the PLE row gather of a batch, run ahead of each ubatch on a worker thread (A1)
-void qwen4exp_ple_prefetch(const llama_model & model, const llama_batch & batch, uint32_t n_ubatch);
-void qwen4exp_ple_prefetch_end(const llama_model & model);
+// qwen4exp.cpp: the PLE row gather of a batch, run ahead of each ubatch on a worker thread into the context's ring
+void qwen4exp_ple_prefetch(const llama_model & model, const llama_batch & batch, uint32_t n_ubatch, std::unique_ptr<llama_ple_async> & ring);
+void qwen4exp_ple_prefetch_end(llama_ple_async * ring);
 
 struct qwen4exp_ple_prefetch_guard {
-    const llama_model & model;
-    explicit qwen4exp_ple_prefetch_guard(const llama_model & m) : model(m) {}
+    const std::unique_ptr<llama_ple_async> & ring;
+    explicit qwen4exp_ple_prefetch_guard(const std::unique_ptr<llama_ple_async> & r) : ring(r) {}
     ~qwen4exp_ple_prefetch_guard() {
-        if (model.arch == LLM_ARCH_QWEN4EXP) {
-            qwen4exp_ple_prefetch_end(model);
+        if (ring) {
+            qwen4exp_ple_prefetch_end(ring.get());
         }
     }
 };
@@ -1958,12 +1959,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // gather this batch's per-layer-embedding rows one ubatch ahead on a worker thread (A1, qwen4exp.cpp);
     // the guard ends the ring with this decode, whatever path leaves it
-    qwen4exp_ple_prefetch_guard ple_guard(model);
+    qwen4exp_ple_prefetch_guard ple_guard(ple_async);
     {
         // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
         const llama_batch & flat = balloc->get_batch();
         if (model.arch == LLM_ARCH_QWEN4EXP && flat.token) {
-            qwen4exp_ple_prefetch(model, flat, cparams.n_ubatch);
+            qwen4exp_ple_prefetch(model, flat, cparams.n_ubatch, ple_async);
         }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -2791,6 +2792,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.ple_async   =*/ ple_async.get(),
     };
 }
 

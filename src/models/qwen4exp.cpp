@@ -21,8 +21,8 @@
 
 // A1 (2026-10-10): PLE row gather ahead of each ubatch; defined below set_input, called from llama_context::decode
 static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst);
-void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & batch, uint32_t n_ubatch);
-void qwen4exp_ple_prefetch_end(const llama_model & model_base);
+void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & batch, uint32_t n_ubatch, std::unique_ptr<llama_ple_async> & ring);
+void qwen4exp_ple_prefetch_end(llama_ple_async * ring);
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -1771,6 +1771,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        ring = params.ple_async;
 
         const int64_t n_want = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
 
@@ -1796,6 +1797,9 @@ public:
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
+
+    // the context's ring of rows gathered ahead (qwen4exp_ple_prefetch), nullptr = gather here
+    llama_ple_async * ring = nullptr;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -1862,7 +1866,7 @@ static void qwen4exp_ple_advise(const llama_model_qwen4exp & pmodel, const llama
 // bytes are those of the synchronous gather; a token whose predecessors are not in the batch (the first n_gram-1 of a
 // continued sequence) or that sits in a batch of several sequences falls back to the synchronous gather.
 // LLAMA_PLE_ASYNC=0 restores the page-cache advice thread above.
-void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & batch, uint32_t n_ubatch) {
+void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & batch, uint32_t n_ubatch, std::unique_ptr<llama_ple_async> & ring) {
     // llama_context::decode calls this for every architecture, so the downcast below is only valid
     // once the arch is known: on any other model it reads ple_disk out of an unrelated object and
     // dereferences whatever that happens to hold.
@@ -1949,16 +1953,12 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & b
         return;
     }
 
-    std::shared_ptr<llama_ple_async> async;
-    {
-        std::lock_guard<std::mutex> lock(pmodel.ple_async_mutex);
-        if (!pmodel.ple_async) {
-            const llama_model_qwen4exp * pm = &pmodel;   // the ring is a member of the model, so it never outlives it
-            pmodel.ple_async = std::make_shared<llama_ple_async>(n_heads, hp.ple_head_dim,
-                    [pm](const int32_t * rows, size_t n_rows, float * dst) { qwen4exp_ple_gather_sync(*pm, rows, n_rows, dst); });
-        }
-        async = pmodel.ple_async;
+    if (!ring) {
+        const llama_model_qwen4exp * pm = &pmodel;   // the ring belongs to a context, which never outlives its model
+        ring = std::make_unique<llama_ple_async>(n_heads, hp.ple_head_dim,
+                [pm](const int32_t * rows, size_t n_rows, float * dst) { qwen4exp_ple_gather_sync(*pm, rows, n_rows, dst); });
     }
+    llama_ple_async * async = ring.get();
     static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
     if (stats) {
         fprintf(stderr, "ple_async: batch of %" PRId64 " tokens, %" PRId64 " unknown here, window %u\n", n, n_unknown, n_ubatch);
@@ -1968,12 +1968,7 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_batch & b
 
 // end of the llama_decode that started the ring: nothing of a batch outlives it (a later cache edit, slot switch or
 // rollback changes the predecessors, and a ring that never hits is a silent regression, not a wrong answer)
-void qwen4exp_ple_prefetch_end(const llama_model & model_base) {
-    if (model_base.arch != LLM_ARCH_QWEN4EXP) {
-        return;
-    }
-    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
-    std::shared_ptr<llama_ple_async> async = pmodel.ple_async;
+void qwen4exp_ple_prefetch_end(llama_ple_async * async) {
     if (async && async->active()) {
         static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
         if (stats) {
@@ -2188,7 +2183,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // everything else is gathered here as before.
         static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
         static const bool check = getenv("LLAMA_PLE_ASYNC_CHECK") != nullptr && atoi(getenv("LLAMA_PLE_ASYNC_CHECK")) != 0;
-        std::shared_ptr<llama_ple_async> async = pmodel.ple_async;
+        llama_ple_async * async = ring;
         if (async && async->active()) {
             const int64_t t0 = ggml_time_us();
             std::vector<uint8_t> miss;
@@ -2324,6 +2319,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+    ple_inp->ring = ple_async;
 
     const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
     ggml_tensor * rows = nullptr;
