@@ -7711,8 +7711,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (can_quantize_y && !d16 && !hcm && ggml_vk_mm_prefetch_enabled(ctx->device) &&
         ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, src1->type == GGML_TYPE_F16)) {
         can_quantize_y = false;
-        if (src1->type == GGML_TYPE_F16) {
-            ggml_vk_path_census_add("MUL_MAT_F16B_NATIVE");   // engagement read: dense GEMMs that took the f16-B path with an f16 B
+        // engagement read: f16-B GEMMs routed by GGML_VK_DENSE_F16B_NATIVE only (not also by the GGML_VK_DENSE_F16COOPMAT list)
+        if (src1->type == GGML_TYPE_F16 && !ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, false)) {
+            ggml_vk_path_census_add("MUL_MAT_F16B_NATIVE");
         }
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
