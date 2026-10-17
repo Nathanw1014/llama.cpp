@@ -73,13 +73,14 @@ int64_t llama_ple_async::consume(const int32_t * idx, int64_t n, float * dst, st
     const int64_t c1 = std::min(c0 + n, n_tokens);   // tokens past the batch end are plain misses
 
     const auto t0 = std::chrono::steady_clock::now();
+    int64_t avail;
     {
         std::unique_lock<std::mutex> lk(mtx);
         cv.wait(lk, [&] { return done || produced >= c1; });
+        avail = std::min(c1, produced);               // a stopped worker may have produced less
     }
     st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-    const int64_t avail = std::min(c1, produced);     // a stopped worker may have produced less
     const size_t  tok_bytes = (size_t) n_heads * dim * sizeof(float);
 
     int64_t hits = 0;
