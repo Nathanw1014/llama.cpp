@@ -578,6 +578,21 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
+// the parameters of a tensor: an EXL3 trellis [16*K, n/16, k/16] holds the k x n weights of a linear, its scale vectors hold none
+static int64_t llama_tensor_n_params(const ggml_tensor * t) {
+    const std::string name = ggml_get_name(t);
+    auto ends_with = [&](const char * suffix) {
+        const size_t n = strlen(suffix);
+        return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    if (ends_with(".exl3_trellis")) {
+        return t->ne[1]*16 * t->ne[2]*16;
+    }
+    if (ends_with(".exl3_suh") || ends_with(".exl3_svh")) {
+        return 0;
+    }
+    return ggml_nelements(t);
+}
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -638,7 +653,7 @@ llama_model_loader::llama_model_loader(
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
-            n_elements += ggml_nelements(cur);
+            n_elements += llama_tensor_n_params(cur);
             n_bytes    += ggml_nbytes(cur);
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
@@ -704,7 +719,7 @@ llama_model_loader::llama_model_loader(
                     if (weights_map.find(tensor_name) != weights_map.end()) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                     }
-                    n_elements += ggml_nelements(cur);
+                    n_elements += llama_tensor_n_params(cur);
                     n_bytes    += ggml_nbytes(cur);
                     weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
                 }
@@ -751,7 +766,7 @@ llama_model_loader::llama_model_loader(
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
-            n_elements += ggml_nelements(cur);
+            n_elements += llama_tensor_n_params(cur);
             n_bytes    += ggml_nbytes(cur);
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
@@ -780,7 +795,7 @@ llama_model_loader::llama_model_loader(
                 if (weights_map.find(cur->name) != weights_map.end()) {
                     throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                 }
-                n_elements += ggml_nelements(cur);
+                n_elements += llama_tensor_n_params(cur);
                 n_bytes    += ggml_nbytes(cur);
                 weights_map.emplace(cur->name, llama_tensor_weight(nullptr, 0, metadata, cur));
             }
