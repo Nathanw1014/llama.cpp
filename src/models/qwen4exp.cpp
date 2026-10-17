@@ -562,20 +562,14 @@ ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t 
     return *slot;
 }
 
-// LLAMA_HC_XN_PAD=N (f16 elements, rounded down to a multiple of 8; default 128, 0 = off): the f16 hc norm output (xn) gets a
-// token stride of hc_dim + N. Flash-Next's hc_dim 10240 f16 is 80 x 256 B, so packed, every token row starts on the same DRAM
-// channel for the readers that walk xn token by token (the inject mat-vec, the hc pre mix); 10368 is 81 x 256 B. The norm writes
-// the padded rows directly (HC_POST_GATE_NORM_CPY / RMS_NORM_MUL_CPY store through the token stride) and the readers take
-// the stride (the down GEMM quantizes B through it, the swapped inject mat-vec steps A rows by it, DSV4_HC_PRE reads it), so
-// nothing copies xn back to packed rows.
+// LLAMA_HC_XN_PAD=N (f16 elements, multiple of 8, default 128, 0 = off): xn token stride hc_dim + N, so packed 80 x 256 B rows
+// (Flash-Next) do not all start on one DRAM channel; the norm writes and every reader reads through the stride, no repack
 static int64_t qwen4exp_hc_xn_pad() {
     static const int64_t pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
     return pad > 0 ? pad : 0;
 }
 
-// The f16 mixed stream needs every matmul weight that reads it to take an f16 B. A bf16 weight left as bf16 (LLAMA_BF16_TO_F16=0,
-// or a value past the f16 range) has no bf16 x f16 matmul on Vulkan (test-backend-ops MUL_MAT_F16B bf16: not supported), so the
-// scheduler would run that GEMM on the CPU. Any bf16 matmul weight in the model keeps the stream f32 (checked once per model).
+// the f16 mixed stream needs an f16 B on every reader; Vulkan has no bf16 x f16 matmul, so a bf16 matmul weight keeps it f32
 static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
     static std::mutex mtx;
     static const llama_model * cached_model = nullptr;
@@ -623,19 +617,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     xn = ggml_mul(ctx0, xn, w_norm_hc);
-    // Prefill: the norm output is an [hc_dim, T] tensor written once and read three times (inject, down, HC pre),
-    // 84 MB per pass for Flash-Next at a 2048-token ubatch. Where the backend takes it, store it as f16: the cast
-    // directly follows the MUL, so a backend that fuses the combine (or norm) with the cast writes f16 only.
+    // prefill: xn is written once and read three times (84 MB per Flash-Next ubatch of 2048); stored f16 where the backend
+    // takes it, the cast right after the MUL so a fused combine / norm writes f16 only
     const bool norm_f16 = cparams.fused_dsv4_hc_norm_f16 && cparams.fused_dsv4_hc_pre && il >= 0 && nt >= 32 &&
                           loras->empty();
     bool xn_padded = false;
     if (norm_f16 && qwen4exp_hc_xn_pad() > 0) {
-        // one buffer per graph (pad_buf): every reader of this layer's xn precedes the next layer's norm through the
-        // residual stream, and the backend orders the next layer's overlapping write behind them
+        // one buffer per graph: this layer's readers precede the next layer's norm through the residual stream
         ggml_tensor * buf = pad_buf(&hc_xn_pad_buf, hc_dim + qwen4exp_hc_xn_pad(), nt, "hc_xn_pad");
         ggml_tensor * dst = ggml_view_3d(ctx0, buf, n_embd, hc, nt, n_embd * ggml_element_size(buf), buf->nb[1], 0);
-        // the destination's VIEW node goes into the graph now, ahead of the norm chain: expanded from the CPY it would land
-        // between the MUL and the CPY, and the norm + cast fusions (consecutive nodes) would fall back to the unfused chain
+        // the VIEW node goes in now: expanded from the CPY it would split the MUL and the CPY and break the norm fusions
         ggml_build_forward_expand(gf, dst);
         xn = ggml_cpy(ctx0, xn, dst);
         xn_padded = true;
@@ -664,9 +655,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
-    // Prefill, on the f16 norm graph: store the gate as f16. The cast directly follows the up GEMM, so a backend that fuses
-    // MUL_MAT + CPY(f16) writes f16 from the accumulator and the [hc_dim, T] f32 gate (84 MB on Flash-Next at a 2048-token
-    // ubatch) is neither written nor read: the gated HC pre reads the f16 gate (LLAMA_HC_GATE_F16=1; default off, the f32 gate fuses as HC_UP_MIX_F32G).
+    // LLAMA_HC_GATE_F16=1 (default off; the f32 gate fuses as HC_UP_MIX_F32G): the gate cast right after the up GEMM, so
+    // MUL_MAT + CPY(f16) stores f16 from the accumulator and the 84 MB f32 gate is never written
     const bool gate_f16 = norm_f16 && cparams.fused_dsv4_hc_gate_f16;
     if (gate_f16) {
         gate = ggml_cast(ctx0, gate, GGML_TYPE_F16);
@@ -676,11 +666,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
-        // every consumer of the mixed stream is a matmul B operand (attention / GDN in-projections, router, shared and
-        // routed experts), so store it as f16: the GEMMs read it without a q8_1 quantise or an f32 -> f16 staging pass.
-        // LLAMA_HC_MIX_F16=0 keeps f32; LLAMA_HC_MIX_F16_MINN (default 0) = the smallest ubatch that takes it.
-        // The f16 store needs the f16 hc norm output (norm_f16), which already requires nt >= 32, so the effective rule
-        // is f16 at nt >= 32, f32 at decode / MTP verify; MINN only raises that floor.
+        // every reader of the mixed stream is a matmul B, so it is stored f16 with the f16 norm (nt >= 32; LLAMA_HC_MIX_F16=0
+        // keeps f32, LLAMA_HC_MIX_F16_MINN raises the floor): no q8_1 quantise or f16 staging pass in the GEMMs
         static const bool mix_f16_on = [] { const char * e = getenv("LLAMA_HC_MIX_F16"); return e == nullptr || atoi(e) != 0; }();
         static const int64_t mix_f16_minn = [] { const char * e = getenv("LLAMA_HC_MIX_F16_MINN"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
         const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn && !qwen4exp_has_bf16_matmul_weight(model)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -907,21 +894,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
-    // f16 output norm at prefill (cparams.fused_gdn_norm_f16, probe-resolved; LLAMA_GDN_NORM_F16=0 opts out): emit RMS_NORM,
-    // MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan backend runs as one pass (RMS_NORM_MUL_SIGMUL_CPY)
-    // writing only the f16 B operand of ssm_out: no sigmoid pass, no f32 norm output and no B conversion in the GEMM
-    // (Flash-Next REAP-320: +2-3% prefill, PPL 3.7972 vs 3.7973).
-    // The GEMM's B was rounded to 8 bits from f32 before; now from f16. Prefill only (32+ tokens, as the probe), no LoRA
-    // (a LoRA delta takes no f16 B), and not for a bf16 out projection (no bf16 x f16 shader).
+    // f16 output norm at prefill (fused_gdn_norm_f16; no LoRA, no bf16 ssm_out): the chain back to back so Vulkan runs it as
+    // one RMS_NORM_MUL_SIGMUL_CPY pass writing only ssm_out's f16 B (Flash-Next REAP-320: +2-3% prefill, PPL 3.7972 vs 3.7973)
     const ggml_tensor * w_out = model.layers[layer].ssm_out;
     if (cparams.fused_gdn_norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16) {
         ggml_build_forward_expand(gf, gate);   // gate's own view nodes go ahead of the chain
         ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
-        // LLAMA_GDN_NORM_PAD=N (f16 elements, rounded down to a multiple of 8; default 128, 0 = off): write the f16 rows with a
-        // token stride of value_dim + N, only where the packed stride camps (a multiple of 256 B sharing a factor of 8+ with
-        // the 16 channels). Flash-Next's value_dim 6144 f16 is 48 x 256 B, so packed, every token row starts on the same DRAM
-        // channel for ssm_out; 6272 is 49 x 256 B. One buffer per graph (pad_buf), shared by the GDN layers.
+        // LLAMA_GDN_NORM_PAD=N (as LLAMA_HC_XN_PAD): token stride value_dim + N where the packed rows all start on one DRAM
+        // channel (256 B multiples sharing a factor of 8+ with the 16 channels, Flash-Next's 48 x 256 B); one buffer per graph
         static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
         const int64_t row = out->ne[0] * out->ne[1];
         if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {

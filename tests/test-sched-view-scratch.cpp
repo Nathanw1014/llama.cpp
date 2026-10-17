@@ -1,9 +1,5 @@
-// ggml_backend_sched with a scratch tensor written only through views: a graph-built tensor (no buffer, not an input)
-// whose first reader in the graph is a VIEW node, as qwen4exp's padded destinations are (LLAMA_HC_XN_PAD /
-// LLAMA_GDN_NORM_PAD: one f16 buffer per graph, its VIEW expanded ahead of the norm chain so the fusions stay adjacent).
-// Before the pass-4 fix the view node took the first supporting backend while its source stayed unassigned, and the
-// reserve asserted in ggml_gallocr_allocate_node (buffer_id >= 0): every launch with a padded
-// destination aborted in the --fit probe. CPU backend only, one backend: the assignment path is the same.
+// ggml_backend_sched with a scratch tensor reached only through views (qwen4exp's padded destinations): its VIEW node
+// must place the source, else the reserve asserts buffer_id >= 0 in ggml_gallocr_allocate_node. One CPU backend suffices.
 
 #include "ggml.h"
 #include "ggml-backend.h"

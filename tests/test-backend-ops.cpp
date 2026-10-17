@@ -4207,15 +4207,8 @@ struct test_mmb_quant_hc : test_case {
 };
 
 
-// qwen4exp gated hc combine followed by the next mix's grouped norm, as the model emits it: SCALE -> SIGMOID -> SCALE ->
-// DSV4_HC_POST (identity mix), the gamma reshape, RMS_NORM -> MUL (-> CPY f16), then the norm's three readers (the hc
-// inject f32 projection, a quantized down projection, the gated HC pre). Vulkan fuses the combine and the norm
-// (HC_POST_GATE_NORM / _CPY) or, with no combine in front, the norm and the cast (RMS_NORM_MUL_CPY).
-// mode: 0 combine + f32 norm, 1 combine + f16 norm, 2 f16 norm of a plain input (no combine),
-//       3 combine + f16 norm with an extra reader of the f32 MUL (the cast must not fuse; the combine + f32 norm may)
-// pad > 0 (modes 1 and 2): the f16 norm is written into a view of one [hc*embd + pad, tokens] buffer (LLAMA_HC_XN_PAD) and
-// its readers take the token stride; on Vulkan the norm must still fuse and the GEMM / mat-vec read the rows in place
-// (with GGML_VK_TEST_REQUIRE_HC_POST_NORM=1 the test fails if the chain runs unfused or the readers copy xn back to packed rows)
+// qwen4exp gated hc combine + the next grouped norm (+ CPY f16) and its three readers, in model order. mode: 0 f32 norm,
+// 1 f16 norm, 2 f16 norm without the combine, 3 an extra f32 reader (no cast fusion); pad > 0: LLAMA_HC_XN_PAD rows
 struct test_hc_post_norm : public test_case {
     const int embd, hc, tokens, mode;
     const ggml_type type_down;
@@ -4326,10 +4319,8 @@ struct test_hc_post_norm : public test_case {
     }
 };
 
-// quantized weights x an f16 B (the f16 hc norm into the hc down GEMM): int8 MMQ quantizes the f16 B directly
-// pad > 0: B is a view of a [k + pad, n] buffer (rows packed, row stride k + pad: the padded hc xn / GDN norm rows); Vulkan
-// must read it in place (int8 MMQ quantizes through the stride, an f16 A's GEMM reads B through stride_b), counted with
-// GGML_VK_TEST_REQUIRE_ROWSTRIDE=1
+// quantized weights x an f16 B (the f16 hc norm into the hc down GEMM); pad > 0: B rows with a k + pad stride (padded
+// xn / GDN norm), read in place on Vulkan
 struct test_mul_mat_f16b : public test_case {
     const ggml_type type_a;
     const int m, n, k;
@@ -4667,12 +4658,8 @@ struct test_rms_norm_mul_mul : public test_case {
     }
 };
 
-// RMS_NORM + MUL(gamma) + SIGMOID(z) + MUL + CPY(f16), then the ssm_out projection: the qwen4exp GDN output norm under
-// LLAMA_GDN_NORM_F16, in the node order qwen4exp emits (Vulkan fuses the five as RMS_NORM_MUL_SIGMUL_CPY, writing only
-// the f16 rows). pad > 0: the f16 rows land in a view of one [ne0*ne1 + pad, ne2] buffer (LLAMA_GDN_NORM_PAD), its VIEW
-// node ahead of the chain, and ssm_out reads them through the stride. Allocated through the scheduler so graph_optimize
-// runs (it must keep the chain together). GGML_VK_TEST_REQUIRE_GDN_NORM=1: fails unless the fused norm ran (and, padded at
-// prefill widths, the row-strided B).
+// the qwen4exp GDN output norm (LLAMA_GDN_NORM_F16) in model order, then ssm_out; pad > 0: LLAMA_GDN_NORM_PAD rows. Through
+// the scheduler, so graph_optimize runs and must keep the chain together
 struct test_gdn_norm_f16 : public test_case {
     const std::array<int64_t, 3> ne;   // head_v_dim, heads, tokens
     const int64_t pad;
@@ -6630,10 +6617,8 @@ struct test_mul_mat_cpy16 : public test_case {
     }
 };
 
-// HC_UP_MIX_F16 (Vulkan fusion name HC_UP_MIX; not the HIP test_hc_up_mix below, which covers the unfused-graph chain): the qwen4exp hc up GEMM + f16 gate cast + gated hc pre, fused on Vulkan into one int8 MMQ GEMM whose epilogue
-// applies the mix (the gate is never written). x is the f16 hc norm output, optionally row-padded (LLAMA_HC_XN_PAD). The CPU reference
-// runs the unfused chain; bit-exactness against Vulkan's own unfused chain is test-vk-exact hc-up-mix. GGML_VK_TEST_REQUIRE_HC_UP_MIX=1
-// fails a case unless the fusion ran exactly once (knob-aware: none with GGML_VK_HC_UP_MIX=0).
+// qwen4exp hc up GEMM + f16 gate cast + gated hc pre (Vulkan: HC_UP_MIX in one int8 MMQ epilogue; test_hc_up_mix below is
+// the HIP chain); bit-exactness against Vulkan's own unfused chain is test-vk-exact hc-up-mix
 struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;
     const bool gate16;   // false: the f32-gate form (LLAMA_HC_GATE_F16=0, no cast; Vulkan fusion name HC_UP_MIX_F32G)
@@ -7389,10 +7374,8 @@ struct test_moe_prefill : public test_case {
     }
 };
 
-// f16 MoE activations (build_moe_ffn with cparams.fused_moe_f16): up/gate expert GEMMs cast to f16, f16 SwiGLU,
-// down expert GEMM with the f16 B, router-weight MUL cast to f16, combine summing the f16 slices in f32 (ggml_add_cast,
-// then f32 + f16 adds). Vulkan fuses MUL_MAT_ID(+MUL)+CPY(f16) and the f16-source MULTI_ADD.
-// part: 0 = the whole block, 1 = up/gate + cast only, 2 = down (+ MUL) + cast from an f16 B only, 3 = the combine only.
+// f16 MoE activations as build_moe_ffn emits them with fused_moe_f16. part: 0 the whole block, 1 up/gate + casts,
+// 2 down (+ MUL) + cast from an f16 B, 3 the f32 combine of the f16 slices
 struct test_moe_f16 : public test_case {
     const ggml_type type_gu;
     const ggml_type type_down;
@@ -7496,11 +7479,8 @@ struct test_moe_f16 : public test_case {
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
-// MUL_MAT_ID (+ MUL by the router weights) + CPY(f16): the MoE gate/up (no mul) and weighted down projections at prefill
-// storing f16 from the accumulator (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16), with the f32 B of the gate/up and the f16 B
-// the down projection feeds. Int8 MMQ twins by default; the routed f16-B pf twins under GGML_VK_MMID_F16COOPMAT.
-// GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 fails the case unless exactly one fused dispatch ran (the chain run unfused matches the CPU
-// too, so the counter is the only proof of engagement).
+// MUL_MAT_ID (+ MUL by the router weights) + CPY(f16): the MoE gate/up and weighted down projections storing f16 from the
+// accumulator (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16); the unfused chain matches too, hence the engagement opt-in
 struct test_mul_mat_id_cpy16 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -12916,11 +12896,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, true, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true));
-    // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
-    // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
-    // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1
-    // (types: the int8 MMQ legacy / K-quant / q6_K stores, the routed iq3_xxs / iq4_nl pf; the store does not depend on the A
-    // loader, which test_mul_mat_id and the dense pf cases cover)
+    // MUL_MAT_ID (+ MUL) + CPY(f16), f32 and f16 B, exact and ragged tiles: one type per store (int8 legacy / K / q6_K, the routed
+    // iq3_xxs / iq4_nl pf); the A loaders are test_mul_mat_id's and the dense pf cases'
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
         for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  256,  64,  640));
@@ -14483,12 +14460,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
-    // Flash-Next REAP-320 expert shapes at ub2048 (320 experts, top-10, 64 rows per expert): the MMID tile selector takes the medium
-    // tile here, which is the only place the REG_A (register-direct A, 128x64, wave32) pipeline engages on iq3_xxs / iq4_nl; both B
-    // types, since the in-model B can be either (an engagement count of 0 here means REG_A untested)
-    // GGML_VK_TEST_REQUIRE_REGA=1 (with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all): each of these must
-    // run at least one MUL_MAT_ID_REGA dispatch on Vulkan, else it fails; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken
-    // (registered with the opt-in only: without it they are plain test_mul_mat_id cases of the cpy16 shapes)
+    // Flash-Next REAP-320 shapes (64 rows per expert): the only medium tile where REG_A engages on iq3_xxs / iq4_nl; registered
+    // with GGML_VK_TEST_REQUIRE_REGA=1 only (with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all), else plain duplicates
     if (env_opt_in("GGML_VK_TEST_REQUIRE_REGA")) {
         test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
         test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));

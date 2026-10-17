@@ -765,10 +765,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
-        // The f16 hc norm exists only on the fused HC pre path, for ubatches of 32+ tokens per sequence, and only
-        // when every layer runs on an accelerator (it pays off where the combine kernel stores the norm as f16,
-        // which no CPU path does). The probe keeps it only where the layer's device takes the f16 norm in
-        // DSV4_HC_PRE and in the hc inject / down matmuls; elsewhere the graph is the f32 one.
+        // f16 hc norm: fused HC pre path, 32+ tokens per sequence, every layer off the CPU (no CPU path stores it f16); kept
+        // only where the layer's device takes the f16 x in DSV4_HC_PRE and the f16 B in the inject / down matmuls
         bool hc_pre_f16_devs = true;
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
             ggml_backend_dev_t dev = model.dev_layer(il);
@@ -788,10 +786,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fmoe16) {
-        // The f16 MoE activations pay off where the expert GEMMs store f16 themselves, which no CPU path does, so
-        // they need 32+ tokens per sequence and every layer on a non-CPU device. The probe then keeps them only where
-        // the layer's device takes the f16 B in the expert down projection (CUDA/HIP reject a quantized MUL_MAT_ID
-        // with an f16 B, so they keep the f32 graph).
+        // f16 MoE activations: 32+ tokens per sequence, every layer off the CPU, kept only where the expert down projection
+        // takes the f16 B (CUDA/HIP reject a quantized MUL_MAT_ID with an f16 B and keep the f32 graph)
         bool moe_f16_devs = true;
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
             ggml_backend_dev_t dev = model.dev_layer(il);
@@ -810,9 +806,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fgdnn16) {
-        // The f16 GDN output norm pays off where the norm kernel stores f16 itself, which no CPU path does: 32+ tokens per
-        // sequence and every layer on a non-CPU device. The probe then keeps it only where the layer's device takes the f16 B
-        // in the ssm_out projection (elsewhere the graph is the f32 one).
+        // f16 GDN output norm: 32+ tokens per sequence, every layer off the CPU, kept only where ssm_out takes the f16 B
         bool gdn_f16_devs = model.arch == LLM_ARCH_QWEN4EXP;   // the only graph that emits it: no probe reserve for others
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
             ggml_backend_dev_t dev = model.dev_layer(il);

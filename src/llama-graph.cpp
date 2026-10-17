@@ -2336,11 +2336,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    // f16 expert activations at prefill (cparams.fused_moe_f16, probe-resolved; LLAMA_MOE_F16=0 opts out): each expert
-    // projection is cast to f16 right after the GEMM (the backend stores f16 from the accumulator: MUL_MAT_ID(+MUL)+CPY),
-    // the GLU runs f16 in / f16 out, the down projection takes the f16 B, and the combine sums the f16 expert outputs in
-    // f32. Plain SwiGLU on separate gate/up experts only (no biases, scales, clamp or LoRA), and only on QWEN4EXP, the one
-    // arch with a PPL/KLD check of the f16 chain; other MoE archs need their own before they are added here.
+    // f16 expert activations at prefill (fused_moe_f16): casts right after the GEMMs, f16 GLU and down B, f32 combine. Plain
+    // SwiGLU only, and only QWEN4EXP, the one arch with a PPL/KLD check of the f16 chain
     const bool moe_f16_arch = arch == LLM_ARCH_QWEN4EXP;
     const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
         type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&

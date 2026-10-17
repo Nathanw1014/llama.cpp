@@ -1,11 +1,6 @@
-// Vulkan-vs-Vulkan exactness: fused dispatches must give the same bytes as the unfused chain on the same device, which
-// test-backend-ops (CPU reference + NMSE) cannot express. Groups (knobs a group sets are read once per process):
-//   f16-store  fused dispatches that store f16 == the unfused f32 store + convert (byte-equal, RTE, engagement, control)
-//   hc-up-mix  MUL_MAT + CPY(f16) + DSV4_HC_PRE fused as HC_UP_MIX == the unfused chain, GGML_VK_HC_UP_MIX=1 vs 0
-//   mmid-frag  manual coopmat fragment MUL_MAT_ID hashes, a tool: three runs compared by test-vk-exact-mmid-frag.py
-// Usage: test-vk-exact [group ...] (default: f16-store and hc-up-mix). Exit 1 on any FAIL, 0 (skipped) without Vulkan0.
-// Needs ggml_dsv4_hc_pre_gated_ext and the backend's dispatch census hooks, so it does not build on master.
-// GGML_VK_DISABLE_FUSION: no case expects a fused dispatch; the byte-equal and control checks still run.
+// Vulkan fused dispatches byte-equal with the unfused chain on the same device (test-backend-ops compares against the CPU).
+// Usage: test-vk-exact [f16-store] [hc-up-mix] [mmid-frag] (default: the first two; mmid-frag is a tool for its .py).
+// Exit 1 on any FAIL, 0 without Vulkan0; with GGML_VK_DISABLE_FUSION no case expects a fused dispatch.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -67,23 +62,9 @@ static void set_vals(ggml_tensor * t, const std::vector<float> & v) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// f16 store exactness: a fused Vulkan dispatch that ends in f32 arithmetic and stores f16 must equal the unfused
-// chain, which stores the f32 result and then converts it (CPY / SET_ROWS / the f32 twin of the op + cast): two roundings,
-// f32 then f16. A store written D_TYPE(a * b) can be compiled into one single-rounding mixed-precision multiply (RADV/ACO), one
-// f16 ulp off in a few values per 100000.
-//
-// Per case: the fused graph and a reference graph over shared inputs (the reference keeps an intermediate as a graph output,
-// so the fusion cannot match, or flips the fusion's per-call knob), then
-//   byte-equal  fused f16 bytes == reference f16 bytes
-//   rte         fused f16 == RTE(the f32 value the same kernel family computes before the conversion), host conversion;
-//               separates rounding from accumulation order (n/a where no such f32 value exists)
-//   maxulp      largest f16 ulp distance fused vs reference
-//   on/off      fused-dispatch count of the fusion in the fused / reference graph (engagement; must be expect / 0)
-//   run2        the fused graph run again gives the same bytes
-//   control     one perturbed input changes the fused output (the comparison can fail)
-// Status: ok, FAIL, or acc-order: the reference is a chain whose reduction order differs from the fused kernel by design
-// (e.g. rms_norm_small vs rms_norm.comp), byte-equal is reported but not required there; every such line has a strict
-// same-kernel line next to it where one exists.
+// f16-store: a fused dispatch storing f16 must round like the unfused f32 store + convert (RADV can fold D_TYPE(a * b) into
+// one single-rounding multiply). Per case: byte-equal, rte (vs RTE of the kernel's f32 value), engagement, run2, control;
+// acc-order: the reference reduces in another order by design, byte-equal reported but not required.
 
 namespace f16_store {
 
@@ -394,10 +375,8 @@ static void case_hc_post_norm(ggml_backend_t be, int64_t n_embd, int64_t nt) {
     ggml_free(ctx);
 }
 
-// RMS_NORM + MUL + CPY(f16) on the hc norm kernel without the combine (HC_NORM_ROWS_CPY, fusion name RMS_NORM_MUL_CPY): the
-// qwen4exp hc norm [n_embd, hc, nt] with a [n_embd, hc] gamma. No f32 twin of this kernel is reachable from a graph, so the
-// reference is the unfused chain (rms_norm.comp reduction order): acc-order allowed; the store line is the one the strict
-// HC_POST_GATE_NORM_CPY case checks.
+// RMS_NORM + MUL + CPY(f16) on the hc norm kernel (RMS_NORM_MUL_CPY): no f32 twin is reachable from a graph, so acc-order;
+// its store is the one the strict HC_POST_GATE_NORM_CPY case checks
 static void case_hc_norm_rows(ggml_backend_t be, int64_t n_embd, int64_t hc, int64_t nt) {
     ggml_context * ctx = new_ctx();
     ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
@@ -490,10 +469,8 @@ static std::vector<int64_t> cache_rows(int64_t nt, int64_t kv) {
     return iv;
 }
 
-// RMS_NORM + VIEW + SET_ROWS into an f16 KV cache (RMS_NORM_VIEW_SET_ROWS, rms_norm_set_rows_f32_f16). byte-equal: the whole
-// cache against the unfused chain (RMS_NORM f32 output, SET_ROWS f32 -> f16) with the same rows; rte: against the same kernel
-// writing an f32 cache (rms_norm_set_rows_f32_f32). Rows <= 256 wide take rms_norm_small.comp unfused (another reduction
-// order): acc-order allowed there; wider rows run rms_norm.comp both ways and are strict.
+// RMS_NORM + VIEW + SET_ROWS into an f16 KV cache vs the unfused chain; rte vs the same kernel writing f32. Rows <= 256 run
+// rms_norm_small.comp unfused (acc-order), wider rows are strict
 static void case_norm_set_rows(ggml_backend_t be, int64_t hd, int64_t nh, int64_t nt) {
     const int64_t kv = 4096;
     ggml_context * ctx = new_ctx();
@@ -536,10 +513,8 @@ static void case_norm_set_rows(ggml_backend_t be, int64_t hd, int64_t nh, int64_
     ggml_free(ctx);
 }
 
-// The rope KV write into an f16 cache: ROPE + VIEW + SET_ROWS (ROPE_VIEW_SET_ROWS, rope_*_f32_f16) or, norm = true,
-// RMS_NORM + MUL + ROPE + VIEW + SET_ROWS (RMS_NORM_MUL_ROPE_VIEW_SET_ROWS, rms_norm_mul_rope_f32_f16). Strict reference: the
-// rope output is a graph output (ROPE f32, or the same norm+rope kernel RMS_NORM_MUL_ROPE in f32), then SET_ROWS f32 -> f16.
-// rte: the cache rows against RTE of that reference rope output. multi: ggml_rope_multi (mode IMROPE / MROPE).
+// (RMS_NORM + MUL +) ROPE + VIEW + SET_ROWS into an f16 cache; strict reference: the rope (or norm + rope) output in f32,
+// then SET_ROWS; rte against that output
 static void case_rope_set_rows(ggml_backend_t be, bool norm, int mode, int64_t hd, int64_t nh, int64_t nt, int n_dims) {
     const int64_t kv = 4096;
     const bool multi = (mode & GGML_ROPE_TYPE_MROPE) != 0;
@@ -656,11 +631,8 @@ static int run(ggml_backend_t be, bool fusion) {
 } // namespace f16_store
 
 // ---------------------------------------------------------------------------------------------------------------------
-// HC_UP_MIX exactness: the Vulkan backend fuses MUL_MAT(q8_0 hc up weight, lo) + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) into
-// one int8 MMQ GEMM whose epilogue applies the gated mix. It must be BIT-EXACT with the unfused chain (a non-exact
-// epilogue makes cached multi-turn and full re-prefill diverge). Runs each shape with GGML_VK_HC_UP_MIX=1 and =0
-// (the backend reads the knob per graph), requires byte-equal mixed outputs and the expected fused-dispatch counts, then perturbs one
-// input as a positive control (the output must change).
+// hc-up-mix: HC_UP_MIX (hc up GEMM + gated hc pre in one int8 MMQ epilogue) must be bit-exact with the unfused chain, or
+// cached multi-turn and a full re-prefill diverge; GGML_VK_HC_UP_MIX=1 vs 0 per shape, engagement and a positive control
 
 namespace hc_up_mix {
 
@@ -757,17 +729,8 @@ static int run(ggml_backend_t be, bool fusion) {
 } // namespace hc_up_mix
 
 // ---------------------------------------------------------------------------------------------------------------------
-// MUL_MAT_ID manual coopmat fragments (GGML_VK_MMID_MANUAL_FRAG): per case, the output bytes of one MUL_MAT_ID graph on Vulkan0 as an
-// FNV-1a hash plus the dispatch census paths MUL_MAT_ID_ALL / MUL_MAT_ID_PF (coopmat register-prefetch and REG_A pipelines) /
-// MUL_MAT_ID_MANUAL_FRAG (the "_mf" builds). The manual-fragment choice is made once per device, so the comparison is across
-// processes: run `test-vk-exact mmid-frag` with the default (manual fragments where the RDNA3 layout probe passed), with
-// GGML_VK_MMID_MANUAL_FRAG=0 and with GGML_VK_TEST_MF_SKEW=1, then compare the hashes (tests/test-vk-exact-mmid-frag.py):
-//   default == off   on every case: the manual fragment reads give coopMatLoad's elements, so the WMMA sequence is the same
-//   skew != off      on every case that ran a "_mf" pipeline: the comparison can fail (positive control)
-//   mf / pf == 1     on the default run, 0 on the off run (engagement); rega_mf / rega == 1 likewise for the REG_A twins, and the
-//                    REG_A shapes (320 experts top-10 at n 2048 = 64 rows per expert) must run REG_A at all (rega > 0)
-// Inputs are seeded, so a process sees the same bytes every run. The routed f16-B coopmat path is forced (GGML_VK_MMID_F16COOPMAT=all)
-// so every type here reaches the pipelines that have an "_mf" build.
+// mmid-frag: MUL_MAT_ID output hashes and pf / _mf / REG_A path counts, compared across a default, a
+// GGML_VK_MMID_MANUAL_FRAG=0 and a GGML_VK_TEST_MF_SKEW=1 process: default == off, skew != off where _mf ran, mf == pf
 
 namespace mmid_frag {
 
