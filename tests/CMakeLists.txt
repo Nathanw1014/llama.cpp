@@ -323,10 +323,12 @@ if (NOT GGML_BACKEND_DL)
     endif()
     if (GGML_EXL3)
         # EXL3 decode self-test, kept next to the decoder under ggml/exl3
-        llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c
-                             ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
-                             NAME test-exl3)
-        target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3 ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+        llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c NAME test-exl3)
+        target_link_libraries(test-exl3 PRIVATE exl3-sha256)
+        target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3)
+        # EXL3 model directory importer, common/exl3-dir.cpp
+        llama_build_and_test(test-exl3-dir.cpp)
+        target_link_libraries(test-exl3-dir PRIVATE exl3-sha256)
     endif()
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)

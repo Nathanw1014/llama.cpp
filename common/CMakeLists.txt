@@ -133,6 +133,17 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+if (GGML_EXL3)
+    # -m DIR: an exllamav3 EXL3 model directory, imported while loading
+    target_sources(${TARGET} PRIVATE exl3-dir.cpp exl3-dir.h)
+    # sha256 from the gguf-hash deps (the fork has no vendor::hash target); test-exl3 and test-exl3-dir use it too
+    add_library(exl3-sha256 OBJECT ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c)
+    target_include_directories(exl3-sha256 PUBLIC ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+    set_target_properties(exl3-sha256 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(${TARGET} PRIVATE exl3-sha256)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_USE_EXL3)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
