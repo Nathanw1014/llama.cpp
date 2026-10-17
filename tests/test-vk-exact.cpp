@@ -67,7 +67,7 @@ static void set_vals(ggml_tensor * t, const std::vector<float> & v) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// f16 store exactness (wave 6b): a fused Vulkan dispatch that ends in f32 arithmetic and stores f16 must equal the unfused
+// f16 store exactness: a fused Vulkan dispatch that ends in f32 arithmetic and stores f16 must equal the unfused
 // chain, which stores the f32 result and then converts it (CPY / SET_ROWS / the f32 twin of the op + cast): two roundings,
 // f32 then f16. A store written D_TYPE(a * b) can be compiled into one single-rounding mixed-precision multiply (RADV/ACO), one
 // f16 ulp off in a few values per 100000.
@@ -656,15 +656,15 @@ static int run(ggml_backend_t be, bool fusion) {
 } // namespace f16_store
 
 // ---------------------------------------------------------------------------------------------------------------------
-// HC_UP_MIX exactness (wave 5): the Vulkan backend fuses MUL_MAT(q8_0 hc up weight, lo) + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) into
-// one int8 MMQ GEMM whose epilogue applies the gated mix. It must be BIT-EXACT with the unfused chain (the fork's HC_UP_MIX was turned
-// off because a non-exact epilogue made cached multi-turn and full re-prefill diverge). Runs each shape with GGML_VK_HC_UP_MIX=1 and =0
+// HC_UP_MIX exactness: the Vulkan backend fuses MUL_MAT(q8_0 hc up weight, lo) + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) into
+// one int8 MMQ GEMM whose epilogue applies the gated mix. It must be BIT-EXACT with the unfused chain (a non-exact
+// epilogue makes cached multi-turn and full re-prefill diverge). Runs each shape with GGML_VK_HC_UP_MIX=1 and =0
 // (the backend reads the knob per graph), requires byte-equal mixed outputs and the expected fused-dispatch counts, then perturbs one
 // input as a positive control (the output must change).
 
 namespace hc_up_mix {
 
-struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; bool mix16 = false; };   // gate16 false: the f32-gate form; mix16: the f16 mixed stream (wave 6)
+struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; bool mix16 = false; };   // gate16 false: the f32-gate form; mix16: the f16 mixed stream
 
 static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
     ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -742,7 +742,7 @@ static int run(ggml_backend_t be, bool fusion) {
         { 2560, 2048, 320, 128, true, false },
         { 2560, 2051, 320, 128, true, false },
         {  128,    8,  96,   0, false, false },
-        // the f16 mixed stream (wave 6): both gate forms; the fused store and the unfused op both round once (RTE)
+        // the f16 mixed stream: both gate forms; the fused store and the unfused op both round once (RTE)
         {   64,  130,  96, 128, true, false, true },
         { 2560, 2051, 320, 128, true, false, true },
         {   64,  130,  96, 128, true, true,  true },

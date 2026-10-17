@@ -362,7 +362,7 @@ llama_context::llama_context(
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_norm_f16 = true;
-    cparams.fused_dsv4_hc_gate_f16 = false;   // default off (wave 4 ABBA: +1.4% d0, -3.1% d8k); LLAMA_HC_GATE_F16=1 opts in
+    cparams.fused_dsv4_hc_gate_f16 = false;   // default off (A/B: +1.4% at depth 0, -3.1% at depth 8k); LLAMA_HC_GATE_F16=1 opts in
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;

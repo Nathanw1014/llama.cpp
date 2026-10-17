@@ -4346,13 +4346,13 @@ struct test_mul_mat_f16b : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        // wave 6 (A): GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
+        // GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
         // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
         const bool req_native = engagement_required(backend, "GGML_VK_TEST_REQUIRE_F16B_NATIVE");
         static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
-            // the counter also counts the wave-4 dense router (GGML_VK_DENSE_F16COOPMAT, default q4_K / q5_K / q6_K / iq4_xs) when B is f16
+            // the counter also counts the dense router (GGML_VK_DENSE_F16COOPMAT, default q4_K / q5_K / q6_K / iq4_xs) when B is f16
             static const char * dl = getenv("GGML_VK_DENSE_F16COOPMAT");
             const bool dense_default = dl == nullptr && (type_a == GGML_TYPE_Q4_K || type_a == GGML_TYPE_Q5_K || type_a == GGML_TYPE_Q6_K || type_a == GGML_TYPE_IQ4_XS);
             if (dl != nullptr && type_a != GGML_TYPE_Q8_0) {
@@ -5596,7 +5596,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t pad;         // > 0: x is a [n_embd, n_hc, n_tokens] view of a [n_embd*n_hc + pad, n_tokens] buffer
                                // (LLAMA_HC_XN_PAD rows; 128 = the shipped pad, 2048 = a stride that camps again)
     const ggml_type type_gate; // f16: the f16 gate (LLAMA_HC_GATE_F16), gated with an f16 x only
-    const ggml_type type_out;  // f16: the f16 mixed stream (wave 6, ggml_dsv4_hc_pre_gated_ext), gated with an f16 x only
+    const ggml_type type_out;  // f16: the f16 mixed stream (ggml_dsv4_hc_pre_gated_ext), gated with an f16 x only
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6630,14 +6630,14 @@ struct test_mul_mat_cpy16 : public test_case {
     }
 };
 
-// HC_UP_MIX_F16 (wave 5; Vulkan fusion name HC_UP_MIX; not the HIP test_hc_up_mix below, which covers the unfused-graph chain): the qwen4exp hc up GEMM + f16 gate cast + gated hc pre, fused on Vulkan into one int8 MMQ GEMM whose epilogue
+// HC_UP_MIX_F16 (Vulkan fusion name HC_UP_MIX; not the HIP test_hc_up_mix below, which covers the unfused-graph chain): the qwen4exp hc up GEMM + f16 gate cast + gated hc pre, fused on Vulkan into one int8 MMQ GEMM whose epilogue
 // applies the mix (the gate is never written). x is the f16 hc norm output, optionally row-padded (LLAMA_HC_XN_PAD). The CPU reference
 // runs the unfused chain; bit-exactness against Vulkan's own unfused chain is test-vk-exact hc-up-mix. GGML_VK_TEST_REQUIRE_HC_UP_MIX=1
 // fails a case unless the fusion ran exactly once (knob-aware: none with GGML_VK_HC_UP_MIX=0).
 struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;
     const bool gate16;   // false: the f32-gate form (LLAMA_HC_GATE_F16=0, no cast; Vulkan fusion name HC_UP_MIX_F32G)
-    const bool mix16;    // true: the f16 mixed stream (wave 6, LLAMA_HC_MIX_F16; HC_UP_MIX stores f16)
+    const bool mix16;    // true: the f16 mixed stream (LLAMA_HC_MIX_F16; HC_UP_MIX stores f16)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_UP_MIX_F16"; }
     std::string vars() override {
@@ -7498,7 +7498,7 @@ struct test_moe_f16 : public test_case {
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 // MUL_MAT_ID (+ MUL by the router weights) + CPY(f16): the MoE gate/up (no mul) and weighted down projections at prefill
 // storing f16 from the accumulator (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16), with the f32 B of the gate/up and the f16 B
-// the down projection feeds. Int8 MMQ twins by default; the routed f16-B pf twins under GGML_VK_MMID_F16COOPMAT (wave 4).
+// the down projection feeds. Int8 MMQ twins by default; the routed f16-B pf twins under GGML_VK_MMID_F16COOPMAT.
 // GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 fails the case unless exactly one fused dispatch ran (the chain run unfused matches the CPU
 // too, so the counter is the only proof of engagement).
 struct test_mul_mat_id_cpy16 : public test_case {
@@ -12884,7 +12884,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, 0,   GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64,   true, GGML_TYPE_F16, 128, GGML_TYPE_F16));
-    // the f16 mixed stream (wave 6, LLAMA_HC_MIX_F16): f32 and f16 gate, padded xn, the Flash-Next ubatch
+    // the f16 mixed stream (LLAMA_HC_MIX_F16): f32 and f16 gate, padded xn, the Flash-Next ubatch
     test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F32, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64,   true, GGML_TYPE_F16, 128, GGML_TYPE_F32, GGML_TYPE_F16));
@@ -12911,14 +12911,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false));
     test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8, false));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false));
-    // the f16 mixed stream (wave 6): both gate forms
+    // the f16 mixed stream: both gate forms
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, true, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true));
     // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
     // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
-    // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 (wave 4)
+    // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1
     // (types: the int8 MMQ legacy / K-quant / q6_K stores, the routed iq3_xxs / iq4_nl pf; the store does not depend on the A
     // loader, which test_mul_mat_id and the dense pf cases cover)
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
@@ -14485,8 +14485,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     // Flash-Next REAP-320 expert shapes at ub2048 (320 experts, top-10, 64 rows per expert): the MMID tile selector takes the medium
     // tile here, which is the only place the REG_A (register-direct A, 128x64, wave32) pipeline engages on iq3_xxs / iq4_nl; both B
-    // types, since the in-model B is f16 on the fork line and f32 on halo-box (an engagement count of 0 here means REG_A untested)
-    // GGML_VK_TEST_REQUIRE_REGA=1 (the wave-3 filler, with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all): each of these must
+    // types, since the in-model B can be either (an engagement count of 0 here means REG_A untested)
+    // GGML_VK_TEST_REQUIRE_REGA=1 (with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all): each of these must
     // run at least one MUL_MAT_ID_REGA dispatch on Vulkan, else it fails; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken
     // (registered with the opt-in only: without it they are plain test_mul_mat_id cases of the cpy16 shapes)
     if (env_opt_in("GGML_VK_TEST_REQUIRE_REGA")) {
@@ -15910,7 +15910,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         return test_cases;
     }
 
-    // R1 (10-10): is the halo-box hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
+    // is the qwen4exp hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
     // 20480-B row stride of xn? packed vs the shipped 128-element pad vs a 2048-element pad that lands on a camping stride again
     for (int64_t pad : {0, 128, 2048}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, pad));

@@ -2751,7 +2751,7 @@ extern "C" {
             struct ggml_tensor  * gate,
             float                 scale);
 
-    // the gated form with an f32 or f16 output (out_type): the mixed stream as an f16 matmul B (wave 6)
+    // the gated form with an f32 or f16 output (out_type): the mixed stream as an f16 matmul B
     GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,

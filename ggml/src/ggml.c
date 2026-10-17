@@ -6615,7 +6615,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         float                 scale,
         bool                  gated,
         enum ggml_type        out_type) {
-    // wave 6: the gated form may write an f16 mixed stream (every consumer is a matmul B operand; the release's hc_mix_ext)
+    // the gated form may write an f16 mixed stream (every consumer is a matmul B operand)
     GGML_ASSERT(out_type == GGML_TYPE_F32 || (gated && out_type == GGML_TYPE_F16));
     // the gated form also takes an f16 x and an f16 gate (backends opt in through supports_op)
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));

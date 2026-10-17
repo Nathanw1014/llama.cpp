@@ -567,7 +567,7 @@ ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t 
 // channel for the readers that walk xn token by token (the inject mat-vec, the hc pre mix); 10368 is 81 x 256 B. The norm writes
 // the padded rows directly (HC_POST_GATE_NORM_CPY / RMS_NORM_MUL_CPY store through the token stride) and the readers take
 // the stride (the down GEMM quantizes B through it, the swapped inject mat-vec steps A rows by it, DSV4_HC_PRE reads it), so
-// nothing copies xn back to packed rows. Port of the fork's 78a909a80 in the fixed one-buffer-per-graph form (f355c9e6d).
+// nothing copies xn back to packed rows.
 static int64_t qwen4exp_hc_xn_pad() {
     static const int64_t pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
     return pad > 0 ? pad : 0;
@@ -676,11 +676,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
-        // wave 6 (B): every consumer of the mixed stream is a matmul B operand (attention / GDN in-projections, router, shared and
-        // routed experts), so store it as f16: the GEMMs read it without a q8_1 quantise or an f32 -> f16 staging pass (the
-        // release's hc_mix_ext). LLAMA_HC_MIX_F16=0 keeps f32; LLAMA_HC_MIX_F16_MINN (default 0) = the smallest ubatch that takes it.
-        // The f16 store needs the f16 hc norm output (norm_f16), which already requires nt >= 32 (as in wave 5), so the effective rule
-        // is the release's: f16 at nt >= 32, f32 at decode / MTP verify; MINN only raises that floor.
+        // every consumer of the mixed stream is a matmul B operand (attention / GDN in-projections, router, shared and
+        // routed experts), so store it as f16: the GEMMs read it without a q8_1 quantise or an f32 -> f16 staging pass.
+        // LLAMA_HC_MIX_F16=0 keeps f32; LLAMA_HC_MIX_F16_MINN (default 0) = the smallest ubatch that takes it.
+        // The f16 store needs the f16 hc norm output (norm_f16), which already requires nt >= 32, so the effective rule
+        // is f16 at nt >= 32, f32 at decode / MTP verify; MINN only raises that floor.
         static const bool mix_f16_on = [] { const char * e = getenv("LLAMA_HC_MIX_F16"); return e == nullptr || atoi(e) != 0; }();
         static const int64_t mix_f16_minn = [] { const char * e = getenv("LLAMA_HC_MIX_F16_MINN"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
         const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn && !qwen4exp_has_bf16_matmul_weight(model)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -909,8 +909,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     // f16 output norm at prefill (cparams.fused_gdn_norm_f16, probe-resolved; LLAMA_GDN_NORM_F16=0 opts out): emit RMS_NORM,
     // MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan backend runs as one pass (RMS_NORM_MUL_SIGMUL_CPY)
-    // writing only the f16 B operand of ssm_out: no sigmoid pass, no f32 norm output and no B conversion in the GEMM (port
-    // of the fork's GDN norm f16, Strata's GDN_NOY; FN REAP-320 on the fork, 10-07: +2-3% prefill, PPL 3.7972 vs 3.7973).
+    // writing only the f16 B operand of ssm_out: no sigmoid pass, no f32 norm output and no B conversion in the GEMM
+    // (Flash-Next REAP-320: +2-3% prefill, PPL 3.7972 vs 3.7973).
     // The GEMM's B was rounded to 8 bits from f32 before; now from f16. Prefill only (32+ tokens, as the probe), no LoRA
     // (a LoRA delta takes no f16 B), and not for a bf16 out projection (no bf16 x f16 shader).
     const ggml_tensor * w_out = model.layers[layer].ssm_out;
