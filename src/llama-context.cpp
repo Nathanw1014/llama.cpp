@@ -788,8 +788,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fmoe16) {
         // f16 MoE activations: 32+ tokens per sequence, every layer off the CPU, kept only where the expert down projection
         // takes the f16 B (CUDA/HIP reject a quantized MUL_MAT_ID with an f16 B and keep the f32 graph)
-        bool moe_f16_devs = true;
-        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        bool moe_f16_devs = model.arch == LLM_ARCH_QWEN4EXP;   // build_moe_ffn's f16 arch list: no probe reserve or log for others
+        for (uint32_t il = 0; moe_f16_devs && il < model.hparams.n_layer(); ++il) {
             ggml_backend_dev_t dev = model.dev_layer(il);
             if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 moe_f16_devs = false;
