@@ -586,7 +586,8 @@ ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
         std::vector<ggml_bf16_t> dst;
         std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
         for (ggml_tensor * t : ws) {
-            if (t->buffer == nullptr || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+            // a weight on a host buffer runs on the CPU, whose bf16 matmul also rounds the activations to bf16
+            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
                 continue;
             }
             src.resize(ggml_nelements(t));
