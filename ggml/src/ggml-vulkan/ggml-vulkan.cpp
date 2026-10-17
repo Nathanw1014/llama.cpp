@@ -7984,9 +7984,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    // column stride in bytes of the B buffer: raw src1 keeps its own stride, staging buffers are tightly packed
+    // column stride in bytes of the B buffer: raw src1 keeps its own stride, staging buffers are packed (f16 rows y_row apart)
     const uint64_t b_col_bytes = (y_needs_reformat || qy_needs_dequant || quantize_y)
-        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1) : (uint64_t)ne10 * sizeof(ggml_fp16_t))
+        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1) : (uint64_t)y_row * sizeof(ggml_fp16_t))
         : (uint64_t)src1->nb[1];
 
     // compute
@@ -8003,7 +8003,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ne01, ne11, ne10,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
-            b_col_bytes, (uint64_t)dst->nb[1]
+            b_col_bytes, (uint64_t)od->nb[1]
         );  // NOLINT
     }
 
