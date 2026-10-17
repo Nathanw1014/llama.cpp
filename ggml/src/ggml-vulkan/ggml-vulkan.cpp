@@ -7446,9 +7446,13 @@ static bool ggml_vk_mmq_f16_y_enabled() {
 // Register-prefetch KHR coopmat matmuls (mul_mm_pf_funcs.glsl, port of the nathanw fork GEMM rewrite): the K loop issues the
 // next tile's global loads before the WMMAs and dequantises them one iteration later, with 8-wide dword loaders for the
 // 2-byte-aligned block types. GGML_VK_MM_PREFETCH=0 turns it off (default on for RADV); the pipelines exist for q8_0, q5_0,
-// q3_K, q6_K, q4_K, q5_K, iq4_xs, iq3_xxs and iq4_nl with an f16 or f32 B.
+// q3_K, q6_K, q4_K, q5_K, iq4_xs, iq3_xxs and iq4_nl with an f16 or f32 B, on KHR coopmat devices only, so without KHR coopmat
+// (or with coopmat2) the routers that leave int8 MMQ for them stay off too.
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device) {
     static const int env = [] { const char * e = getenv("GGML_VK_MM_PREFETCH"); return e ? atoi(e) : -1; }();
+    if (!device->coopmat_support || device->coopmat2) {
+        return false;
+    }
     return env >= 0 ? env != 0 : device->driver_id == vk::DriverId::eMesaRadv;
 }
 
