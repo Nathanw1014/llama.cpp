@@ -2005,7 +2005,7 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
     }();
     const int n_thr = (int) std::max<size_t>(1, std::min<size_t>((size_t) n_thr_cfg, n_rows / 1024));
 
-    // A1b (2026-10-11): the first ubatch of a batch pays the whole gather (~120 ms for 32768 rows = 3 MB on Flash-Next, a latency
+    // The first ubatch of a batch pays the whole gather (~120 ms for 32768 rows = 3 MB on Flash-Next, a latency
     // cost, not bandwidth). On a warm page cache the per-row madvise(MADV_WILLNEED) pass is pure syscall overhead, so sample the
     // residency of a few rows with mincore() and skip the advice when the table is warm; a cold table keeps it (that is where
     // the parallel readahead pays, 550+ ms otherwise). LLAMA_PLE_ADVISE=1 always advises (the previous behaviour), 0 never, 2 adaptive.
@@ -2097,7 +2097,7 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
     }
 }
 
-// the synchronous row gather for whichever host path the table uses; safe to call from the A1 worker thread
+// the synchronous row gather for whichever host path the table uses; safe to call from the prefetch worker thread
 static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst) {
     if (n_rows == 0) {
         return;

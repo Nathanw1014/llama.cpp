@@ -9,7 +9,7 @@
 
 // Gathers the per-layer-embedding (PLE) rows of a batch on a worker thread while the GPU computes the
 // current ubatch, so the next ubatch's set_input finds its rows ready instead of reading them with the
-// GPU idle (A1, 2026-10-10).
+// GPU idle.
 //
 // The batch is walked in token order in windows of `window` tokens into a ring of 2 windows. The row
 // indices come from the caller (hashed from the batch's own tokens); set_input recomputes them from the
