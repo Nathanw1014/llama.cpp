@@ -273,7 +273,8 @@ llama_build_and_test(test-sched-view-scratch.cpp)
 # non-AMD devices lack, so these are not registered as tests (run them manually on a device that has the paths)
 llama_build(test-hc-up-mix-exact.cpp)
 llama_build(test-f16-store-exact.cpp)
-llama_build_and_test(test-mmid-manual-frag.cpp)
+# manual tool: three runs (default, GGML_VK_MMID_MANUAL_FRAG=0, GGML_VK_TEST_MF_SKEW=1) compared by test-mmid-manual-frag.py
+llama_build(test-mmid-manual-frag.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
