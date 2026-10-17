@@ -16,13 +16,8 @@
 #include <regex>
 #include <unordered_set>
 
-// wave 6 (B): ported verbatim from the release v0.7.8.1 (src-v0781-clean 8e9dcfeb7); the qwen4exp indexer weights are bf16, and with
-// the f16 mixed stream as B a bf16 x f16 GEMM has no kernel on gfx11 RADV
-// LLAMA_BF16_TO_F16 (default on): a bf16 matmul weight bound for a GPU buffer is created and uploaded as f16, so it takes
-// the fast f16 matmul paths where a GPU has no fast bf16 one (gfx11 on RADV). bf16 has 7 mantissa bits and f16 10, so
-// every value in f16's normal range (>= 2^-14) converts exactly; values below it round to the nearest f16 subnormal
-// (error <= 2^-25, ~3e-8: real indexer weights have ~0.015% of values there, all < 1e-5). A tensor with a value f16
-// cannot hold (overflow or NaN), or a normal-range value that would change, stays bf16. Same 2 bytes: sizes unchanged.
+// LLAMA_BF16_TO_F16 (default on): a bf16 matmul weight bound for a GPU buffer is loaded as f16, for GPUs with no fast bf16 matmul
+// (gfx11 on RADV). Values >= 2^-14 convert exactly, smaller ones round (error <= 3e-8); any other change keeps the tensor bf16
 static bool llama_bf16_to_f16_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_BF16_TO_F16");

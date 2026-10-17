@@ -72,7 +72,7 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
-    // LLAMA_BF16_TO_F16 (wave 6, port of the release v0.7.8.1): bf16 matmul weights loaded as f16 where exact
+    // LLAMA_BF16_TO_F16: bf16 matmul weights loaded as f16 where exact
     std::set<std::string> f16_from_bf16;
     size_t f16_from_bf16_rounded = 0;
     size_t f16_from_bf16_kept    = 0;   // planned as f16 but not exact: loaded as bf16
