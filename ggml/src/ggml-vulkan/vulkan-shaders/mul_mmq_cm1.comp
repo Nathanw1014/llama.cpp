@@ -51,7 +51,7 @@ layout (binding = 2) writeonly buffer D2 {f16vec2 data_d2[];};
 layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
 #endif
 #ifdef HC_EPI
-// HC_UP_MIX (wave 5): the qwen4exp hc up GEMM with the gated hc pre in its epilogue. The f16 hc norm output x [n_embd, 4, N]
+// HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue. The f16 hc norm output x [n_embd, 4, N]
 // is read here; D (binding 2) is the f32 mixed stream [n_embd, N]; the gate [4*n_embd, N] is never written.
 layout (binding = 3) readonly buffer X {float16_t data_x[];};
 #endif
@@ -207,10 +207,9 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 #endif
 
 #if defined(MUL_MAT_ID) && defined(D16)
-// f16 stores that must equal the unfused chain (f32 store, then CPY / the f16 SWIGLU): written plainly, the compiler may fold
-// the last f32 multiply and the f16 conversion into one single-rounding mixed-precision op (~6 in 1e5 values one ulp off),
-// and it drops a bare float(float16_t(x)) round trip. The values go through an XOR with a push-constant zero: bit 2 of
-// fusion_flags is never set (ggml_vk_matmul_id sets bits 0 and 3).
+// f16 stores equal to the unfused chain (f32 store, then CPY / the f16 SWIGLU): the values go through an XOR with a push-constant
+// zero (fusion_flags bit 2, asserted clear by ggml_vk_matmul_id) so the compiler can neither fuse the multiply into the conversion
+// nor drop a float(float16_t(x)) round trip
 uint mmid_zero() { return p.fusion_flags & 4u; }
 float16_t mmid_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ mmid_zero())); }
 f16vec2 mmid_store16x2(const vec2 x) { return f16vec2(uintBitsToFloat(floatBitsToUint(x) ^ uvec2(mmid_zero()))); }
@@ -223,7 +222,7 @@ float glu_silu_mul(const float g, const float u) { return g / (1.0f + exp(-g)) *
 #endif
 #endif
 #if defined(HC_EPI) && defined(D16)
-// wave 6 f16 mixed stream: equal to the f32 mixed stream stored, then converted (as dsv4_hc_pre.comp D_F16); hc_zero is 0
+// f16 mixed stream: equal to the f32 mixed stream stored, then converted (as dsv4_hc_pre.comp D_F16); hc_zero is 0
 float16_t hc_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ p.hc_zero)); }
 #endif
 
@@ -693,16 +692,15 @@ void main() {
                         float result = 0.0f;
                         [[unroll]]
                         for (uint ih = 0; ih < 4; ++ih) {
-                            // RADV/ACO drops a bare float(float16_t(x)) round-trip (tbo-b1d: the fused mix matched the UNROUNDED
-                            // gate). The f16 bits pass through an integer op on a push-constant zero, so the v_cvt_f16_f32 the
-                            // d16 store uses must run and the gate is the f16 value the unfused chain reads.
+                            // RADV/ACO drops a bare float(float16_t(x)) round trip: the f16 bits pass through an integer op on a
+                            // push-constant zero, so the gate is the f16 value the unfused chain reads
                             const uint gbits = packFloat2x16(f16vec2(float16_t(v[ih]), float16_t(0.0))) ^ p.hc_zero;
                             const float g = p.hc_round != 0u ? float(unpackFloat2x16(gbits).x) : v[ih];
                             const float wv = 1.0f / (1.0f + exp(-g));
                             result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
                         }
 #ifdef D16
-                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = hc_store16(p.hc_scale * result);   // wave 6: the f16 mixed stream
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = hc_store16(p.hc_scale * result);   // the f16 mixed stream
 #else
                         data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = D_TYPE(p.hc_scale * result);
 #endif

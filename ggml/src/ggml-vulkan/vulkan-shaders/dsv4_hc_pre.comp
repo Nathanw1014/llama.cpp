@@ -49,7 +49,7 @@ layout(binding = 1, std430) readonly buffer W { float16_t data_w[]; };
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 #endif
 #if defined(D_F16)
-// D_F16 (wave 6): the mixed stream stored as f16 (every consumer is a matmul B operand); the f32 result rounded RTE at the store
+// D_F16: the mixed stream stored as f16 (every consumer is a matmul B operand); the f32 result rounded RTE at the store
 layout(binding = 2, std430) writeonly buffer D { float16_t data_d[]; };
 #else
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };

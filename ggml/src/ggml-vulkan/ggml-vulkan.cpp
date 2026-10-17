@@ -1863,7 +1863,7 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16 = false);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 // GGML_VK_MMID_MANUAL_FRAG (default 1): MUL_MAT_ID pf / REG_A pipelines take the manual-fragment "_mf" builds when the RDNA3
-// fragment layout probe passed (ggml_vk_check_coopmat_rdna3_layout); 0 keeps the coopMatLoad builds (the gate's off arm)
+// fragment layout probe passed (ggml_vk_check_coopmat_rdna3_layout); 0 keeps the coopMatLoad builds
 // GGML_VK_MMID_ROWID_FILL (default 1): see ggml_vk_matmul_id, push-constant bit 4
 static bool ggml_vk_mmid_rowid_fill_enabled() {
     static const bool v = [] { const char * e = getenv("GGML_VK_MMID_ROWID_FILL"); return e == nullptr || atoi(e) != 0; }();
@@ -2094,11 +2094,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_align = 128;
         m_align =  64;
         s_align =  32;
-        // Large-tile K alignment (port of the nathanw fork 3a0c39814). Upstream requires K % 128 for the ALIGNED large-tile
-        // kernel, but the aligned loaders only need whole BK=32 K-tiles (K % 8 for the 8-wide f16 B loads), and ALIGNED=0 also
-        // disables the register prefetch, so a GEMM with K % 128 != 0 would run the scalar-load, no-prefetch variant
-        // (Flash-Next's hc up-GEMM, q5_0 10240xNx320: 1016 -> 650 us at op level on the fork). Default 32 on AMD + KHR
-        // coopmat; GGML_VK_MM_ALIGN_L=128 restores upstream, 32 or 64 for probing (whole BK=32 tiles only).
+        // the aligned large-tile loaders need whole BK=32 K tiles, not K % 128, and ALIGNED=0 also drops the register prefetch
+        // (q5_0 10240xNx320 on gfx1151: 1016 -> 650 us). GGML_VK_MM_ALIGN_L=128 restores upstream, 32 or 64 for probing.
         if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2) {
             l_align = 32;
         }
@@ -2877,9 +2874,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1)
         }
 #undef X_CM1
-        // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true; with
-        // GGML_VK_DENSE_WAVE32 (E5) the tiles are retiled for wave32 subgroups at the same BLOCK_SIZE (WM / WN halved until
-        // the warp grid tiles BM x BN again) and the subgroup size is pinned to 32
+        // register-prefetch variants (GGML_VK_MM_PREFETCH), keyed with pf = true; GGML_VK_DENSE_WAVE32 retiles them for
+        // wave32 subgroups at the same BLOCK_SIZE and pins the subgroup size to 32
         if (ggml_vk_mm_prefetch_enabled(device)) {
             std::vector<vk_tile_config> tc_pf = tc_mmq;
             const bool pf_w32 = ggml_vk_dense_wave32_enabled(device);
@@ -2907,7 +2903,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 cm1_create_pf({TYPE, GGML_TYPE_F32, false, false, false, false, true}, "matmul_" #tstr "_f32_pf",        matmul_##tstr##_f32_pf_cm1_len,        matmul_##tstr##_f32_pf_cm1_data); \
                 cm1_create_pf({TYPE, GGML_TYPE_F16, false, false, false, false, true}, "matmul_" #tstr "_f16_pf",        matmul_##tstr##_f16_pf_cm1_len,        matmul_##tstr##_f16_pf_cm1_data); \
             } \
-            /* f16-output twin (wave 4, dense MUL_MAT+CPY(f16) on the routed path; f16 B only, the dense route converts B) */ \
+            /* f16-output twin (dense MUL_MAT+CPY(f16) on the routed path; f16 B only, the dense route converts B) */ \
             if (device->coopmat_acc_f16_support) { \
                 cm1_create_pf({TYPE, GGML_TYPE_F16, false, true, true, false, true},  "matmul_" #tstr "_f16_pf_d16_f16acc", matmul_##tstr##_f16_pf_d16_f16acc_cm1_len, matmul_##tstr##_f16_pf_d16_f16acc_cm1_data); \
             } \
@@ -2924,16 +2920,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             X_CM1_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
             X_CM1_PF(GGML_TYPE_IQ4_NL, iq4_nl)
 #undef X_CM1_PF
-            // XL 256x256 tier of the dense pf pipelines (port of the fork's e6e793bbd): 512 threads, 16 wave32 subgroups
-            // each owning a 64x64 block, BK 32; the large tile's cost on gfx1151 is staging (fetch + dequant + LDS store per
-            // BK step), and doubling BM and BN halves the staged elements per WMMA. Aligned only, selected per shape by
-            // ggml_vk_mm_xl_ok. GGML_VK_MM_XL=0 disables, =2 forces it wherever l would run (probe).
+            // XL 256x256 tier of the dense pf pipelines: 16 wave32 subgroups of 64x64, BK 32, aligned only, picked per shape by
+            // ggml_vk_mm_xl_ok (halves the staged elements per WMMA). GGML_VK_MM_XL=0 disables, =2 forces it (probe).
             static const int mm_xl_env = [] { const char * e = getenv("GGML_VK_MM_XL"); return e ? atoi(e) : 1; }();
             if (mm_xl_env != 0 && device->coopmat_m == 16 && device->coopmat_n == 16 && device->coopmat_k == 16 && device->vendor_id == VK_VENDOR_ID_AMD) {
                 const std::vector<uint32_t> xl_warptile = { 512, 256, 256, 32, 64, 64, 2, 16, 16, 16, 32 };
                 const std::vector<vk_tile_config> tc_xl = {{ xl_warptile, { 256, 256, 1 }, l_align }};
-                // the XL tile is 16 wave32 subgroups: pin the subgroup size to the warptile's WARP (32); unpinned, RADV runs the
-                // 512-thread workgroup as 8 wave64 subgroups and only half the tile is computed (10-10 filler: NMSE 0.5 on every shape)
+                // pinned to the warptile's WARP (32): unpinned, RADV runs the 512 threads as 8 wave64 subgroups and computes half the tile
                 auto cm1_create_xl = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data) {
                     create_mm_pipelines(key, tc_xl, name, len, data, sizeof(vk_mat_mat_push_constants), 3, cm1_spec, false, true, 0, true, true);
                 };
@@ -2997,12 +2990,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef CM1_MMQ_D16
         }
 
-        // HC_UP_MIX (wave 5): the q8_0 int8 MMQ hc up GEMM with the gated hc pre in its epilogue (mul_mmq_cm1.comp HC_EPI). The
+        // HC_UP_MIX: the q8_0 int8 MMQ hc up GEMM with the gated hc pre in its epilogue (mul_mmq_cm1.comp HC_EPI). The
         // epilogue takes the 32-bit pack path's 4-row groups: RDNA3/3.5 wave32 with 16x16 int8 coopmats only.
         if (device->coopmat_int_support && rdna3 && cm1_sg == 32 && device->coopmat_int_m == 16 && device->coopmat_int_n == 16) {
             cm1_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false, false, false, false, false, true}, tc_mmq_cm1_int, "matmul_q8_0_q8_1_hcmix",
                            matmul_q8_0_q8_1_hcmix_cm1_len, matmul_q8_0_q8_1_hcmix_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
-            // wave 6: the f16 mixed stream (ggml_dsv4_hc_pre_gated_ext out_type F16)
+            // the f16 mixed stream (ggml_dsv4_hc_pre_gated_ext out_type F16)
             cm1_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false, true, false, false, false, true}, tc_mmq_cm1_int, "matmul_q8_0_q8_1_hcmix_d16",
                            matmul_q8_0_q8_1_hcmix_d16_cm1_len, matmul_q8_0_q8_1_hcmix_d16_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
         }
@@ -3110,7 +3103,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, false, false, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
                 cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, false, false, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
             } \
-            /* f16-output twins (wave 4): the MUL_MAT_ID(+MUL)+CPY(f16) store on the routed path, six bindings (router weights) */ \
+            /* f16-output twins: the MUL_MAT_ID(+MUL)+CPY(f16) store on the routed path, six bindings (router weights) */ \
             if (device->coopmat_acc_f16_support) { \
                 cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, true, true, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf_d16_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf_d16, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
                 cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, true, true, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf_d16_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf_d16, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
@@ -3150,9 +3143,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         create_mm_pipelines(key, tc_rega, name, len, data, sizeof(vk_mat_mat_id_push_constants), pc, rega_spec, false, true, 0, true, true);
                     }
                 };
-                // the f16-output twins (wave 4: the pf d16 SPIR-V with the router-weight binding, six bindings) carry the same
-                // REG_A spec: in the model every expert GEMM at prefill is a MUL_MAT_ID(+MUL)+CPY(f16) fusion, so without them the
-                // tile could only run in test-backend-ops
+                // the f16-output twins (pf d16 SPIR-V, router-weight binding) carry the same REG_A spec: in the model every
+                // prefill expert GEMM is a MUL_MAT_ID(+MUL)+CPY(f16) fusion
 #define X_CM1_ID_REGA(TYPE, tstr) \
                 if (device->coopmat_acc_f16_support) { \
                     cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, false, false, true, true},  std::string("matmul_id_subgroup_" #tstr "_f32_pf_f16acc_rega") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, _f16acc), mul_mat_id_param_count); \
@@ -4914,10 +4906,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 }
 
-// The manual-fragment MUL_MAT_ID kernels (mul_mm.comp BUF_MANUAL) write fragment elements by hand in the gfx11 WMMA layout as
-// RADV lowers KHR cooperative matrices; the spec does not guarantee it. Run coopmat_layout_check once (wave32 and wave64) and
-// compare its hand-laid product and its coopMatStore with the exact product. Port of the nathanw release's probe (c7daa3e23);
-// GGML_VK_FORCE_NO_MANUAL_FRAG=1 makes it report failure.
+// The manual-fragment and REG_A MUL_MAT_ID kernels lay fragments out by hand in the gfx11 WMMA layout as RADV lowers KHR
+// cooperative matrices, which the spec does not guarantee: check it once at wave32 and wave64. GGML_VK_FORCE_NO_MANUAL_FRAG=1 fails it.
 static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
     if (!device->pipeline_coopmat_layout_check[0] || !device->pipeline_coopmat_layout_check[1]) {
         return false;
@@ -7074,7 +7064,7 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
         return (ith != ctx->device->pipeline_matmul.end() && !ith->second.empty()) ? &ith->second : nullptr;
     }
     if (!glu && ggml_vk_mm_prefetch_type(src0_type) && ggml_vk_mm_prefetch_enabled(ctx->device)) {
-        // register-prefetch variant (same tiles, same B type), with its f16-output twin for d16 (wave 4); falls through to the
+        // register-prefetch variant (same tiles, same B type), with its f16-output twin for d16; falls through to the
         // generic pipelines when absent (an int8 B never has a pf key)
         vk_matmul_pipeline_key kp{src0_type, src1_type, mul_mat_id, f16acc, d16, false, true};
         auto itp = ctx->device->pipeline_matmul.find(kp);
@@ -7136,10 +7126,8 @@ static void ggml_vk_matmul_id(
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     // fusion_flags bit 0: scale rows by the router weights (MUL_MAT_ID + MUL); bit 3 (int8 MMQ SwiGLU epilogue only): this GEMM
     // is the gate projection, else the up projection
-    // bit 4 (GGML_VK_MMID_ROWID_FILL, default 1): the row-id loader fills a partial tile's unused slots with token 0. The aligned
-    // B loads read row_ids for the whole BN tile, so without it a partial tile (most of them at ~64 rows per expert) gathers B
-    // rows from whatever the shared array held: scattered, possibly out-of-range reads. The rows are never stored, so the output
-    // is the same bits either way. The release's loader always fills.
+    // bit 4 (GGML_VK_MMID_ROWID_FILL, default 1): the row-id loader fills a partial tile's unused slots with token 0, so the
+    // aligned B loads (whole BN tile) gather valid rows instead of stale ids; those rows are never stored
     const bool rowid_fill = ggml_vk_mmid_rowid_fill_enabled();
     if (rowid_fill) {
         ggml_vk_path_census_add("MUL_MAT_ID_ROWID_FILL");
@@ -7450,11 +7438,8 @@ static bool ggml_vk_mmq_f16_y_enabled(const vk_device & device) {
     return env >= 0 ? env != 0 : device->vendor_id == VK_VENDOR_ID_AMD;
 }
 
-// Register-prefetch KHR coopmat matmuls (mul_mm_pf_funcs.glsl, port of the nathanw fork GEMM rewrite): the K loop issues the
-// next tile's global loads before the WMMAs and dequantises them one iteration later, with 8-wide dword loaders for the
-// 2-byte-aligned block types. GGML_VK_MM_PREFETCH=0 turns it off (default on for RADV); the pipelines exist for q8_0, q5_0,
-// q3_K, q6_K, q4_K, q5_K, iq4_xs, iq3_xxs and iq4_nl with an f16 or f32 B, on KHR coopmat devices only, so without KHR coopmat
-// (or with coopmat2) the routers that leave int8 MMQ for them stay off too.
+// Register-prefetch KHR coopmat matmuls (mul_mm_pf_funcs.glsl): GGML_VK_MM_PREFETCH=0 turns them off (default on for RADV).
+// They exist only on KHR coopmat devices without coopmat2, so elsewhere the routers that leave int8 MMQ for them stay off too.
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device) {
     static const int env = [] { const char * e = getenv("GGML_VK_MM_PREFETCH"); return e ? atoi(e) : -1; }();
     if (!device->coopmat_support || device->coopmat2) {
@@ -7463,11 +7448,8 @@ static bool ggml_vk_mm_prefetch_enabled(const vk_device& device) {
     return env >= 0 ? env != 0 : device->driver_id == vk::DriverId::eMesaRadv;
 }
 
-// XL tier gate (256x256 tile, 1 workgroup per CU, vs l: 128x128, 2 per CU), fitted on the fork at op level on gfx1151
-// (73 dense GEMM shapes of Qwen3.8-27B and Flash-Next, n = 256/512/2048, 2026-09-25): per tile XL is 1.07-1.44x faster
-// (q6_K most), so it wins wherever it fills the GPU as well as l does. Wave quantization: XL only when its wave count is at
-// most half of l's; types q4_K/q5_K/q6_K/q8_0/iq4_xs (iq4_nl loses 0.87-0.90x at every shape, the rest are unmeasured);
-// k >= 1024 (the hc up-GEMM at k = 320 is 0.93-0.98x); m >= 1024. GGML_VK_MM_XL=2 skips the gate (probe only).
+// XL tier gate, fitted at op level on gfx1151 (73 dense GEMM shapes, XL 1.07-1.44x per tile): XL when its wave count is at most
+// half of l's, for q4_K/q5_K/q6_K/q8_0/iq4_xs (iq4_nl loses), k >= 1024, m >= 1024. GGML_VK_MM_XL=2 skips the gate (probe).
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k) {
     static const bool force = [] { const char * e = getenv("GGML_VK_MM_XL"); return e && atoi(e) == 2; }();
     if (force) {
@@ -7486,9 +7468,8 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
     return 2 * waves_xl <= waves_l;
 }
 
-// E5 wave32 (port of the fork's 25c45fea1): RDNA3.x WMMA is wave32-native, so a wave64 subgroup issues each coopmat op as two
-// halves. The prefetch (and XL) dense pipelines are retiled so the warp grid tiles BM x BN with wave32 subgroups at the same
-// BLOCK_SIZE, and the subgroup size is pinned to 32. GGML_VK_DENSE_WAVE32=0 keeps the driver default (wave64 on RADV).
+// RDNA3.x WMMA is wave32-native (a wave64 subgroup issues each coopmat op as two halves): the prefetch dense pipelines run as
+// wave32 subgroups at the same BLOCK_SIZE. GGML_VK_DENSE_WAVE32=0 keeps the driver default (wave64 on RADV).
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
     static const int env = [] { const char * e = getenv("GGML_VK_DENSE_WAVE32"); return e ? atoi(e) : -1; }();
     const bool can = device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
@@ -7497,14 +7478,9 @@ static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
     return can && (env >= 0 ? env != 0 : true);
 }
 
-// GGML_VK_DENSE_YPAD=N (E5, idea from Strata (Niko1221): "K + 64, K 6144 19 -> 35 TFLOPS"): pad the row stride of the f16 B
-// operand that the dense f16-B coopmat path stages into prealloc_y by N f16 elements (multiple of 8: the aligned loads divide
-// stride_b by LOAD_VEC_B and coopMatLoad wants 16 B strides). 16 DRAM channels interleave on 256 B granules, so a row of k
-// f16 elements whose byte stride is a multiple of 256 starts every row on one of 16/gcd(granules, 16) channels: Flash-Next's
-// k 6144 / 10240 (gcd 16) camp on one channel, k 2560 (gcd 4) does not. Applied only where gcd >= 8. Same bits: only the
-// layout of the scratch copy changes. The fork measured q8_0 2560x2048x6144 30.2 -> 40.9 TFLOPS (-26.7 ms per ubatch) with
-// the non-camping 10240x2048x2560 control flat and the strided staging copy +1.7 ms over 203 GEMMs. =0 off, =N pads N;
-// GGML_VK_DENSE_YPAD_ALL=1 pads every staged f16 B regardless of the stride (probe).
+// GGML_VK_DENSE_YPAD=N (multiple of 8, default 128, 0 off; idea from Strata): pad the staged f16 B rows of the dense f16-B path
+// where their 256 B-granule stride camps on few DRAM channels (gcd >= 8; q8_0 2560x2048x6144 on gfx1151: 30.2 -> 40.9 TFLOPS).
+// Same bits, only the scratch layout changes. GGML_VK_DENSE_YPAD_ALL=1 pads every staged f16 B (probe).
 static uint32_t ggml_vk_dense_ypad() {
     static const uint32_t pad = [] { const char * e = getenv("GGML_VK_DENSE_YPAD"); return e ? (uint32_t) std::max(0, atoi(e)) & ~7u : 128u; }();
     return pad;
@@ -7517,9 +7493,8 @@ static bool ggml_vk_dense_ypad_camps(uint64_t k) {
     return std::gcd(bytes / 256, (uint64_t) 16) >= 8;
 }
 
-// REG_A (PORT-MAP F, Halogen (Peonist) expert-loading design via the nathanw fork): register-direct A for the aligned
-// MUL_MAT_ID f16-coopmat tile of iq3_xxs / iq4_nl (mul_mm.comp MMID_REGA). GGML_VK_MMID_REGA=0 turns it off, =1 forces it on;
-// default on where the RDNA3 fragment layout probe passed (the loader writes A fragments in that layout by hand).
+// REG_A (after Halogen's expert-loading design): register-direct A for the aligned iq3_xxs / iq4_nl MUL_MAT_ID f16-coopmat tile.
+// Default on where the RDNA3 fragment layout probe passed (A fragments are laid out by hand); GGML_VK_MMID_REGA=0 / 1 forces it.
 static bool ggml_vk_mmid_rega_enabled(const vk_device& device) {
     static const int env = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : -1; }();
     return env >= 0 ? env != 0 : device->coopmat_rdna3_layout;
@@ -7535,14 +7510,8 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
     }
 }
 
-// Dense router (PORT-MAP E-stack): which quantized A types leave the int8 MMQ path for the f16-B KHR coopmat matmul (the
-// register-prefetch variant with its XL tier). Default = the types measured faster there at op level on gfx1151 / Mesa
-// 26.2.4 (10-10, f16 B, prefetch + XL vs the int8 MMQ pipelines, ms per call): q5_K 17408x2048x5120 15.28 -> 10.23, q5_K
-// 5120x2048x17408 15.34 -> 9.85, q4_K 14.86 -> 9.52, q6_K 16.51 -> 11.25, iq4_xs 13.67 -> 9.19, q8_0 10240x2048x2560
-// 3.72 -> 2.74 and 2560x2048x6144 2.40 -> 1.86 (without XL, q8_0 and q6_K were a loss or flat, so the XL tier is what
-// qualifies them). q3_K / q5_0 / iq4_nl stay on int8 until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
-// pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own list (GGML_VK_MMID_F16COOPMAT, default
-// "iq3_xxs,iq4_nl": the Flash-Next expert types, measured in-model; see ggml_vk_mmid_f16coopmat).
+// Router lists (GGML_VK_DENSE_F16COOPMAT, GGML_VK_DENSE_F16B_NATIVE, GGML_VK_MMID_F16COOPMAT): the quantized A types that leave int8
+// MMQ for the f16-B KHR coopmat pf matmul. "0" or "" = none, "all" = every pf type, else a comma list of type names.
 // each caller keeps its list in a function-static const (thread-safe initialisation, nothing shared is filled later)
 static std::vector<std::string> ggml_vk_parse_route_list(const char * env_name, const char * dflt) {
     std::vector<std::string> v;
@@ -7569,15 +7538,10 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
     return false;
 }
 
-// GGML_VK_DENSE_F16COOPMAT_MINK (default 1024): GEMMs with a shorter K stay on the int8 path. Measured in-model on Flash-Next
-// (10-11, serialising perf logger, pp2048): the hc up GEMM q8_0 10240x2048x320 took 1.29 ms/call routed vs 0.88 on int8 MMQ
-// (95 calls per 4 ubatches, 39 ms), the one K-step the XL / prefetch tile gets at K=320 cannot amortise its B conversion and
-// prologue; the K=2560 and K=6144 shapes read flat between the paths in-model.
-// GGML_VK_DENSE_F16B_NATIVE (wave 6 item 1 (A), default "q8_0"): listed types take the f16-B KHR coopmat matmul whenever B ARRIVES as f16
-// (no B conversion on that path), whatever the type list above says; decided per call at dispatch from src1->type, so a GEMM takes the
-// same path every time its B is f16. Wave-5 FN d32k timed ubatch (serial perf logger): the hc down GEMM q8_0 320x2048x10240 reads the
-// f16 hc norm output on both lines and took 1032 us/call on int8 MMQ vs 609 us/call on the release's f16-B coopmat path (95 calls).
-// "0" disables; a comma list (or "all") replaces the default. The K / N floors below still apply.
+// GGML_VK_DENSE_F16COOPMAT_MINK (default 1024): shorter K stays on int8 (Flash-Next q8_0 10240x2048x320 on gfx1151: 1.29 ms
+// routed vs 0.88 int8, one K step cannot amortise the B conversion).
+// GGML_VK_DENSE_F16B_NATIVE (default "q8_0"): listed types take the f16-B path whenever B arrives as f16 (no conversion), within
+// the K / N floors (Flash-Next q8_0 320x2048x10240 on gfx1151: 1032 -> 609 us/call).
 static bool ggml_vk_dense_f16b_native(ggml_type t) {
     static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_DENSE_F16B_NATIVE", "q8_0");
     return ggml_vk_route_match(list, t);
@@ -7585,23 +7549,18 @@ static bool ggml_vk_dense_f16b_native(ggml_type t) {
 
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16) {
     static const uint32_t min_k = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINK"); return e ? (uint32_t) atoi(e) : 1024u; }();
-    // GGML_VK_DENSE_F16COOPMAT_MINN (default 32): decode / verify / MTP shapes stay on the int8 or mat-vec paths; the f16-B prefetch
-    // path is a prefill tile and has an open small-n defect (bf16 m=128 n=16/9 k=5120 fail test-backend-ops under route all, 10-11)
+    // GGML_VK_DENSE_F16COOPMAT_MINN (default 32): decode / verify / MTP shapes stay on int8 or mat-vec; the f16-B prefetch tile is a
+    // prefill tile with an open small-n defect (bf16 m=128 n=16/9 k=5120 fail test-backend-ops under route all)
     static const uint32_t min_n = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINN"); return e ? (uint32_t) atoi(e) : 32u; }();
     if (k < min_k || n < min_n) return false;
-    // Default list (wave 4, measured in-model with the K / N floors above): the K-quants and iq4_xs take the f16-B pf / XL path, q8_0
-    // stays on int8 MMQ. Routing the whole wave-2 list read +11.6% / +8.6% pp (d0 / 32k) on Qwen3.8-27B, whose dense GEMMs are
-    // q4_K / q5_K / q6_K / iq4_xs at K 5120-17408, and flat on Flash-Next (-0.1% / +1.7%) and Qwen3.6-35B-A3B (-0.2% / -0.4%), whose
-    // dense weights are all q8_0 (the int8 path is near-native for q8_0). GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8,
-    // "all" routes every type with a pf pipeline, a comma list replaces the default.
+    // default list measured in-model on gfx1151: +11.6% / +8.6% pp (d0 / 32k) on Qwen3.8-27B (q4_K..iq4_xs dense GEMMs), flat on
+    // Flash-Next and Qwen3.6-35B-A3B, whose dense weights are q8_0 (near-native on int8, so q8_0 stays there)
     static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs");
     return ggml_vk_route_match(list, t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
-// GGML_VK_MMID_F16COOPMAT (default "iq3_xxs,iq4_nl"): the listed expert types leave int8 MMQ for the f16-B coopmat pf tile, which
-// carries the REG_A tile, the f16-output expert store (d16) and the MMID_B_FULL load. Every gate since wave 4 ran with exactly this
-// list on every arm (the batch4 mmidrouteoff arm is the A/B of record), so a build without the env lost those paths. "" or "0" keeps
-// every expert type on int8 MMQ; "all" or a comma list replaces the default. Logged once at init ("MUL_MAT_ID f16-B route: ...").
+// GGML_VK_MMID_F16COOPMAT (default "iq3_xxs,iq4_nl", the Flash-Next expert types): listed expert types leave int8 MMQ for the f16-B
+// pf tile, which carries REG_A, the f16-output expert store and MMID_B_FULL. Logged once at init ("MUL_MAT_ID f16-B route: ...").
 static const std::vector<std::string> & ggml_vk_mmid_route_list() {
     static const std::vector<std::string> list = ggml_vk_parse_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default);
     return list;
@@ -7613,10 +7572,8 @@ static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
 
 
 
-// An f16 matrix whose rows are packed but strided (qwen4exp's padded hc xn / GDN norm rows, LLAMA_HC_XN_PAD /
-// LLAMA_GDN_NORM_PAD): the dense GEMM reads it as B in place through stride_b or quantizes it to q8_1 through the row
-// stride, and the mat-vec reads it as A through stride_a, instead of copying it to packed rows, which would undo the pad.
-// GGML_VK_ROWSTRIDE=0 disables (the copy as before).
+// An f16 matrix with packed but strided rows (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD): GEMM B and mat-vec A read it in place through
+// their row stride (or quantize it through it) instead of a packed copy that would undo the pad. GGML_VK_ROWSTRIDE=0 copies.
 static bool ggml_vk_f16_rowstride(const ggml_tensor * t) {
     static const bool enabled = [] { const char * e = getenv("GGML_VK_ROWSTRIDE"); return e == nullptr || atoi(e) != 0; }();
     return enabled && t->type == GGML_TYPE_F16 && t->nb[0] == sizeof(ggml_fp16_t) && t->ne[2] == 1 && t->ne[3] == 1 &&
@@ -7625,7 +7582,7 @@ static bool ggml_vk_f16_rowstride(const ggml_tensor * t) {
 
 // out16: the MUL_MAT+CPY(f16) fusion. The result is stored as f16 straight into the cast's destination
 // (contiguous, same shape) by an f16-output int8 MMQ pipeline; dst itself is never written.
-// HC_UP_MIX (wave 5): the qwen4exp hc up GEMM writes the gated hc pre's mixed stream instead of the gate
+// HC_UP_MIX: the qwen4exp hc up GEMM writes the gated hc pre's mixed stream instead of the gate
 struct vk_hcmix_args {
     ggml_tensor *       mixed;   // DSV4_HC_PRE's output: f32 [n_embd, N]
     const ggml_tensor * x;       // DSV4_HC_PRE's x: f16 [n_embd, 4, N] (the f16 hc norm output, possibly row-padded)
@@ -7637,7 +7594,7 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
         const vk_hcmix_args & hc, uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t padded_n) {
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    const size_t   d_el = ggml_type_size(hc.mixed->type);   // f32 or (wave 6) f16 mixed stream
+    const size_t   d_el = ggml_type_size(hc.mixed->type);   // f32 or f16 mixed stream
     const uint32_t d_s1 = (uint32_t) (hc.mixed->nb[1] / d_el);
     vk_mat_mat_hcmix_push_constants pc {};
     pc.mm = { m, n, k, stride_a, stride_b, d_s1, batch_stride_a, batch_stride_b, d_s1 * n, 0, 1, k, 1, 1, 1, 1, padded_n };
@@ -7829,10 +7786,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     if (y_needs_reformat) {
         if (y_row_pad != 0) {
-            // the padded layout needs the STRIDED copy shader: with no destination ggml_vk_get_cpy_pipeline picks the contiguous
-            // shader, which ignores the destination strides, and every padded MUL_MAT reads garbage (NMSE ~2 on the f32-B
-            // routed shapes with K = 5120 / 6144 / 10240 / 17408, 10-11; the release line learnt the same on 10-07). A stand-in
-            // destination with the padded f16 row stride selects the strided shader.
+            // the padded layout needs the strided copy shader (without a destination the contiguous one is picked and ignores the
+            // destination strides): a stand-in destination with the padded f16 row stride selects it
             ggml_tensor y_padded_dst = *src1;
             y_padded_dst.type  = y_kernel_type;
             y_padded_dst.nb[0] = ggml_type_size(y_kernel_type);
@@ -8781,7 +8736,7 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     // supports_op admits an f16 x only for the gated form, and an f16 gate only with an f16 x
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
     GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16 && x->type == GGML_TYPE_F16));
-    // wave 6: an f16 dst (the f16 mixed stream) only with an f16 x (supports_op)
+    // an f16 dst (the f16 mixed stream) only with an f16 x (supports_op)
     const bool d16 = dst->type == GGML_TYPE_F16;
     GGML_ASSERT(!d16 || (gated && x->type == GGML_TYPE_F16));
     vk_pipeline pipeline = !gated ? ctx->device->pipeline_dsv4_hc_pre_f32 :
@@ -9017,15 +8972,8 @@ static bool ggml_vk_mmid_f16b_enabled() {
 }
 
 
-// fused_scale / fused_dst: the MUL_MAT_ID+MUL fusion (router weights in the epilogue, result in the MUL's destination).
-// out16: the MUL_MAT_ID(+MUL)+CPY(f16) fusions. The result is stored as f16 straight into the cast's destination
-// (contiguous, same shape as dst) by an f16-output pipeline (ggml_vk_mmid_d16_ok); dst itself is never written.
-// glu_up (with out16): the MUL_MAT_ID+CPY(f16)+SWIGLU fusion. The store writes silu(gate) * up into out16, the
-// SWIGLU's destination; glu_up is the other projection (f16, laid out like dst), glu_acc_gate tells whether this
-// GEMM is the gate (true) or the up projection (false).
-// true when the id tile selector, fed the rows per expert, picks the MEDIUM tier of this map: identified by the tier's
-// 64x64 workgroup tile (s is 32x32, l 128x128 on the coopmat devices that build the REG_A tile), not by its index, because
-// filter_tc drops the tiers a type cannot fit in shared memory (iq3_xxs / iq4_nl lose the large tile with their LUT)
+// true when the id tile selector picks the medium (64x64) tier of this map, found by shape, not by index: filter_tc drops
+// the tiers a type cannot fit in shared memory (iq3_xxs / iq4_nl lose the large tile with their LUT)
 static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::vector<vk_matmul_pipeline_pair>& configs, uint32_t m, uint32_t n_per_expert) {
     if (configs.size() < 2) {
         return false;
@@ -9036,6 +8984,9 @@ static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::v
     return sel != nullptr && sel->wg_denoms[0] == 64 && sel->wg_denoms[1] == 64;
 }
 
+// fused_scale / fused_dst: MUL_MAT_ID+MUL (router weights in the epilogue, result in the MUL's destination).
+// out16: MUL_MAT_ID(+MUL)+CPY(f16), stored as f16 into the cast's destination (ggml_vk_mmid_d16_ok); dst is never written.
+// glu_up (with out16): MUL_MAT_ID+CPY(f16)+SWIGLU, the other projection; glu_acc_gate: this GEMM is the gate projection.
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr, const ggml_tensor * out16 = nullptr, const ggml_tensor * glu_up = nullptr, bool glu_acc_gate = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -9118,8 +9069,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled(ctx->device) && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
-    // GGML_VK_MMID_F16COOPMAT: the listed expert types leave int8 MMQ for the f16-B pf tile; since wave 4 the f16-output store
-    // (MUL_MAT_ID(+MUL)+CPY(f16)) rides along on the pf d16 twins, so a fused node no longer silently stays on int8
+    // GGML_VK_MMID_F16COOPMAT: the listed expert types leave int8 MMQ for the f16-B pf tile (with the f16-output store on the
+    // pf d16 twins)
     if (can_quantize_y && !glu && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_f16coopmat(src0->type)) {
         can_quantize_y = false;
     }
@@ -9207,11 +9158,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         }
     }
 
-    // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the f16-B coopmat
-    // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch).
-    // In the model this needs the expert GEMM routed off int8 MMQ (GGML_VK_MMID_F16COOPMAT, default iq3_xxs,iq4_nl); the fused f16 cast
-    // (d16) takes the REG_A twin built on the pf d16 SPIR-V (wave 4). GGML_VK_FUSION_DEBUG=1 prints the first reason each
-    // distinct rejection happens.
+    // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the routed f16-B pf path
+    // where the selector takes the medium tile; d16 takes its pf d16 twin. GGML_VK_FUSION_DEBUG=1 logs each distinct rejection.
     if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) && ggml_vk_mmid_rega_enabled(ctx->device)) {
         static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
         static std::set<std::string> rega_said;
@@ -9232,12 +9180,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         } else if (!ggml_vk_mm_prefetch_enabled(ctx->device)) {
             rega_reject("prefetch pipelines off");
         } else if (!ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, n_for_tile)) {
-            // the pf id map of iq3_xxs / iq4_nl carries two tiers (the large tile fails the shared-memory check with the LUT),
-            // so the medium tile is found by its shape, not by index 1 of a three-entry map (tbo-f11: "fewer than 3 tiles")
+            // the same n_for_tile as the base pipeline: bn, max_tiles and the row map above are sized for that tile
             rega_reject("tile selector did not pick the medium tile for the rows per expert");
         } else {
-            // the tile question for an expert GEMM is the rows PER EXPERT (nei1 * nei0 / n_as: 2048 tokens x top-10 / 320 experts
-            // = 64 on Flash-Next REAP-320), as the fork's port sizes it
             const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
             const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
             vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, d16, false, true, true};
@@ -16953,9 +16898,8 @@ static bool ggml_vk_fuse_hc_post_norm_enabled() {
 
 // true when ggml_vk_mul_mat_id_q_f16 will run this MUL_MAT_ID on a pipeline with the router-weight binding (int8 MMQ coopmat1,
 // or the f16-output pf twin on the routed f16-B path) and the MUL is a per-row scale it can apply
-// d16: the MUL is followed by the f16 cast the dispatch stores (MUL_MAT_ID+MUL+CPY(f16)); on the routed f16-B pf path only the
-// f16-output twins carry the router-weight binding, so without d16 a routed MUL_MAT_ID+MUL stays unfused there (before wave 4 the
-// matcher ignored the router and such a node hit the int8-only assert in ggml_vk_mul_mat_id_q_f16)
+// d16: the MUL is followed by the f16 cast the dispatch stores; on the routed f16-B pf path only the f16-output twins carry the
+// router-weight binding, so there a MUL_MAT_ID+MUL without the cast stays unfused
 static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx, const ggml_tensor * mmid, const ggml_tensor * mul, bool d16 = false) {
     if (!ggml_vk_mmid_epilogue_enabled()) {
         return false;
@@ -17106,11 +17050,8 @@ static bool ggml_vk_gdn_norm_f16_wiring(const ggml_cgraph * g, int i) {
            n[4]->op == GGML_OP_CPY && n[4]->src[0] == n[3] && n[4]->type == GGML_TYPE_F16;
 }
 
-// RMS_NORM_MUL_SIGMUL_CPY (short rows): the GDN output norm writing only the f16 B operand of ssm_out, saving the sigmoid
-// pass, the f32 norm output and the GEMM's own B conversion (port of the fork's GDN norm f16, Strata's GDN_NOY). The SIGMOID
-// does not consume the MUL before it, so the chain is matched as a subgraph whose one output is the CPY. The destination's
-// rows are packed; its outer strides may be padded (LLAMA_GDN_NORM_PAD). GGML_VK_GDN_NORM_F16=0 disables (the chain then
-// runs as RMS_NORM_MUL, SIGMOID, MUL, CPY).
+// RMS_NORM_MUL_SIGMUL_CPY (short rows, after Strata's GDN_NOY): the GDN output norm writes only the f16 B operand of ssm_out,
+// matched as a subgraph whose one output is the CPY (rows packed, outer strides may be padded). GGML_VK_GDN_NORM_F16=0 disables.
 // GGML_VK_FUSION_DEBUG=1: the first time each reason rejects a chain wired as the GDN norm f16 pattern, say so
 static bool ggml_vk_gdn_norm_f16_reject(const char * why) {
     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
@@ -18179,12 +18120,8 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-// Dispatch census, a test hook (test-backend-ops "census" mode and engagement checks): every fused dispatch, counted per
-// label and fused node count ("LABEL/n"), and every dispatch-path decision a backend function records with
-// ggml_vk_path_census_add ("path:NAME", a path or pipeline variant taken that is not a fusion). Off until a test calls
-// "ggml_backend_debug_dispatch_census_reset" from ggml_backend_reg_get_proc_address, or from load with
-// GGML_VK_DISPATCH_CENSUS_LOG=1 (printed at exit); while off it costs one relaxed load per fused dispatch or path decision.
-// Not a stable API: names and output may change with the fusions and paths.
+// Dispatch census, a test hook (not a stable API): fused dispatches per "LABEL/n" and path decisions per "path:NAME". Off until a
+// test calls "ggml_backend_debug_dispatch_census_reset" (or GGML_VK_DISPATCH_CENSUS_LOG=1, printed at exit); off, one relaxed load.
 static std::atomic<bool> vk_dispatch_census_on {false};
 static std::mutex vk_dispatch_census_mutex;
 static std::map<std::string, uint64_t> vk_dispatch_census;
@@ -18296,10 +18233,8 @@ static void ggml_vk_dispatch_census_log_init() {
     }
 }
 
-// MUL_MAT+CPY(f16): a quantized GEMM whose only consumer is a cast to f16 stores float16_t straight into the
-// cast's destination through an f16-output int8 MMQ pipeline, so the f32 result is never written or read back.
-// GGML_VK_FUSE_MM_F16OUT=0 disables. GEMM shapes on the int8 MMQ path only: the mat-vec, split-K and
-// non-MMQ paths all write f32.
+// MUL_MAT+CPY(f16): a quantized int8 MMQ GEMM whose only consumer is an f16 cast stores f16 straight into the cast's destination
+// (the mat-vec, split-K and non-MMQ paths write f32). GGML_VK_FUSE_MM_F16OUT=0 disables.
 static bool ggml_vk_mm_f16out_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_MM_F16OUT");
@@ -18343,10 +18278,8 @@ static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struc
     return ggml_vk_mul_mat_f16out_ok(ctx, mm);
 }
 
-// HC_UP_MIX (wave 5): MUL_MAT(q8_0 hc up weight, lo) + CPY(f16 gate) + RESHAPE + DSV4_HC_PRE(gated, f16 x, f16 gate) -> one int8 MMQ GEMM
-// whose epilogue rounds each gate to f16 and applies the gated mix in DSV4_HC_PRE's order: bit-exact with the unfused chain, and the
-// [4*n_embd, N] gate is neither written nor read. GGML_VK_HC_UP_MIX=0 disables; read once, and again after the
-// "ggml_backend_debug_env_reload" test hook (the exactness test flips it between graphs).
+// HC_UP_MIX: the hc up GEMM (+ CPY(f16 gate)) + DSV4_HC_PRE as one int8 MMQ GEMM whose epilogue applies the gated mix bit-exactly.
+// GGML_VK_HC_UP_MIX=0 disables; read once, again after the "ggml_backend_debug_env_reload" test hook.
 static std::atomic<int> vk_hc_up_mix_env {-1};
 static bool ggml_vk_hc_up_mix_enabled() {
     int v = vk_hc_up_mix_env.load(std::memory_order_relaxed);
@@ -18419,10 +18352,8 @@ static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struc
     return n_extra;
 }
 
-// MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores float16_t straight into the cast's destination (the f16 MoE
-// activations of build_moe_ffn), so the f32 expert outputs are never written or read back.
-// GGML_VK_FUSE_MMID_F16OUT=0 disables. GEMM shapes only, on the two pipeline families with an f16-output twin:
-// int8 MMQ coopmat1 (f32 or f16 B, quantized to q8_1) and the KHR-coopmat IQ1-IQ3 matmul with an f32 B.
+// MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 straight into the cast's destination (build_moe_ffn's f16 activations),
+// on the pipelines with an f16-output twin (ggml_vk_mmid_d16_ok). GGML_VK_FUSE_MMID_F16OUT=0 disables.
 static bool ggml_vk_mmid_f16out_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_MMID_F16OUT");
@@ -18446,7 +18377,7 @@ static bool ggml_vk_mmid_d16_ok(ggml_backend_vk_context * ctx, const ggml_tensor
         return false;
     }
     const ggml_prec prec = (ggml_prec) mmid->op_params[0];
-    // routed f16-B pf path (GGML_VK_MMID_F16COOPMAT, wave 4): ggml_vk_mul_mat_id_q_f16 leaves int8 for the pf tile and takes
+    // routed f16-B pf path (GGML_VK_MMID_F16COOPMAT): ggml_vk_mul_mat_id_q_f16 leaves int8 for the pf tile and takes
     // its f16-output twin, which carries the router-weight binding; the SwiGLU store stays int8-only (CPY16_SWIGLU then falls
     // back to MUL_MAT_ID_CPY16 plus the separate GLU pass)
     if (ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_f16coopmat(src0->type) &&
@@ -18543,9 +18474,8 @@ static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struc
 
 // MUL_MAT_ID + MUL(router weights) + CPY(f16): the router-weight epilogue, stored as f16
 static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    // not ggml_vk_can_fuse({MUL_MAT_ID, MUL}): that path asks ggml_vk_mmid_scale_epilogue_ok without the d16 flag, which on a
-    // routed type answers for the f32-out pf pipeline (no router-weight binding) and refused every routed MUL_MAT_ID_MUL_CPY16
-    // (wave-4 filler 10-11, 0/25 engaged); the structural check is the three-op ggml_can_fuse, the d16-aware predicate is below
+    // not ggml_vk_can_fuse({MUL_MAT_ID, MUL}): it asks ggml_vk_mmid_scale_epilogue_ok without d16, which refuses every routed type
+    // (the f32-out pf pipeline has no router-weight binding); the three-op ggml_can_fuse plus the d16-aware predicate below
     if (!ggml_vk_mmid_f16out_enabled() || node_idx + 2 >= cgraph->n_nodes ||
         !ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_CPY })) {
         return false;
@@ -19366,7 +19296,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return keep_pattern(pattern);
         };
 
-        // HC_UP_MIX (wave 5): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE stay consecutive, and the GEMM's inputs (lo) stay
+        // HC_UP_MIX: MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE stay consecutive, and the GEMM's inputs (lo) stay
         // allocated until the HC pre: the fused GEMM reads lo while it writes the mixed stream
         if (ggml_vk_hc_up_mix_enabled() &&
             match_pattern({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, first_unused) &&
@@ -20626,7 +20556,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
             {
-                // wave 6: the gated HC_PRE may write an f16 mixed stream (f16 x only; checked again with the srcs below)
+                // the gated HC_PRE may write an f16 mixed stream (f16 x only; checked again with the srcs below)
                 const bool f16_d_ok = op->op == GGML_OP_DSV4_HC_PRE && ggml_get_op_params_i32(op, 1) != 0 && op->src[0] &&
                                       op->src[0]->type == GGML_TYPE_F16 && device->pipeline_dsv4_hc_pre_gated_x16_f16 != nullptr &&
                                       device->pipeline_dsv4_hc_pre_gated_x16_g16_f16 != nullptr;

@@ -34,10 +34,8 @@ layout (constant_id = 2) const bool do_multiply2 = false;
 // is rounded to f32 first, the same two roundings as the separate SCALE op.
 layout (constant_id = 3) const bool do_post_scale = false;
 
-// RMS_NORM + MUL + SIGMOID + MUL + CPY(f16) (the qwen4exp GDN output norm, LLAMA_GDN_NORM_F16 / GGML_VK_GDN_NORM_F16):
-// the second multiplier is read raw (z) and passed through sigmoid here, with unary.comp's op_sigmoid expression, and the
-// f16 variant of this shader stores the ssm_out GEMM's B operand directly (idea from Strata's GDN_NOY: only the f16
-// image the out projection reads is written)
+// RMS_NORM + MUL + SIGMOID + MUL + CPY(f16) (the qwen4exp GDN output norm, after Strata's GDN_NOY): z is read raw and passed
+// through unary.comp's op_sigmoid expression; the f16 variant writes only the ssm_out GEMM's B operand
 layout (constant_id = 4) const bool do_sigmoid_c = false;
 
 layout (binding = 3) readonly buffer C {float data_c[];};

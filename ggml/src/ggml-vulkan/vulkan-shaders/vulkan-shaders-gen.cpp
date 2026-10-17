@@ -644,9 +644,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
             if (matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
-                // HC_UP_MIX (wave 5): the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
+                // HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
-                // wave 6: the same with an f16 mixed stream (D16 keeps the f32x4 store helpers out; the epilogue returns before any D16 store)
+                // the same with an f16 mixed stream (D16 keeps the f32x4 store helpers out; the epilogue returns before any D16 store)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
             if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
@@ -693,10 +693,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     }
 
-    // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl): per-type shaders with the
-    // 8-wide dword loaders (4-wide for q4_K/q5_K, which use the tile-row scale cache), f16 and f32 B, selected
-    // at init by GGML_VK_MM_PREFETCH. Dense and subgroup MUL_MAT_ID only (the default MUL_MAT_ID path has no
-    // coopmat variant on this tree).
+    // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl), f16 and f32 B, selected at init by
+    // GGML_VK_MM_PREFETCH; dense and subgroup MUL_MAT_ID only
     if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
         for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
             const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
@@ -709,10 +707,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             };
             string_to_spv(shader_name + "_" + tname + "_f16_pf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
             string_to_spv(shader_name + "_" + tname + "_f32_pf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
-            // f16-output twins for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions on the routed f16-B pf path (wave 4): the store is the
-            // fork's build variant (D_TYPE float16_t, D16 = the 16-byte dense alignment rule); the subgroup MUL_MAT_ID twins carry
-            // the router-weight binding (binding 5, applied in the store when bit 0 of fusion_flags is set), f32 or
-            // f16 B as the model feeds them. No SwiGLU store on this path (CPY16_SWIGLU falls back to CPY16 + the separate GLU).
+            // f16-output twins for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions on the routed f16-B pf path; the MUL_MAT_ID ones carry
+            // the router-weight binding (fusion_flags bit 0). No SwiGLU store here (CPY16_SWIGLU falls back to CPY16 + GLU).
             if (matmul_id_type == MatMulIdType::NONE) {
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}}), fp16, coopmat, coopmat2, f16acc);
             } else {

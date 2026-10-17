@@ -1,19 +1,10 @@
-// Register-prefetch loaders for the KHR coopmat matmuls (MM_PREFETCH variants of mul_mm.comp).
-// Port of the nathanw fork GEMM rewrite (e68dd31db + the per-type loader follow-ups): the loop issues the
-// global loads of the next K tile (fetch_a / fetch_b) before the WMMAs of the current one and dequantises
-// them into LDS one iteration later (store_a_raw / store_b_raw). The 8-wide loaders fetch whole dwords
-// through a uint view of A for the 2-byte-aligned block types. Faster quant loaders after Gufo
-// (fedeizzo, francescobozzo). Only compiled with MM_PREFETCH; the generic MULMAT_QUANT shader is untouched.
+// Register-prefetch loaders for the KHR coopmat matmuls (MM_PREFETCH variants of mul_mm.comp): the next K tile's global loads
+// (fetch_a / fetch_b) are issued before the current WMMAs and dequantised into LDS one iteration later (store_*_raw).
+// Faster quant loaders after Gufo (fedeizzo, francescobozzo).
 
-// Register reuse across K steps (register-prefetch loop only). The q5_K qh dword serves all eight
-// BK = 32 steps of a superblock, as do the iq4_xs d/scale words, so fetch_a loads them once per
-// superblock and keeps the register otherwise (pos_a is uniform, so the skip is a scalar branch).
-// a_fetch_all forces full fetches: for the prologue (split-k may start anywhere in a superblock) and
-// for the non-prefetch loaders, which call fetch_a with a fresh raw. GGML_VK standalone dispatcher,
-// 3 interleaved runs, 2026-09-28, 17408x2048x5120 / 5120x2048x17408: q5_K 256x256 tile 1.14x/1.10x,
-// 128x128 1.12x/1.08x; iq4_xs 256x256 1.035x/1.02x, 128x128 1.04x/1.01x. Tried and not kept: the
-// q4_K/q5_K qs dword (it holds two consecutive steps' nibbles): q4_K 256x256 0.95x (ACO added ~100
-// copies to the loop), q5_K no change over qh alone; the q6_K qh group (serves 4 steps): 0.90-0.97x.
+// Register reuse across K steps (prefetch loop only): the q5_K qh dword and the iq4_xs d/scale words serve a whole superblock,
+// so fetch_a loads them once per superblock (q5_K 1.08-1.14x, iq4_xs 1.01-1.04x on gfx1151). a_fetch_all forces full fetches
+// for the prologue (split-k may start mid-superblock) and the non-prefetch loaders.
 #if !defined(NO_A_REUSE)
 #define A_REUSE 1
 #endif
@@ -24,8 +15,8 @@ bool a_fetch_all = true;
 // fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
 // dword(b-2), dword(b+2) and a 16-bit load of b+6: it never touches a byte outside [b-2, b+8). q8_0 / q5_0 / iq4_nl groups
 // start after d, so b-2 stays inside the block; a q6_K / q3_K group at the start of an odd block reads the last 2 bytes of
-// the previous block of the same tensor (block 0 is 4-aligned, so nothing before the tensor). The first version read whole
-// dwords past the group and faulted on the last block of an mmap'd tensor (GPUVM fault, 2026-09-13).
+// the previous block of the same tensor (block 0 is 4-aligned, so nothing before the tensor). Reading whole dwords past
+// the group instead faults on the last block of an mmap'd tensor.
 // Scales and d are read through the typed block members. Index math is split into a uniform part
 // (pos_a: superblock column and the position inside the block are the same for every lane) and a
 // lane-invariant part computed once before the K loop (a_lane_off / a_store_idx, see mul_mm.comp).
@@ -898,12 +889,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 
 // ---- register prefetch (dense coopmat path, aligned pipelines) ----------------------------------
-// The fused load_*_to_shmem functions issue the global load and immediately consume it, so every BK
-// step stalls for the full memory latency before the tile reaches LDS (ISA audit 2026-09-13: the
-// f32-accumulator loop dropped from 526 to 340 instructions for +4% at n=512, i.e. the loop is
-// latency-bound, not issue-bound). fetch_* only issue the loads for the NEXT tile into registers;
-// store_*_raw dequantize/convert those registers into LDS one iteration later, after the WMMAs of
-// the current tile have covered the latency. Types are added as their fetch/store split is written.
+// The fused load_*_to_shmem loaders consume each global load at once, so every BK step waits the full memory latency (the loop
+// is latency-bound: 526 -> 340 instructions gave +4% on gfx1151). fetch_* load the NEXT tile into registers and store_*_raw
+// write them to LDS one iteration later, after the current WMMAs covered the latency.
 #if defined(COOPMAT) && (defined(DATA_A_F16) || defined(DATA_A_F32)) && LOAD_VEC_A == 8
 // f16 / f32 A, aligned pipelines only (the unaligned ones keep the fused scalar loader; see mul_mm.comp)
 #define A_PREFETCH 1
