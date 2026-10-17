@@ -4,7 +4,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include <cmath>
 #include <cstdio>
 #include <vector>
 
