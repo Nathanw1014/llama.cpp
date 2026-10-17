@@ -269,8 +269,10 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sched-view-scratch.cpp)
-llama_build_and_test(test-hc-up-mix-exact.cpp)
-llama_build_and_test(test-f16-store-exact.cpp)
+# Vulkan fused-path exactness: the engagement asserts need the int8 MMQ / f16-output pipelines, which lavapipe and many
+# non-AMD devices lack, so these are not registered as tests (run them manually on a device that has the paths)
+llama_build(test-hc-up-mix-exact.cpp)
+llama_build(test-f16-store-exact.cpp)
 llama_build_and_test(test-mmid-manual-frag.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
