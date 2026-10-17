@@ -554,40 +554,35 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 
-// bf16 twins (B6): the f32 router / ssm_alpha / ssm_beta / hc inject weights are read whole once per token at decode as f32
-// mat-vecs (~0.3 GB per token on Flash-Next REAP-320). Where every value is bf16-exact (the converter keeps these in f32 but
-// their origin is bf16), a bf16 copy halves the bytes with identical values. Built once, on the first graph whose weights are
-// loaded (a no-alloc fitting model defers); used only for batches of <= 8 tokens (the mat-vec path), the f32 original stays
-// for the GEMMs. LLAMA_BF16_TWINS=0 disables.
-ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
-    std::lock_guard<std::mutex> lock(bf16_twins_mutex);
-    if (!bf16_twins_tried) {
-        const char * e = getenv("LLAMA_BF16_TWINS");
-        if (e != nullptr && atoi(e) == 0) {
-            bf16_twins_tried = true;
-            return nullptr;
-        }
-        std::vector<ggml_tensor *> ws;
-        for (const auto & layer : layers) {
-            for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ssm_alpha, layer.ssm_beta, layer.hc_attn_inject, layer.hc_ffn_inject }) {
-                if (t != nullptr && t->type == GGML_TYPE_F32) {
-                    ws.push_back(t);
-                }
+// bf16 twins: decode reads the f32 router / ssm_alpha / ssm_beta / hc inject weights whole once per token as mat-vecs. Where
+// every value is bf16-exact (lower 16 bits zero), a bf16 copy on the weight's buffer type halves the bytes with identical values.
+bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+    if (!ml.no_alloc) {
+        load_bf16_twins();
+    }
+    return true;
+}
+
+void llama_model_qwen4exp::load_bf16_twins() {
+    const char * e = getenv("LLAMA_BF16_TWINS");
+    if (e != nullptr && atoi(e) == 0) {
+        return;
+    }
+    size_t n_exact = 0, n_inexact = 0, bytes = 0;
+    std::vector<float> src;
+    std::vector<ggml_bf16_t> dst;
+    std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ssm_alpha, layer.ssm_beta, layer.hc_attn_inject, layer.hc_ffn_inject }) {
+            if (t == nullptr || t->type != GGML_TYPE_F32) {
+                continue;
             }
-        }
-        for (const ggml_tensor * t : ws) {
-            if (t->data == nullptr) {
-                return nullptr;   // not loaded yet (the -fit probe): decide on a later build
-            }
-        }
-        bf16_twins_tried = true;
-        size_t n_exact = 0, n_inexact = 0, bytes = 0;
-        std::vector<float> src;
-        std::vector<ggml_bf16_t> dst;
-        std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
-        for (ggml_tensor * t : ws) {
             // a weight on a host buffer runs on the CPU, whose bf16 matmul also rounds the activations to bf16
-            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+            if (t->buffer == nullptr || t->data == nullptr || ggml_backend_buffer_is_host(t->buffer) || !ggml_is_contiguous(t) ||
+                t->ne[2] != 1 || t->ne[3] != 1) {
                 continue;
             }
             src.resize(ggml_nelements(t));
@@ -603,49 +598,40 @@ ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
             }
             by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
         }
-        for (auto & kv : by_buft) {
-            ggml_init_params ip = { ggml_tensor_overhead() * (kv.second.size() + 1), nullptr, true };
-            ggml_context * ctx = ggml_init(ip);
-            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
-            for (ggml_tensor * t : kv.second) {
-                ggml_tensor * tw = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, t->ne[0], t->ne[1]);
-                ggml_format_name(tw, "%s.bf16", ggml_get_name(t));
-                pairs.emplace_back(t, tw);
-            }
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, kv.first);
-            if (buf == nullptr) {
-                LLAMA_LOG_WARN("%s: bf16 twins: allocation on %s failed, keeping f32\n", __func__, ggml_backend_buft_name(kv.first));
-                ggml_free(ctx);
-                continue;
-            }
-            for (auto & p : pairs) {
-                src.resize(ggml_nelements(p.first));
-                dst.resize(src.size());
-                ggml_backend_tensor_get(p.first, src.data(), 0, src.size() * sizeof(float));
-                ggml_fp32_to_bf16_row_ref(src.data(), dst.data(), (int64_t) src.size());
-                ggml_backend_tensor_set(p.second, dst.data(), 0, dst.size() * sizeof(ggml_bf16_t));
-                bf16_twins[p.first] = p.second;
-                n_exact++;
-                bytes += ggml_nbytes(p.second);
-            }
-            bf16_twin_ctxs.push_back(ctx);
-            bf16_twin_bufs.push_back(buf);
-        }
-        LLAMA_LOG_INFO("%s: bf16 twins: %zu f32 weights are bf16-exact and got twins (%.1f MiB), %zu are not and keep f32\n",
-                __func__, n_exact, bytes / (1024.0 * 1024.0), n_inexact);
     }
-    auto it = bf16_twins.find(w);
-    return it == bf16_twins.end() ? nullptr : it->second;
+    for (auto & kv : by_buft) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (kv.second.size() + 1), nullptr, true };
+        ggml_context_ptr ctx { ggml_init(ip) };
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (ggml_tensor * t : kv.second) {
+            ggml_tensor * tw = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_BF16, t->ne[0], t->ne[1]);
+            ggml_format_name(tw, "%s.bf16", ggml_get_name(t));
+            pairs.emplace_back(t, tw);
+        }
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), kv.first) };
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: bf16 twins: allocation on %s failed, keeping f32\n", __func__, ggml_backend_buft_name(kv.first));
+            continue;
+        }
+        for (auto & p : pairs) {
+            src.resize(ggml_nelements(p.first));
+            dst.resize(src.size());
+            ggml_backend_tensor_get(p.first, src.data(), 0, src.size() * sizeof(float));
+            ggml_fp32_to_bf16_row_ref(src.data(), dst.data(), (int64_t) src.size());
+            ggml_backend_tensor_set(p.second, dst.data(), 0, dst.size() * sizeof(ggml_bf16_t));
+            bf16_twins[p.first] = p.second;
+            n_exact++;
+            bytes += ggml_nbytes(p.second);
+        }
+        bf16_twin_bufs.emplace_back(std::move(ctx), std::move(buf));
+    }
+    LLAMA_LOG_INFO("%s: bf16 twins: %zu f32 weights are bf16-exact and got twins (%.1f MiB), %zu are not and keep f32\n",
+            __func__, n_exact, bytes / (1024.0 * 1024.0), n_inexact);
 }
 
-// the twins live outside the model's buffer list, so they are released here
-llama_model_qwen4exp::~llama_model_qwen4exp() {
-    for (ggml_backend_buffer_t buf : bf16_twin_bufs) {
-        ggml_backend_buffer_free(buf);
-    }
-    for (ggml_context * ctx : bf16_twin_ctxs) {
-        ggml_free(ctx);
-    }
+ggml_tensor * llama_model_qwen4exp::bf16_twin(const ggml_tensor * w) const {
+    auto it = bf16_twins.find(w);
+    return it == bf16_twins.end() ? nullptr : it->second;
 }
 
 // decode-sized batches (<= 8 tokens take the mat-vec path): the bf16 twin of a weight where it exists, else the weight
