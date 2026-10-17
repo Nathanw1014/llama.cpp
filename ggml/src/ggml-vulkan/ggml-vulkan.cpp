@@ -1882,6 +1882,7 @@ static bool ggml_vk_mmid_manual_frag_enabled() {
     return on;
 }
 static void ggml_vk_path_census_add(const char * name);
+static bool ggml_vk_dispatch_census_enabled();
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
 static bool ggml_vk_dense_ypad_camps(uint64_t k);
@@ -9233,11 +9234,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             } else {
                 static bool rega_logged = false;
                 if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
-                ggml_vk_path_census_add("MUL_MAT_ID_REGA");
-                ggml_vk_path_census_add((std::string("MUL_MAT_ID_REGA:") + ggml_type_name(src0->type)).c_str());
-                if (pipeline->name.find("_mf") != std::string::npos) {   // the REG_A twin built with manual B fragment loads
-                    ggml_vk_path_census_add("MUL_MAT_ID_REGA_MF");
-                    ggml_vk_path_census_add((std::string("MUL_MAT_ID_REGA_MF:") + ggml_type_name(src0->type)).c_str());
+                if (ggml_vk_dispatch_census_enabled()) {   // the per-type names build a string: only while the census counts
+                    ggml_vk_path_census_add("MUL_MAT_ID_REGA");
+                    ggml_vk_path_census_add((std::string("MUL_MAT_ID_REGA:") + ggml_type_name(src0->type)).c_str());
+                    if (pipeline->name.find("_mf") != std::string::npos) {   // the REG_A twin built with manual B fragment loads
+                        ggml_vk_path_census_add("MUL_MAT_ID_REGA_MF");
+                        ggml_vk_path_census_add((std::string("MUL_MAT_ID_REGA_MF:") + ggml_type_name(src0->type)).c_str());
+                    }
                 }
                 pipeline = itr->second[0].aligned;
             }
@@ -9250,16 +9253,18 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // engagement read for the manual-fragment port: every MUL_MAT_ID dispatch, the ones on the coopmat register-prefetch / REG_A
     // pipelines (the only ones with an "_mf" build), and the ones that run an "_mf" build
     // per expert type too (":<type>"), so the REG_A engagement ratio reads MUL_MAT_ID_REGA:<t> / MUL_MAT_ID_ALL:<t>
-    ggml_vk_path_census_add("MUL_MAT_ID_ALL");
-    ggml_vk_path_census_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
-    if (pipeline->name.find("_pf") != std::string::npos) {
-        ggml_vk_path_census_add("MUL_MAT_ID_PF");
-        if (ggml_vk_mmid_b_full_enabled()) {
-            ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
-        }
-        ggml_vk_path_census_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
-        if (pipeline->name.find("_mf") != std::string::npos) {
-            ggml_vk_path_census_add("MUL_MAT_ID_MANUAL_FRAG");
+    if (ggml_vk_dispatch_census_enabled()) {   // name lookups and per-type strings: only while the census counts
+        ggml_vk_path_census_add("MUL_MAT_ID_ALL");
+        ggml_vk_path_census_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
+        if (pipeline->name.find("_pf") != std::string::npos) {
+            ggml_vk_path_census_add("MUL_MAT_ID_PF");
+            if (ggml_vk_mmid_b_full_enabled()) {
+                ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
+            }
+            ggml_vk_path_census_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
+            if (pipeline->name.find("_mf") != std::string::npos) {
+                ggml_vk_path_census_add("MUL_MAT_ID_MANUAL_FRAG");
+            }
         }
     }
     const uint64_t x_ne = ggml_nelements(src0);
@@ -18212,6 +18217,11 @@ static void ggml_vk_dispatch_census_add(const char * label, int n_nodes) {
 
 // call at a dispatch-path decision: counts "path:NAME" (e.g. ggml_vk_path_census_add("FA_EXACT")); master records none
 // yet, each path that wants an engagement check adds its own name
+// true while the census counts: a caller whose key needs work to build (a string, a name lookup) checks it first
+static bool ggml_vk_dispatch_census_enabled() {
+    return vk_dispatch_census_on.load(std::memory_order_relaxed);
+}
+
 [[maybe_unused]] static void ggml_vk_path_census_add(const char * name) {
     if (vk_dispatch_census_on.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
