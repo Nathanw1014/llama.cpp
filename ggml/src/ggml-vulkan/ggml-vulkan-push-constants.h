@@ -236,6 +236,7 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t gate;
     float    gate_in;
     float    gate_out;
+    uint32_t zero;   // always 0: the f16 store's XOR operand
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 

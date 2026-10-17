@@ -7136,6 +7136,7 @@ static void ggml_vk_matmul_id(
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, n_as, row_ids_offset,
                                               fusion_flags | (glu_up && glu_acc_gate ? 8u : 0u) | (rowid_fill ? 16u : 0u) };
+    GGML_ASSERT((pc.fusion_flags & 4u) == 0);   // bit 2 is the f16 / scaled stores' XOR zero (mul_mm.comp, mul_mmq_cm1.comp)
     const uint32_t tiles_y = std::min(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     const std::array<uint32_t, 3> elements = { m, tiles_y * pipeline->wg_denoms[1], uint32_t(CEIL_DIV(max_tiles, tiles_y)) };
     if (glu_up != nullptr) {
@@ -8797,6 +8798,7 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
         scale,
     };
     init_pushconst_tensor_offsets(ctx, pc, x, weights, nullptr, nullptr, dst);
+    GGML_ASSERT(!d16 || (pc.n_embd >> 31) == 0);   // the f16 store XORs with n_embd >> 31 as its zero (dsv4_hc_pre.comp)
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
@@ -8890,6 +8892,7 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         has_post ? 1u : 0u,
         has_post ? ggml_get_op_params_f32(scale_in, 0) : 1.0f,
         has_post ? ggml_get_op_params_f32(hc_post->src[2], 0) : 1.0f,
+        0u,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -14004,6 +14007,7 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
         nb11, nb12, nb13,
         0, 0, // a_offset, d_offset filled in by init_pushconst_tensor_offsets
     };
+    GGML_ASSERT((rope.is_back & ~1u) == 0);   // the f16 store XORs with is_back & ~1 as its zero (rope_funcs.glsl)
 
     return rope;
 }
@@ -14078,6 +14082,7 @@ static void ggml_vk_rms_norm_small(ggml_backend_vk_context * ctx, vk_context& su
     vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, src1, dst, eps, 0);
     pc.param2 = post_scale;
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
+    GGML_ASSERT(dst->type != GGML_TYPE_F16 || pc.param3 == 0.0f);   // the f16 store XORs with param3 as its zero (rms_norm_small.comp)
 
     const uint32_t rows_per_wg = 256 / ctx->device->subgroup_size;
     const uint64_t nrows = (uint64_t)src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -14121,6 +14126,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         const ggml_tensor * indices = set_rows->src[1];
         vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, src0, set_rows, op_params[0], 0);
         init_pushconst_tensor_offsets(ctx, pc, src0, src0, nullptr, nullptr, set_rows);
+        GGML_ASSERT(set_rows->type != GGML_TYPE_F16 || pc.param3 == 0.0f);   // the f16 store XORs with param3 as its zero (rms_norm.comp)
 
         vk_pipeline pipeline = set_rows->type == GGML_TYPE_F16 ?
             ctx->device->pipeline_rms_norm_set_rows_f32_f16 : ctx->device->pipeline_rms_norm_set_rows_f32_f32;
@@ -14338,6 +14344,7 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
     }
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
+    GGML_ASSERT((mode >> 2) == 0);   // the f16 store XORs with mode >> 2 as its zero (glu_main.glsl)
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = split ? ggml_type_size(src1->type) : src0_type_size;
     const uint32_t dst_type_size  = ggml_type_size(dst->type);
