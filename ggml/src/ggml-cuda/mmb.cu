@@ -1106,6 +1106,7 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
     // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
     // models 0.002-0.065, 97-99%); pp4096 +0.9%. Keep on MMQ; Q8_0 / IQ4_NL already eligible, so exempt.
+    // Trellis types have no MMQ, so here they fall to the per-expert dequant + BLAS loop (see mmb_tq_enabled).
     const char * nm = ggml_get_name(dst);
     if (nm && strncmp(nm, "ffn_moe_gate_up", 15) == 0 &&
             src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_IQ4_NL) return false;
