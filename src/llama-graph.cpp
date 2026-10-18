@@ -1589,6 +1589,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
+    // EXL3 experts: no scale tensor, and LoRA adapters cannot name them
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            return ggml_exl3_mul_mat_id(ctx0, w, cur, ids, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     cur = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
@@ -1984,12 +1992,14 @@ bool llm_graph_keep_pins() {
     return on;
 }
 
-static bool llm_graph_moe_f16(int64_t n_tokens, const ggml_tensor * exps) {
+// EXL3 experts (EXL3_MUL_MAT_ID) take and produce f32 only: their MoE chain stays f32
+static bool llm_graph_moe_f16(int64_t n_tokens, const ggml_tensor * exps, const llama_exl3 * exl3) {
     static const bool on = [] {
         const char * e = getenv("LLAMA_MOE_F16");
         return e == nullptr || atoi(e) != 0;
     }();
-    return on && n_tokens >= 32 && exps != nullptr && llm_graph_weights_on_gpu(exps->buffer);
+    return on && n_tokens >= 32 && exps != nullptr && llm_graph_weights_on_gpu(exps->buffer) &&
+           !(exl3 && exl3->linears.count(exps));
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -2226,7 +2236,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
-        if (llm_graph_moe_f16(n_tokens, down_exps)) {
+        if (llm_graph_moe_f16(n_tokens, down_exps, exl3)) {
             // f16 expert activations at prefill: one cast of the merged projection, pinned right behind its
             // matmul so the backend fuses MUL_MAT_ID+CPY(f16) and stores f16 from the accumulator; the gate
             // and up views below are then f16 and the GLU runs f16 in / f16 out. The block input must stay
@@ -2252,7 +2262,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // cast so the backend can fuse MUL_MAT_ID+CPY(f16) and store f16 from the accumulator. The block
         // input stays referenced past the last cast (a view expanded after it): the allocator must not
         // hand the cast's destination the input's freed bytes while the fused matmul is still reading them.
-        const bool cast_f16 = llm_graph_moe_f16(n_tokens, down_exps) && gate_exps != nullptr && !up_exps_b && !gate_exps_b;
+        const bool cast_f16 = llm_graph_moe_f16(n_tokens, down_exps, exl3) && gate_exps != nullptr && !up_exps_b && !gate_exps_b;
         ggml_tensor * moe_inp = cur;
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
@@ -2338,7 +2348,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (has_gate) {
-                if (llm_graph_moe_f16(n_tokens, down_exps) && (cur->type != GGML_TYPE_F16 || up->type != GGML_TYPE_F16)) {
+                if (llm_graph_moe_f16(n_tokens, down_exps, exl3) && (cur->type != GGML_TYPE_F16 || up->type != GGML_TYPE_F16)) {
                     // f16 expert activations at prefill (fused gate/up or biased paths: the separate path
                     // cast right after each projection): the GLU runs f16 in / f16 out and the down
                     // projection takes the f16 B operand directly. LLAMA_MOE_F16=0 restores the f32 chain.
@@ -2420,7 +2430,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_weighted", il);
     }
 
-    const bool experts_f16 = llm_graph_moe_f16(n_tokens, down_exps) && experts->type == GGML_TYPE_F32;
+    const bool experts_f16 = llm_graph_moe_f16(n_tokens, down_exps, exl3) && experts->type == GGML_TYPE_F32;
     if (experts_f16) {
         // f16 expert outputs: the weighted down projection stores f16 (MUL_MAT_ID+MUL+CPY(f16) fusion) and
         // the combine below reads f16 and sums in f32 (ggml_add_cast, MULTI_ADD f16in kernel): half the
