@@ -18396,6 +18396,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                         return false;
                     }
+#ifdef GGML_USE_TRELLIS
+                    // coopmat2 devices build no trellis matmul pipelines (no cm2 decoder, and the scalar /
+                    // coopmat1 ones live in the other branches), so batched trellis MUL_MAT_ID would dequantize
+                    // every expert to f16 and can exceed maxStorageBufferRange. The mat-vec path is unaffected.
+                    if (device->coopmat2 && !ggml_vk_use_mul_mat_vec_id(op) &&
+                        (src0_type == GGML_TYPE_PTQ1_0 || src0_type == GGML_TYPE_TQ2_T ||
+                         src0_type == GGML_TYPE_TQK6 || src0_type == GGML_TYPE_TQK7 ||
+                         src0_type == GGML_TYPE_TQP5 || src0_type == GGML_TYPE_TQP6 || src0_type == GGML_TYPE_TQP7)) {
+                        return false;
+                    }
+#endif
                 }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
