@@ -4344,6 +4344,8 @@ static TQP_INLINE uint64_t tqp_window(const uint8_t * qs, int kb, int l) {
 }
 
 // the two weights of step 8l+j as an int32 (int16 pair)
+// the deepest state, j = 0 at kb = 7, ends at bit 7*7 + TQ_STATE_BITS of the 64-bit window
+static_assert(TQ_STATE_BITS + 6*7 + 7 <= 64, "TQP state window needs TQ_STATE_BITS <= 15");
 static TQP_INLINE int32_t tqp_pair(const int32_t * cb, uint64_t w, int kb, int j) {
     const uint32_t s = (uint32_t) (w >> ((7 - j)*kb)) & TQ_STATE_MASK;
     return cb[(s * 0x9e3779b1u) >> 21];
