@@ -4960,7 +4960,7 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
                 cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { set }, {});
                 cb.dispatch(1, 1, 1);
                 cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
-                    { vk::MemoryBarrier{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+                    { { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
                 ggml_vk_ctx_end(subctx);
                 ggml_vk_submit(subctx, device->fence);
                 VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "coopmat layout check waitForFences", device);
