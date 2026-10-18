@@ -43,6 +43,16 @@ static int compare(const char * what, const float * got, const float * want, siz
 }
 
 int main(int argc, char ** argv) {
+    // the reference files are raw little-endian (header, blocks and expected f32)
+    {
+        const uint16_t probe = 1;
+        uint8_t first;
+        memcpy(&first, &probe, 1);
+        if (first != 1) {
+            printf("big-endian host: the little-endian reference files are not read here, skipping\n");
+            return 0;
+        }
+    }
     const char * path = argc > 1 ? argv[1] : TQ2T_REF_DEFAULT;
     FILE * f = fopen(path, "rb");
     if (!f) {
