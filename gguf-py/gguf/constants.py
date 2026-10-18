@@ -521,6 +521,9 @@ class Keys:
         INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
+    class AgentionTrellis:
+        STATE_BITS = "agention.trellis.state_bits"  # uint32; TQ2_T / TQK / TQP files must say 15
+
 
 #
 # recommended mapping of model tensor names for storage in gguf
