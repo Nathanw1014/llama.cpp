@@ -1049,6 +1049,20 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 }
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
+static bool llama_type_is_offline_trellis(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
@@ -1509,6 +1523,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
+        }
+
+        // the in-tree TQ2_T / TQK / TQP encoders are placeholders: real files come from the offline encoder
+        if (metadata[i].target_type != tensor->type && llama_type_is_offline_trellis(metadata[i].target_type)) {
+            throw std::runtime_error(format("%s: %s tensors can only be written by the offline trellis encoder",
+                tensor->name, ggml_type_name(metadata[i].target_type)));
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
