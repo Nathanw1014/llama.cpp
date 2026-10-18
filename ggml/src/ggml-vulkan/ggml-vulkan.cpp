@@ -6493,12 +6493,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3 ? 4u : rows; };
     uint32_t rm_iq = 2 * rm_kq;
 #ifdef GGML_USE_TRELLIS
-    // Trellis types (TQ2_T/TQK6/TQK7) copy an 8 KiB codebook into shared memory per workgroup;
-    // more rows per workgroup could amortize that copy. An interleaved A/B on Flash-Next TQK6
-    // decode (gfx1151) showed no effect beyond run-to-run drift (~8%), so the
-    // default stays rm_iq. GGML_VK_TQ_RM overrides (experiment knob).
-    uint32_t rm_tq = rm_iq;
-    if (const char * e = getenv("GGML_VK_TQ_RM")) { const int v = atoi(e); if (v >= 1 && v <= 32) rm_tq = (uint32_t) v; }
+    // Trellis types copy an 8 KiB codebook into shared memory per workgroup; more rows per
+    // workgroup could amortize that copy, but an interleaved A/B on Flash-Next TQK6 decode
+    // (gfx1151) showed no effect beyond run-to-run drift (~8%), so they use rm_iq.
+    const uint32_t rm_tq = rm_iq;
     // TQK6/TQK7 expert mat-vec (MUL_MAT_ID): 16 rows per workgroup. Each row is an unrolled,
     // independent load chain, so more rows give more loads in flight per thread, and the 8 KiB
     // codebook copy is shared by 4x more rows. Microbench on gfx1151 (512 experts, 10 used):
