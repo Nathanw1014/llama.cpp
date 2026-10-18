@@ -7478,11 +7478,15 @@ static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
     return can && (env >= 0 ? env != 0 : true);
 }
 
-// GGML_VK_DENSE_YPAD=N (multiple of 8, default 128, 0 off; idea from Strata): pad the staged f16 B rows of the dense f16-B path
-// where their 256 B-granule stride camps on few DRAM channels (gcd >= 8; q8_0 2560x2048x6144 on gfx1151: 30.2 -> 40.9 TFLOPS).
+// GGML_VK_DENSE_YPAD=N (multiple of 8, default 0 off, 1..7 = 128; idea from Strata): pad the staged f16 B rows of the dense f16-B
+// path where their 256 B-granule stride camps on few DRAM channels (gcd >= 8; q8_0 2560x2048x6144 on gfx1151: 30.2 -> 40.9 TFLOPS).
 // Same bits, only the scratch layout changes. GGML_VK_DENSE_YPAD_ALL=1 pads every staged f16 B (probe).
+// Off by default: neutral on Flash-Next REAP-320 (pp 0.0 / +0.7%, d0 / 8k) and Qwen3.8-27B (-0.2 / +0.1%), gfx1151 RADV ABBA n=2, 2026-10-18
 static uint32_t ggml_vk_dense_ypad() {
-    static const uint32_t pad = [] { const char * e = getenv("GGML_VK_DENSE_YPAD"); return e ? (uint32_t) std::max(0, atoi(e)) & ~7u : 128u; }();
+    static const uint32_t pad = [] {
+        const int v = [] { const char * e = getenv("GGML_VK_DENSE_YPAD"); return e ? atoi(e) : 0; }();
+        return v <= 0 ? 0u : (v & ~7) != 0 ? (uint32_t) (v & ~7) : 128u;
+    }();
     return pad;
 }
 static bool ggml_vk_dense_ypad_camps(uint64_t k) {
