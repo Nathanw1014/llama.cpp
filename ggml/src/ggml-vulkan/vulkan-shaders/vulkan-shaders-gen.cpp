@@ -613,10 +613,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             continue;
         }
 #ifdef GGML_USE_TRELLIS
-        // PTQ1_0 has no coopmat2 decoder: dequant_funcs_cm2.glsl carries no PTQ1_0 entry,
-        // so emitting mul_mm_cm2 for it fails shader compilation and takes the whole
-        // Vulkan build down, not just this type. Skip it; it falls back to the scalar and
-        // coopmat1 matmul paths, which are the ones implemented and tested.
+        // The trellis types have no coopmat2 decoder: dequant_funcs_cm2.glsl carries no entry
+        // for them, so emitting mul_mm_cm2 fails shader compilation and takes the whole
+        // Vulkan build down. Skip them. A coopmat2 device then has no trellis matmul
+        // pipelines: MUL_MAT dequantizes to f16, and batched MUL_MAT_ID is declined in
+        // supports_op.
         if (coopmat2 && is_trellis_quant(tname)) {
             continue;
         }
