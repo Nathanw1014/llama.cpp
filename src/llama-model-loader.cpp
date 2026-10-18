@@ -841,6 +841,10 @@ llama_model_loader::llama_model_loader(
         if (n_type[GGML_TYPE_TQ2_T] + n_type[GGML_TYPE_TQK6] + n_type[GGML_TYPE_TQK7] +
             n_type[GGML_TYPE_TQP5] + n_type[GGML_TYPE_TQP6] + n_type[GGML_TYPE_TQP7] > 0) {
             const int64_t kid = gguf_find_key(metadata, "agention.trellis.state_bits");
+            if (kid >= 0 && gguf_get_kv_type(metadata, kid) != GGUF_TYPE_UINT32) {
+                throw std::runtime_error(format("agention.trellis.state_bits has type %s, expected %s",
+                    gguf_type_name(gguf_get_kv_type(metadata, kid)), gguf_type_name(GGUF_TYPE_UINT32)));
+            }
             const uint32_t bits = kid >= 0 ? gguf_get_val_u32(metadata, kid) : 16u;
             if (bits != 15u) {
                 throw std::runtime_error(format(
