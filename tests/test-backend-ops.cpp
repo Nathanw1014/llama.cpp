@@ -15425,7 +15425,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int bs : {1, 2, 4, 32, 128, 512}) {
         for (ggml_type type_a : {GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQ2_T, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ2_XS}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+            if (640 % ggml_blck_size(type_a) == 0) { // k=640: no 256-blocks (Q4_K, IQ2_XS)
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+            }
         }
     }
 
