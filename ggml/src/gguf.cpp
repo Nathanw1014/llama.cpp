@@ -717,6 +717,13 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ok = false;
                 break;
             }
+            // ids inside the range can still be unassigned (e.g. 142, PQ2_0, which is not ported)
+            if (ggml_blck_size(info.t.type) == 0) {
+                GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d (unassigned type id)\n",
+                    __func__, info.t.name, info.t.type);
+                ok = false;
+                break;
+            }
             const size_t  type_size = ggml_type_size(info.t.type);
             const int64_t blck_size = ggml_blck_size(info.t.type);
 
