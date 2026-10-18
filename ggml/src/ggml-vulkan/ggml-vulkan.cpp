@@ -8981,7 +8981,9 @@ static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::v
     uint32_t idx = ctx->device->matmul_id_tile_selector(m, n_per_expert, 0, ctx->device->shader_core_count, configs);
     if (idx >= configs.size()) idx = (uint32_t) configs.size() - 1;
     const vk_pipeline & sel = configs[idx].unaligned;
-    return sel != nullptr && sel->wg_denoms[0] == 64 && sel->wg_denoms[1] == 64;
+    // BN 64 medium tile, BM 64 or 128 (GGML_VK_MMID_M128): REG_A replaces either; ahead of M128 it read +2.7% / +2.8% pp2048 on
+    // Flash-Next REAP-320 d0 / 8k (gfx1151 RADV, ABBA n=4, 2026-10-18), M128 alone neutral
+    return sel != nullptr && sel->wg_denoms[1] == 64 && (sel->wg_denoms[0] == 64 || sel->wg_denoms[0] == 128);
 }
 
 // fused_scale / fused_dst: MUL_MAT_ID+MUL (router weights in the epilogue, result in the MUL's destination).
