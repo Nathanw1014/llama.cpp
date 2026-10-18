@@ -74,13 +74,8 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             ibi += p.stride_a;
 
 #if K_PER_ITER == 8
-#if defined(DATA_A_PTQ1_0)
-            vec4 v, v2;
-            ptq1_0_trits8(ib, a_offset, iqs, v, v2);
-#else
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
-#endif
 
             const vec2 dm = get_dm(ib, a_offset);
             if (dm.y != 0) { // quant has min component
