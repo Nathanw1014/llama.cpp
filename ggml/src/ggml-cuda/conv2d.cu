@@ -135,6 +135,8 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     constexpr int BM = 64, BN = 64, BK = 64;
     constexpr int AS = BK / 2 + 4;
     constexpr int BS = BN / 2 + 4;
+    // the copy loops start at 0 so their trip count is a constant (a loop starting at tid cannot be fully unrolled: -Wpass-failed on gfx1151 with ROCm 7.2.1)
+    static_assert((BM * BK / 8) % nthreads == 0 && (BM * BK / 2) % nthreads == 0 && BK % (nthreads / (BN / 2)) == 0, "conv2d copy loops need whole steps");
     __shared__ __align__(16) half2 a_s[BM][AS];
     __shared__ __align__(16) half2 b_s[BK][BS];
 
@@ -181,7 +183,8 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     for (int k0 = begin; k0 < end; k0 += BK) {
         if (k_total % 8 == 0 && uintptr_t(weight) % 16 == 0) {
 #pragma unroll
-            for (int i = tid; i < BM * BK / 8; i += nthreads) {
+            for (int i0 = 0; i0 < BM * BK / 8; i0 += nthreads) {
+                const int  i   = i0 + tid;
                 const int  row = i / (BK / 8), col = 8 * (i % (BK / 8));
                 const int4 v                 = m0 + row < oc && k0 + col < k_total ?
                                                    ((const int4 *) weight)[((m0 + row) * k_total + k0 + col) / 8] :
@@ -190,7 +193,8 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
             }
         } else {
 #pragma unroll
-            for (int i = tid; i < BM * BK / 2; i += nthreads) {
+            for (int i0 = 0; i0 < BM * BK / 2; i0 += nthreads) {
+                const int i   = i0 + tid;
                 const int row = i / (BK / 2), col = 2 * (i % (BK / 2));
                 half      lo = __float2half(0.0f), hi = lo;
                 if (m0 + row < oc && k0 + col < k_total) {
@@ -203,7 +207,8 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
             }
         }
 #pragma unroll
-        for (int k = load_row; k < BK; k += nthreads / (BN / 2)) {
+        for (int kb = 0; kb < BK; kb += nthreads / (BN / 2)) {
+            const int k  = kb + load_row;
             const int ki = k0 + k;
             const int ci = ki / (kw * kh), ky = ki / kw % kh, kx = ki % kw;
             const int offset = ki < k_total ? (n * ic + ci) * ih * iw + ky * dy * iw + kx * dx : 0;
