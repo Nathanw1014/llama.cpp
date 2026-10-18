@@ -264,12 +264,6 @@ const uint tq2t_lut_const[2048] = {
     0x3f9f1038u, 0x399fade8u, 0xb9da3363u, 0x37c83909u, 0xbc4c3c82u, 0xb788bc3au, 0x39daa897u, 0x3beeb6d2u
 };
 
-#ifdef TQ_LUT_DIRECT
-// Experiment: index the constant array directly (no per-workgroup shared copy).
-#define tq2t_lut tq2t_lut_const
-// Some shaders call init_iq_shmem unconditionally; nothing to copy here.
-void init_iq_shmem(uvec3 wgsize) {}
-#else
 // 8 KiB per workgroup; one 32-bit shared load returns both weights of a pair.
 shared uint tq2t_lut[2048];
 
@@ -285,7 +279,6 @@ void init_iq_shmem(uvec3 wgsize)
     }
     barrier();
 }
-#endif // TQ_LUT_DIRECT
 
 // Codebook index of trellis entry e = 2*s + p (see tq2t_hyb_index in ggml-common.h).
 const uint TQ_STATE_MASK = 0x7fffu; // 15-bit trellis states (TQ_STATE_BITS in ggml-common.h)
