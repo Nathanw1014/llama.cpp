@@ -51,6 +51,9 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// set in perf mode only: GGML_TEST_QUANT_INIT_BLOCKS must not make eval tensors repeat (identical experts hide routing bugs)
+static bool g_allow_quant_init_blocks = false;
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -100,9 +103,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
         // GGML_TEST_QUANT_INIT_BLOCKS=<n>: quantize only the first n blocks and repeat them over the
-        // tensor (perf runs of slow encoders, e.g. the trellis types on 512-expert MoE shapes).
+        // tensor (perf runs of slow encoders, e.g. the trellis types on 512-expert MoE shapes). Perf mode only.
         static const size_t fast_init_blocks = [] {
-            const char * e = getenv("GGML_TEST_QUANT_INIT_BLOCKS");
+            const char * e = g_allow_quant_init_blocks ? getenv("GGML_TEST_QUANT_INIT_BLOCKS") : nullptr;
             return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
         }();
         const size_t n_blocks_all = nels / ggml_blck_size(tensor->type);
@@ -13113,6 +13116,7 @@ int main(int argc, char ** argv) {
             mode = MODE_TEST;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
+            g_allow_quant_init_blocks = true;
         } else if (strcmp(argv[i], "grad") == 0) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
