@@ -1443,14 +1443,20 @@ void ggml_vec_dot_ptq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
 // >= 2^-3 in magnitude are exact, smaller ones are off by at most 2^-14. Indexing by
 // state instead of by codebook pair halves the lookups per weight and removes the
 // per-state hash multiply. Filled once by ggml_cpu_tq_init (from ggml_cpu_init).
-int16_t ggml_tq_state_i16[(TQ_STATE_MASK + 1)*4];
+// read as 64-bit (state) and 32-bit (pair) entries by the x86 kernels, so align past both
+#if defined(_MSC_VER)
+#define GGML_TQ_TABLE_ALIGN __declspec(align(64))
+#else
+#define GGML_TQ_TABLE_ALIGN __attribute__((aligned(64)))
+#endif
+GGML_TQ_TABLE_ALIGN int16_t ggml_tq_state_i16[(TQ_STATE_MASK + 1)*4];
 
 // The 2048 codebook pairs, rounded the same way: ggml_tq_state_i16[4*s + j] ==
 // ggml_tq_pair_i16[2*tq2t_hyb_index(2*s) + j]. 8 KiB, so it stays in L1; the TQP SIMD
 // kernels hash the state (one multiply) instead of reading the 256 KiB state table,
 // which is faster once many threads stream weights through L2 (TQP uses one pair per
 // state, so the state table saves no lookups there).
-int16_t ggml_tq_pair_i16[2048*2];
+GGML_TQ_TABLE_ALIGN int16_t ggml_tq_pair_i16[2048*2];
 
 void ggml_cpu_tq_init(void) {
     for (uint32_t i = 0; i < 2048*2; ++i) {
