@@ -1160,6 +1160,9 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+
+    // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
+    ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
