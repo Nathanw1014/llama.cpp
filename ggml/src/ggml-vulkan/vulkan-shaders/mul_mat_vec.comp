@@ -286,6 +286,7 @@ void accumulate_tqp(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
 // Eight lanes own a whole block: six packed qs words, one qh tail, one
 // inactive lane. Each packed byte is loaded once and supplies all its trits.
 // Keep the common reduction and fusion path, including partial output tiles.
+// Needs BLOCK_SIZE >= 8: the PTQ1_0 pipelines are built on the subgroup-16 workgroup size.
 void accumulate_ptq1_0(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
                       uint first_row, uint num_rows, uint tid) {
     const uint lane = tid & 7u;
