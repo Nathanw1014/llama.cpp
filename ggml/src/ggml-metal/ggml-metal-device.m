@@ -1509,6 +1509,22 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+// trellis types (PTQ1_0, TQ2_T, TQK6/7, TQP5/6/7) have no Metal kernels
+static bool ggml_metal_type_is_trellis(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_metal_supports_mul_mat_op(
         bool has_simdgroup_reduction,
         const struct ggml_tensor * op,
@@ -1516,7 +1532,8 @@ static bool ggml_metal_supports_mul_mat_op(
         bool mm_path) {
     if (!has_simdgroup_reduction ||
         op->src[0]->type == GGML_TYPE_NVFP4 ||
-        op->src[0]->type == GGML_TYPE_TQ1_0) {
+        op->src[0]->type == GGML_TYPE_TQ1_0 ||
+        ggml_metal_type_is_trellis(op->src[0]->type)) {
         return false;
     }
 
@@ -1922,7 +1939,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
+                   !ggml_metal_type_is_trellis(op->src[0]->type);
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
