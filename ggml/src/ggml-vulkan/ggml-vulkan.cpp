@@ -4090,7 +4090,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         !ggml_vk_intel_windows_driver_in_range(device->properties.driverVersion, 101, 8509, 101, 8860);
     if (can_use_fwht && device->subgroup_basic && device->subgroup_shuffle) {
         int idx = 0;
-        for (uint32_t n : {64, 128, 256, 512}) {
+        for (uint32_t n : {64, 128, 256, 512, 1024}) {
             if (device->subgroup_size <= n) {
                 ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
             }
@@ -4098,7 +4098,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     } else if (can_use_fwht) {
         int idx = 0;
-        for (uint32_t n : {64, 128, 256, 512}) {
+        for (uint32_t n : {64, 128, 256, 512, 1024}) {
             const uint32_t block_size = std::min(device->subgroup_size, n);
             ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
             ++idx;
@@ -8018,6 +8018,12 @@ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
         case 128: return 1;
         case 256: return 2;
         case 512: return 3;
+        // 1024: Bonsai 2's Hadamard block. Without it the rotation runs as a dense
+        // f32 1024x1024 mul_mat. GGML_VK_FWHT_1024=0 restores that path.
+        case 1024: {
+            static const bool off = [] { const char * e = getenv("GGML_VK_FWHT_1024"); return e != nullptr && e[0] == '0'; }();
+            return off ? -1 : 4;
+        }
         default:  return -1;
     }
 }
