@@ -4927,12 +4927,16 @@ struct test_exl3_mul_mat_id : public test_case {
     const int64_t ne11;       // 1: x broadcast over the slots, n_used: one x per slot
     const int64_t n_tokens;
     const bool    swiglu;     // x = swiglu(gate, up), as the MoE down projection reads it (fused on HIP's GEMM path)
+    const bool    mul_w;      // the result times the router weights [1, n_used, n_tokens], as llama's MoE does
 
     std::string vars() override {
+        if (mul_w) {
+            return VARS_TO_STR10(k, n, n_exp, tile_words, codebook, n_used, ne11, n_tokens, swiglu, mul_w);
+        }
         return VARS_TO_STR9(k, n, n_exp, tile_words, codebook, n_used, ne11, n_tokens, swiglu);
     }
 
-    bool run_whole_graph() override { return swiglu; }
+    bool run_whole_graph() override { return swiglu || mul_w; }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4940,9 +4944,9 @@ struct test_exl3_mul_mat_id : public test_case {
     }
 
     test_exl3_mul_mat_id(int64_t k = 256, int64_t n = 384, int64_t n_exp = 8, int64_t tile_words = 32, int codebook = 2,
-            int64_t n_used = 2, int64_t ne11 = 1, int64_t n_tokens = 13, bool swiglu = false)
+            int64_t n_used = 2, int64_t ne11 = 1, int64_t n_tokens = 13, bool swiglu = false, bool mul_w = false)
         : k(k), n(n), n_exp(n_exp), tile_words(tile_words), codebook(codebook), n_used(n_used), ne11(ne11), n_tokens(n_tokens),
-          swiglu(swiglu) {}
+          swiglu(swiglu), mul_w(mul_w) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * trellis = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, tile_words, n/16, k/16, n_exp);
@@ -4970,6 +4974,11 @@ struct test_exl3_mul_mat_id : public test_case {
         ggml_set_name(ids, "ids");
 
         ggml_tensor * out = ggml_exl3_mul_mat_id(ctx, trellis, x, ids, suh, svh, codebook);
+        if (mul_w) {
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+            ggml_set_name(w, "w");
+            out = ggml_mul(ctx, out, w);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10201,6 +10210,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_exl3_mul_mat_id(512, 768, 128, 64, 1, 8, n_tokens % 2 ? 1 : 8, n_tokens));
     }
     test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 100));
+    // the down projection times the router weights (fused on Vulkan with GGML_VK_EXL3_FUSE_MUL=1): dot, one token, GEMM
+    for (int64_t n_tokens : {1, 3, 200}) {
+        test_cases.emplace_back(new test_exl3_mul_mat_id(512, 768, 32, 32, 1, 4, 4, n_tokens, false, true));
+        test_cases.emplace_back(new test_exl3_mul_mat_id(512, 768, 32, 32, 1, 4, 4, n_tokens, true, true));
+    }
     test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 5));
 
     // glu ops
@@ -13004,6 +13018,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // EXL3 Qwen3.5-4B ffn_up (K = 4, mcg) at decode and ubatch rows
     for (int64_t rows : { 1, 512 }) {
         test_cases.emplace_back(new test_exl3_mul_mat(2560, 9216, 64, 1, {rows, 1}));
+    }
+    // EXL3 LFM2.5-8B-A1B experts (32, 4 used; gate/up x broadcast, down per slot; K = 2 and 4, mcg) and the q4_K
+    // MUL_MAT_ID of the same shapes (uniform random routing)
+    for (int64_t n_tokens : { 1, 4, 32, 512, 2048 }) {
+        for (int64_t tw : { 32, 64 }) {
+            test_cases.emplace_back(new test_exl3_mul_mat_id(2048, 1792, 32, tw, 1, 4, 1, n_tokens));
+            test_cases.emplace_back(new test_exl3_mul_mat_id(1792, 2048, 32, tw, 1, 4, 4, n_tokens));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, true, 1792, n_tokens, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, false, 2048, n_tokens, 1792));
     }
     // EXL3 Qwen3.5-9B ffn (K = 4, mcg) and the q4_K mat-mul of the same shapes, decode, MTP-sized and ubatch rows
     for (int64_t rows : { 1, 4, 8, 16, 32, 33, 64, 128, 512 }) {
