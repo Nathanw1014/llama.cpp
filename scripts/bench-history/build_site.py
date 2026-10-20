@@ -192,6 +192,22 @@ def tps(cell: dict[str, Any] | None) -> str:
     return f'<td class="num" title="{esc(title)}">{fmt(cell["mean"])} <span class="sd">&plusmn;{fmt(cell["sd"])}</span></td>'
 
 
+def ppl_cell(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return '<td class="num">-</td>'
+    if entry.get('ppl') is None:
+        return f'<td class="num"><span class="sd">{esc(entry.get("status"))}</span></td>'
+    title = f"{entry.get('n_chunks')} chunks at c{entry.get('n_ctx')}, b{entry.get('n_batch')} ub{entry.get('n_ubatch')}"
+    return f'<td class="num" title="{esc(title)}">{entry["ppl"]:.4f} <span class="sd">&plusmn;{entry["ppl_err"]:.4f}</span></td>'
+
+
+def ppl_delta(base: dict[str, Any] | None, other: dict[str, Any] | None) -> str:
+    if not base or not other or base.get('ppl') is None or other.get('ppl') is None:
+        return '<td class="num">-</td>'
+    delta = other['ppl'] - base['ppl']
+    return f'<td class="num">{delta:+.4f} <span class="sd">({100 * delta / base["ppl"]:+.3f}%)</span></td>'
+
+
 def load_runs(results: Path) -> list[dict[str, Any]]:
     runs = []
     for path in sorted((results / 'runs').glob('*/run.json')):
@@ -220,7 +236,7 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
                  f'<p class="lede">{len(runs)} recorded runs of <code>bench-gfx1151-history.yml</code> on the AMD DevLab '
                  f'Dispatch Strix Halo pool. Built {esc(generated)} UTC from the {branch} branch. '
                  'Machine-readable: <a href="data/runs.json">data/runs.json</a>.</p>\n'
-                 '<nav><a href="#runs">Runs</a><a href="#trend">Over time</a><a href="#results">All results</a></nav>\n'
+                 '<nav><a href="#runs">Runs</a><a href="#trend">Over time</a><a href="#ppl">Perplexity</a><a href="#results">All results</a></nav>\n'
                  '</header>\n<main>')
 
     parts.append('<section id="runs"><h2>Runs</h2>')
@@ -271,6 +287,31 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
         parts.append('</tbody></table></div>')
     if not groups:
         parts.append('<p class="note">No llama-bench results yet.</p>')
+    parts.append('</section>')
+
+    parts.append('<section id="ppl"><h2>Perplexity over time</h2>'
+                 '<p class="note">llama-perplexity on the pinned Wikitext-2 sample, newest run first, &plusmn; the error the tool reports. '
+                 'Both batch sizes score the same tokens, so the delta is the effect of how each chunk is cut into batches.</p>')
+    ppl_models = sorted({str(p.get('model')) for run in runs for p in run.get('perplexity') or []})
+    for model in ppl_models:
+        batches = sorted({p.get('n_batch') or 0 for run in runs for p in run.get('perplexity') or [] if p.get('model') == model})
+        parts.append(f'<h3>{esc(model)}</h3><div class="scroll"><table><thead><tr><th>Date (UTC)</th><th>Ref</th><th>Commit</th>'
+                     + ''.join(f'<th class="num">b{esc(b)}</th>' for b in batches)
+                     + ''.join(f'<th class="num">b{esc(b)} - b{esc(batches[0])}</th>' for b in batches[1:])
+                     + '<th>Sample</th></tr></thead><tbody>')
+        for run in runs:
+            mine = {p.get('n_batch'): p for p in run.get('perplexity') or [] if p.get('model') == model}
+            if not mine:
+                continue
+            matrix = run.get('matrix') or {}
+            parts.append(f'<tr><td><a href="runs/{esc(run["key"])}/index.html">{esc(run_date(run))}</a></td>'
+                         f'<td><code>{esc(run.get("ref"))}</code></td><td>{site.commit_link(run)}</td>'
+                         + ''.join(ppl_cell(mine.get(b)) for b in batches)
+                         + ''.join(ppl_delta(mine.get(batches[0]), mine.get(b)) for b in batches[1:])
+                         + f'<td>c{esc(matrix.get("ppl_ctx"))} x {esc(matrix.get("ppl_chunks"))} chunks</td></tr>')
+        parts.append('</tbody></table></div>')
+    if not ppl_models:
+        parts.append('<p class="note">No perplexity results yet.</p>')
     parts.append('</section>')
 
     rows = []
@@ -326,7 +367,7 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
              f'<h1>Run {esc(key)}</h1>',
              f'<p class="lede">{badge(run.get("status"))} <code>{esc(run.get("ref"))}</code> at {site.commit_link(run)} '
              f'on <span class="mono">{esc(runner.get("name"))}</span></p>',
-             '<nav><a href="#run">Run</a><a href="#bench">llama-bench</a><a href="#ops">test-backend-ops</a>'
+             '<nav><a href="#run">Run</a><a href="#bench">llama-bench</a><a href="#ppl">llama-perplexity</a><a href="#ops">test-backend-ops</a>'
              '<a href="#commands">Commands</a><a href="#raw">Raw output</a></nav>\n</header>\n<main>']
 
     commit = site.commit_link(run, short=False)
@@ -368,6 +409,9 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
         ('Depths (-d)', esc(','.join(map(str, matrix.get('depths', []))))),
         ('Repetitions (-r)', esc(matrix.get('reps'))),
         ('pp / tg / batch', f'{esc(matrix.get("n_prompt"))} / {esc(matrix.get("n_gen"))} / {esc(matrix.get("n_batch"))}'),
+        ('llama-perplexity', esc(f'Wikitext-2 wiki.test.raw (sha256 {matrix.get("wikitext_sha256")}), -c {matrix.get("ppl_ctx")}, '
+                                 f'{matrix.get("ppl_chunks")} chunks, -b/-ub {",".join(map(str, matrix.get("ppl_batches", [])))}')
+         if matrix.get('ppl') else 'no'),
         ('test-backend-ops perf', 'yes' if matrix.get('ops_perf') else 'no'),
     ]))
     steps = run.get('steps') or {}
@@ -429,6 +473,33 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                              f'<td class="num">{fmt(c["median"])}</td><td class="num">{fmt(c["min"])}</td><td class="num">{fmt(c["max"])}</td>'
                              f'<td class="num">{c["n"]}</td><td class="mono">{esc(", ".join(fmt(s) for s in c["samples"]))}</td></tr>')
             parts.append('</tbody></table></div></details>')
+    parts.append('</section>')
+
+    parts.append('<section id="ppl"><h2>llama-perplexity (Wikitext-2 sample)</h2>')
+    entries = run.get('perplexity') or []
+    if not entries:
+        parts.append('<p class="note">Not run.</p>')
+    else:
+        base = {}
+        for e in entries:
+            base.setdefault(e.get('model'), e)
+        parts.append('<table><thead><tr><th>Model</th><th class="num">batch / ubatch</th><th class="num">ctx x chunks</th>'
+                     '<th class="num">PPL</th><th class="num">vs first batch</th><th class="num">s/pass</th><th class="num">wall s</th>'
+                     '<th>Status</th><th>Raw log</th></tr></thead><tbody>')
+        for e in entries:
+            name = f'perplexity-{e.get("model")}-b{e.get("n_batch")}.log'
+            raw = link(site.log_url(key, name), name) if any(lg.get('name') == name for lg in run.get('logs', [])) else '-'
+            delta = ppl_delta(base[e.get('model')], e) if base[e.get('model')] is not e else '<td class="num">-</td>'
+            parts.append(f'<tr><td>{esc(e.get("model"))}</td><td class="num">{esc(e.get("n_batch"))} / {esc(e.get("n_ubatch"))}</td>'
+                         f'<td class="num">{esc(e.get("n_ctx")) + " x " + esc(e.get("n_chunks")) if e.get("n_ctx") else "-"}</td>{ppl_cell(e)}{delta}'
+                         f'<td class="num">{fmt(e.get("seconds_per_pass"))}</td><td class="num">{fmt(e.get("wall_seconds"), 1)}</td>'
+                         f'<td>{badge(e.get("status"))}</td><td>{raw}</td></tr>')
+        parts.append('</tbody></table>')
+        parts.append('<details><summary>Cumulative PPL per chunk</summary><table><tbody>'
+                     + ''.join(f'<tr><th>{esc(e.get("model"))} b{esc(e.get("n_batch"))}</th>'
+                               f'<td class="mono wrap">{esc(", ".join(f"{v:.4f}" for v in e.get("chunk_ppl") or []))}</td></tr>'
+                               for e in entries)
+                     + '</tbody></table></details>')
     parts.append('</section>')
 
     parts.append('<section id="ops"><h2>test-backend-ops perf</h2>')
@@ -508,6 +579,8 @@ def summary(run: dict[str, Any]) -> dict[str, Any]:
     out['run_url'] = (run.get('workflow') or {}).get('run_url')
     out['results'] = [{k: c[k] for k in ('model', 'test', 'n_batch', 'n_ubatch', 'n_depth', 'mean', 'sd', 'median', 'n')}
                       for c in cells(run)]
+    out['perplexity'] = [{k: p.get(k) for k in ('model', 'n_batch', 'n_ubatch', 'n_ctx', 'n_chunks', 'ppl', 'ppl_err', 'status')}
+                         for p in run.get('perplexity') or []]
     out['ops_perf'] = [{k: o.get(k) for k in ('backend', 'status', 'exit_code', 'n_rows')} for o in run.get('ops_perf', [])]
     return out
 

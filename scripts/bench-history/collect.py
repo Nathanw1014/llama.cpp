@@ -23,6 +23,10 @@ PERF_BW = re.compile(r'^(\d+) kB/run -\s+([0-9.]+) GB/s$')
 PERF_FLOP = re.compile(r'^([0-9.]+) ([kMGT])FLOP/run -\s+([0-9.]+) ([kMGT])FLOPS$')
 PERF_UNSUPPORTED = re.compile(r'^  [A-Za-z0-9_]+\(.*\): not supported')
 SCALE = {'k': 1e3, 'M': 1e6, 'G': 1e9, 'T': 1e12}
+PPL_FINAL = re.compile(r'Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)')
+PPL_CHUNK = re.compile(r'\[(\d+)\]([0-9]+\.[0-9]+|nan|inf),')
+PPL_SETUP = re.compile(r'calculating perplexity over (\d+) chunks, n_ctx=(\d+), batch_size=(\d+), n_seq=(\d+)')
+PPL_PASS = re.compile(r'([0-9.]+) seconds per pass')
 OPS_COLUMNS = ['op', 'params', 'runs', 'us_per_run', 'kb_per_run', 'gb_per_s', 'flop_per_run', 'flop_per_s']
 
 # the make logs are large and stay in the Actions artifact only
@@ -111,6 +115,29 @@ def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
     return rows, bad
 
 
+def parse_perplexity(path: Path) -> dict[str, Any]:
+    """Final PPL, its error, the cumulative per-chunk PPL and the setup line of one llama-perplexity log."""
+    out: dict[str, Any] = {'ppl': None, 'ppl_err': None, 'chunk_ppl': [], 'n_chunks': None, 'n_ctx': None,
+                           'batch_size': None, 'n_seq': None, 'seconds_per_pass': None}
+    if not path.is_file():
+        return out
+    text = ANSI.sub('', path.read_text(errors='replace'))
+    final = PPL_FINAL.findall(text)
+    if final:
+        out['ppl'], out['ppl_err'] = float(final[-1][0]), float(final[-1][1])
+    # stdout and stderr interleave, so take the [i] markers in order and stop at the first gap
+    for idx, value in PPL_CHUNK.findall(text):
+        if int(idx) == len(out['chunk_ppl']) + 1:
+            out['chunk_ppl'].append(float(value))
+    setup = PPL_SETUP.search(text)
+    if setup:
+        out['n_chunks'], out['n_ctx'], out['batch_size'], out['n_seq'] = (int(v) for v in setup.groups())
+    per_pass = PPL_PASS.search(text)
+    if per_pass:
+        out['seconds_per_pass'] = float(per_pass.group(1))
+    return out
+
+
 def first_match(path: Path, pattern: str) -> str | None:
     if not path.is_file():
         return None
@@ -179,6 +206,28 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             status = 'no rows'
         bench.append({'model': name, 'exit_code': rc, 'status': status, 'bad_lines': bad, 'rows': rows})
 
+    ppl_requested = meta.get('ppl', 'false') == 'true'
+    ppl = []
+    if ppl_requested:
+        ppl_rows = {(row[1], row[2]): row for row in results if row[0] == 'perplexity' and len(row) >= 4}
+        for name in meta.get('models', '').split(','):
+            if not name:
+                continue
+            for batch in int_list(meta.get('ppl_batches', '')):
+                row = ppl_rows.get((name, str(batch)))
+                parsed = parse_perplexity(raw / f'perplexity-{name}-b{batch}.log')
+                rc = to_int(row[3]) if row else None
+                if row and row[3] == 'no-wikitext':
+                    status = 'skipped (no wikitext)'
+                elif row is None and model_status.get(name, 'verified') not in ('verified', ''):
+                    status = f'skipped ({model_status[name]})'
+                else:
+                    status = exit_status(rc)
+                    if status == 'ok' and parsed['ppl'] is None:
+                        status = 'no result'
+                ppl.append({'model': name, 'n_batch': batch, 'n_ubatch': batch, 'exit_code': rc, 'status': status,
+                            'wall_seconds': float(row[4]) if row and len(row) > 4 and row[4] else None, **parsed})
+
     ops = []
     if ops_requested:
         ops_rc: dict[str, int | None] = {}
@@ -197,9 +246,10 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
                 'n_rows': len(rows), 'n_unsupported': unsupported, 'columns': OPS_COLUMNS, 'rows': rows,
             })
 
-    if all(b['status'] == 'ok' for b in bench) and all(o['status'] == 'ok' for o in ops) and bench:
+    entries = bench + ppl + ops
+    if bench and all(e['status'] == 'ok' for e in entries):
         status = 'ok'
-    elif any(b['rows'] for b in bench) or any(o['rows'] for o in ops):
+    elif any(b['rows'] for b in bench) or any(o['rows'] for o in ops) or any(p['ppl'] is not None for p in ppl):
         status = 'partial'
     else:
         status = 'failed'
@@ -258,11 +308,17 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             'n_gen': to_int(meta.get('n_gen')),
             'n_batch': to_int(meta.get('n_batch')),
             'ops_perf': ops_requested,
+            'ppl': ppl_requested,
+            'ppl_ctx': to_int(meta.get('ppl_ctx')),
+            'ppl_chunks': to_int(meta.get('ppl_chunks')),
+            'ppl_batches': int_list(meta.get('ppl_batches', '')),
+            'wikitext_sha256': meta.get('wikitext_sha256') or None,
         },
         'steps': steps,
         'commands': [{'label': r[0], 'command': r[1]} for r in read_tsv(raw / 'commands.tsv') if len(r) >= 2],
         'models': models,
         'llama_bench': bench,
+        'perplexity': ppl,
         'ops_perf': ops,
         'logs': logs,
     }
@@ -284,6 +340,9 @@ def write_summary(run: dict[str, Any]) -> None:
     lines.append('')
     for entry in run['llama_bench']:
         lines.append(f"- llama-bench {entry['model']}: {entry['status']}, {len(entry['rows'])} rows")
+    for entry in run['perplexity']:
+        value = f"PPL {entry['ppl']:.4f} +/- {entry['ppl_err']:.5f}" if entry['ppl'] is not None else 'no PPL'
+        lines.append(f"- llama-perplexity {entry['model']} b{entry['n_batch']}: {entry['status']}, {value}")
     for entry in run['ops_perf']:
         lines.append(f"- test-backend-ops perf {entry['backend']}: {entry['status']}, {entry['n_rows']} rows")
     with open(path, 'a') as f:
