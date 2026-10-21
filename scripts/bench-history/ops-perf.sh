@@ -6,6 +6,9 @@
 #
 # usage: ops-perf.sh <test-backend-ops> <device> <log> <case list>
 # Writes command lines to commands.tsv and results to results.tsv next to the log.
+#
+# A case that fails allocation or compute prints no `OP(params):` line, only "failed to allocate
+# tensors" or "graph_compute failed", and test-backend-ops still exits 0. Such failures are counted.
 
 set -uo pipefail
 bin=$1
@@ -33,6 +36,7 @@ cases() { grep -cE '^  [A-Za-z0-9_]+\(.*\): ' "$log"; }
 
 : > "$log"
 rc_all=0
+group_rc=0
 
 # run_group <label> <command as recorded> <test-backend-ops args>...
 run_group() {
@@ -45,6 +49,7 @@ run_group() {
     rc=${PIPESTATUS[0]}
     printf 'ops-perf-group\t%s\t%s\t%s\t%s\n' "$dev" "$label" "$rc" "$(( $(rows) - before ))" >> "$logs/results.tsv"
     echo "$dev $label: exit $rc, $(( $(rows) - before )) rows"
+    group_rc=$rc
     [ "$rc_all" -ne 0 ] || rc_all=$rc
 }
 
@@ -52,30 +57,39 @@ run_group mul_mat "$(quote "$bin" perf -b "$dev" -o MUL_MAT -p "$mul_mat")" -o M
 
 before=$(cases)
 run_group mul_mat_id "$(quote "$bin" perf -b "$dev" -o MUL_MAT_ID -p "$mul_mat_id")" -o MUL_MAT_ID -p "$mul_mat_id"
-if [ "$(cases)" -eq "$before" ]; then
+if [ "$group_rc" -eq 0 ] && [ "$(cases)" -eq "$before" ]; then
     echo "::warning::$dev: this build has no all-types MUL_MAT_ID perf cases (n_mats=32, m=512, k=2048)"
 fi
 
 listed=$(grep -c -v -e '^#' -e '^$' "$list")
 lines=$(wc -l < "$log")
-run_group list "$(quote "$bin" perf -b "$dev") -o \"\$(grep -v '^#' scripts/bench-history/perf-cases.txt | paste -sd, -)\"" \
+run_group list "$(quote "$bin" perf -b "$dev") -o \"\$(grep -v -e '^#' -e '^\$' $(quote "$list") | paste -sd, -)\"" \
     -o "$(grep -v -e '^#' -e '^$' "$list" | paste -sd, -)"
+failures=$(grep -cE 'failed to allocate|graph_compute failed' "$log")
 # distinct names: a few cases appear twice in the perf list and run twice
 seen=$(tail -n +"$(( lines + 1 ))" "$log" | grep -E '^  [A-Za-z0-9_]+\(.*\): ' | sed -E 's/\): .*$/)/' | sort -u | wc -l)
-if [ "$rc_all" -eq 0 ] && [ "$seen" -lt "$listed" ]; then
-    echo "::warning::$dev: $(( listed - seen )) of $listed listed perf cases are not in this build"
+if [ "$group_rc" -eq 0 ] && [ "$seen" -lt "$listed" ]; then
+    echo "::warning::$dev: $(( listed - seen )) of $listed listed perf cases printed no result (not in this build, or among the $failures failed cases)"
+fi
+if [ "$failures" -gt 0 ]; then
+    echo "::warning::$dev: $failures perf cases failed to allocate or compute"
 fi
 
 # `-b` with a name that matches no device exits 0, so prove the device ran
-awk -v dev="$dev" '
+final=$rc_all
+total=$(rows)
+if ! awk -v dev="$dev" '
     $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
         seen = 1
         if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
     }
     END { exit !(seen && ran) }
-' "$log" || { echo "::error::$dev never ran" >&2; exit 1; }
-
-total=$(rows)
-printf 'ops-perf\t%s\t%s\t%s\n' "$dev" "$rc_all" "$total" >> "$logs/results.tsv"
-[ "$total" -gt 0 ] || { echo "::error::no perf rows on $dev" >&2; exit 1; }
-exit "$rc_all"
+' "$log"; then
+    echo "::error::$dev never ran" >&2
+    final=1
+elif [ "$total" -eq 0 ]; then
+    echo "::error::no perf rows on $dev" >&2
+    final=1
+fi
+printf 'ops-perf\t%s\t%s\t%s\t%s\n' "$dev" "$final" "$total" "$failures" >> "$logs/results.tsv"
+exit "$final"

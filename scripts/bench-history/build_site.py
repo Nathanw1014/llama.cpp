@@ -511,7 +511,8 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
         parts.append('<p class="note">Not run.</p>')
     else:
         parts.append('<table><thead><tr><th>Backend</th><th>Status</th><th class="num">Exit</th><th class="num">Rows</th>'
-                     '<th class="num">Not supported</th><th>Groups (rows)</th><th class="num">Listed cases missing</th>'
+                     '<th class="num">Not supported</th><th class="num">Failed</th><th>Groups (rows)</th>'
+                     '<th class="num">Listed cases without a result</th>'
                      '<th>Table</th><th>Raw log</th></tr></thead><tbody>')
         for o in ops:
             backend = o.get('backend')
@@ -520,13 +521,14 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                 if any(lg.get('name') == f'ops-perf-{backend}.log' for lg in run.get('logs', [])) else '-'
             parts.append(f'<tr><td>{esc(backend)}</td><td>{badge(o.get("status"))}</td><td class="num">{esc(o.get("exit_code"))}</td>'
                          f'<td class="num">{esc(o.get("n_rows"))}</td><td class="num">{esc(o.get("n_unsupported"))}</td>'
-                         f'<td>{esc(group_summary(o))}</td>'
+                         f'<td class="num">{esc(o.get("n_failed", "-"))}</td><td>{esc(group_summary(o))}</td>'
                          f'<td class="num">{len(o.get("missing_listed") or [])} of {esc(o.get("n_listed", "-"))}</td>'
                          f'<td>{table}</td><td>{raw}</td></tr>')
         parts.append('</tbody></table>')
         for o in ops:
             if o.get('missing_listed'):
-                parts.append(f'<details><summary>{esc(o.get("backend"))}: listed cases that are not in this build</summary>'
+                parts.append(f'<details><summary>{esc(o.get("backend"))}: listed cases without a result '
+                             '(not in this build, or among the failed cases)</summary>'
                              f'<pre>{esc(chr(10).join(o["missing_listed"]))}</pre></details>')
     parts.append('</section>')
 

@@ -22,6 +22,8 @@ PERF_ROW = re.compile(r'^  ([A-Za-z0-9_]+)\((.*)\):\s+(\d+) runs -\s+([0-9.]+) u
 PERF_BW = re.compile(r'^(\d+) kB/run -\s+([0-9.]+) GB/s$')
 PERF_FLOP = re.compile(r'^([0-9.]+) ([kMGT])FLOP/run -\s+([0-9.]+) ([kMGT])FLOPS$')
 PERF_UNSUPPORTED = re.compile(r'^  ([A-Za-z0-9_]+\(.*\)): not supported')
+# a perf case that fails allocation or compute prints one of these instead of its `OP(params):` line
+PERF_FAILED = re.compile(r'failed to allocate|graph_compute failed')
 SCALE = {'k': 1e3, 'M': 1e6, 'G': 1e9, 'T': 1e12}
 PPL_FINAL = re.compile(r'Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)')
 PPL_CHUNK = re.compile(r'\[(\d+)\]([0-9]+\.[0-9]+|nan|inf),')
@@ -63,10 +65,11 @@ def int_list(value: str) -> list[int]:
     return [int(v) for v in value.split(',') if v.strip().isdigit()]
 
 
-def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int, set[str]]:
-    """Return the perf rows of `backend` in OPS_COLUMNS order, the count of unsupported cases and every case name seen."""
+def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int, set[str], int]:
+    """Return the perf rows of `backend` in OPS_COLUMNS order, the unsupported count, every case name seen and the failure count."""
     rows: list[list[Any]] = []
     unsupported = 0
+    failed = 0
     seen: set[str] = set()
     current = None
     for raw in path.read_text(errors='replace').splitlines():
@@ -76,6 +79,9 @@ def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int, set[
             current = m.group(1)
             continue
         if current != backend:
+            continue
+        if PERF_FAILED.search(line):
+            failed += 1
             continue
         m = PERF_UNSUPPORTED.match(line)
         if m:
@@ -97,7 +103,7 @@ def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int, set[
             row[6] = float(flop.group(1)) * SCALE[flop.group(2)]
             row[7] = float(flop.group(3)) * SCALE[flop.group(4)]
         rows.append(row)
-    return rows, unsupported, seen
+    return rows, unsupported, seen, failed
 
 
 def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -185,7 +191,11 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
     ops_requested = meta.get('ops_perf', 'false') == 'true'
 
     models = []
+    # the first record per model is the HIP step's; a Vulkan step download may add a second one
+    first_rows = {}
     for row in read_tsv(raw / 'models.tsv'):
+        first_rows.setdefault(row[0], row)
+    for row in first_rows.values():
         row += [''] * (8 - len(row))
         models.append({
             'key': row[0], 'repo': row[1], 'revision': row[2], 'file': row[3], 'bytes': to_int(row[4]),
@@ -207,6 +217,8 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             status = exit_status(rc)
             if model_status.get(name, 'verified') not in ('verified', ''):
                 status = f'skipped ({model_status[name]})'
+            elif (bench_rc.get(name) or '').startswith('skipped-'):
+                status = f"skipped ({bench_rc[name][len('skipped-'):]})"
             elif bench_rc.get(name) == 'skipped':
                 status = 'skipped (no model file)'
             elif backend == 'Vulkan' and rc is None and steps.get('device-vulkan') not in ('success', None):
@@ -249,7 +261,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
                       if line.strip() and not line.startswith('#')]
         for backend in ('ROCm0', 'Vulkan0'):
             log = raw / f'ops-perf-{backend}.log'
-            rows, unsupported, seen = parse_ops_perf(log, backend) if log.is_file() else ([], 0, set())
+            rows, unsupported, seen, n_failed = parse_ops_perf(log, backend) if log.is_file() else ([], 0, set(), 0)
             rc = ops_rc.get(backend)
             status = exit_status(rc)
             if rc is None and rows:
@@ -264,7 +276,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             list_done = any(g['group'] == 'list' and g['exit_code'] == 0 for g in groups)
             ops.append({
                 'backend': backend, 'exit_code': rc, 'status': status, 'step': steps.get(f'ops-perf-{backend}', ''),
-                'n_rows': len(rows), 'n_unsupported': unsupported, 'groups': groups,
+                'n_rows': len(rows), 'n_unsupported': unsupported, 'n_failed': n_failed, 'groups': groups,
                 'n_listed': len(listed), 'missing_listed': [c for c in listed if c not in seen] if list_done else [],
                 'columns': OPS_COLUMNS, 'rows': rows,
             })
@@ -370,7 +382,9 @@ def write_summary(run: dict[str, Any]) -> None:
         value = f"PPL {entry['ppl']:.4f} +/- {entry['ppl_err']:.5f}" if entry['ppl'] is not None else 'no PPL'
         lines.append(f"- llama-perplexity {entry['model']} b{entry['n_batch']}: {entry['status']}, {value}")
     for entry in run['ops_perf']:
-        missing = f", {len(entry['missing_listed'])} listed cases not in this build" if entry['missing_listed'] else ''
+        missing = f", {len(entry['missing_listed'])} listed cases without a result" if entry['missing_listed'] else ''
+        if entry.get('n_failed'):
+            missing += f", {entry['n_failed']} failed to allocate or compute"
         lines.append(f"- test-backend-ops perf {entry['backend']}: {entry['status']}, {entry['n_rows']} rows{missing}")
     with open(path, 'a') as f:
         f.write('\n'.join(lines) + '\n')
