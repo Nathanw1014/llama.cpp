@@ -15426,6 +15426,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // every type through MUL_MAT_ID at the same up/gate shape; 32 experts keep the weight setup short,
+    // which at 512 experts takes about 320 s per trellis case on gfx1151 (DevLab run 39469034755)
+    for (int bs : {1, 8, 512}) {
+        for (ggml_type type_a : all_types) {
+            if (2048 % ggml_blck_size(type_a) == 0) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false, 512, bs, 2048));
+            }
+        }
+    }
+
 #ifdef GGML_USE_TRELLIS
     // qwen3.8-flash-next routed experts (512 experts, 10 used): gate/up k=2560 -> m=640, down k=640 -> m=2560.
     // Trellis types against the K/IQ types they replace; 32..512 are prefill batches.
