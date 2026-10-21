@@ -7,11 +7,12 @@
 # it was dispatched on. workflow_dispatch only works once this file is on the default branch.
 #
 # One run does:
-#   1. builds llama-bench and test-backend-ops for HIP (gfx1151), with the bench-gfx1151.yml recipe
-#   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg
+#   1. builds llama-bench and test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
+#   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg, on ROCm0
 #   3. runs llama-perplexity with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
-#   4. runs the full test-backend-ops perf suite on ROCm0, then builds Vulkan and runs it on Vulkan0
-#   5. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
+#   4. runs the same llama-bench matrix on Vulkan0, after all HIP work
+#   5. runs a test-backend-ops perf subset on ROCm0, then on Vulkan0 (scripts/bench-history/ops-perf.sh)
+#   6. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
 #      bench-results branch and rebuilds the Pages site from all runs on that branch
 #
 # Recipe. Models, quants and flags come from bench-gfx1151.yml and its PR172 comparison variant,
@@ -33,9 +34,13 @@
 # both 4096. At c4096 the two runs score the same tokens: b2048 cuts every chunk into two batches,
 # b4096 runs it as one, so a PPL difference comes from the batch cut alone.
 #
-# The Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
-# SUM [8192,8192] case), so it runs last: a device reset cannot touch the HIP numbers. Such a run
-# is kept and shown as partial.
+# Perf subset: MUL_MAT and MUL_MAT_ID for every type at n = 1, 8 and 512, plus the cases listed in
+# scripts/bench-history/perf-cases.txt (an even sample of every other op). The full suite took more
+# than 150 min per device in run 39469034755, mostly CPU-side weight setup of trellis MUL_MAT_ID cases.
+#
+# The full Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
+# SUM [8192,8192] case), so the Vulkan perf subset runs last: a device reset cannot touch the other
+# numbers. Such a run is kept and shown as partial.
 #
 # Runner labels: `devlab-dispatch` reaches the AMD Ryzen AI Dev Lab pool, `strix-halo` selects Strix
 # Halo hosts in it. Keep both. A wrong label does not fail, the job queues silently.
@@ -73,12 +78,17 @@ on:
         required: false
         default: '5'
       ops_perf:
-        description: 'Run the full test-backend-ops perf suite on ROCm0 and Vulkan0'
+        description: 'Run the test-backend-ops perf subset on ROCm0 and Vulkan0'
         required: false
         default: true
         type: boolean
       ppl:
         description: 'Run llama-perplexity on the Wikitext-2 sample at batch 2048 and 4096'
+        required: false
+        default: true
+        type: boolean
+      vulkan_bench:
+        description: 'Run the llama-bench matrix on Vulkan0 too'
         required: false
         default: true
         type: boolean
@@ -202,10 +212,20 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
+      # the lane's own scripts and case list, which the measured ref may not have
+      - name: Checkout the lane scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .bench-lane
+          sparse-checkout: scripts/bench-history
+          persist-credentials: false
+
       - name: Record run metadata
         env:
           INPUT_OPS_PERF: ${{ inputs.ops_perf }}
           INPUT_PPL: ${{ inputs.ppl }}
+          INPUT_VULKAN_BENCH: ${{ inputs.vulkan_bench }}
         run: |
           set -euo pipefail
           logs="$RUNNER_TEMP/logs"
@@ -213,6 +233,7 @@ jobs:
           : > "$logs/commands.tsv"
           : > "$logs/results.tsv"
           : > "$logs/models.tsv"
+          cp .bench-lane/scripts/bench-history/perf-cases.txt "$logs/perf-cases.txt"
           git log -1 --format='%H%n%cI%n%s' > "$logs/commit.txt"
           {
             echo "schema=1"
@@ -231,6 +252,7 @@ jobs:
             echo "n_batch=$BENCH_N_BATCH"
             echo "ops_perf=$INPUT_OPS_PERF"
             echo "ppl=$INPUT_PPL"
+            echo "vulkan_bench=$INPUT_VULKAN_BENCH"
             echo "ppl_ctx=$PPL_CTX"
             echo "ppl_chunks=$PPL_CHUNKS"
             echo "ppl_batches=$PPL_BATCHES"
@@ -309,6 +331,107 @@ jobs:
             exit 1
           fi
 
+      - name: Provide the Vulkan toolchain
+        id: vulkan_sdk
+        if: ${{ !cancelled() && (inputs.ops_perf || inputs.vulkan_bench) && steps.checkout.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          # the pool has Mesa and the loader but no glslc, headers, SPIRV-Headers config or
+          # passwordless sudo, so unpack the Lunarg SDK into $RUNNER_TEMP (recipe from bench-gfx1151)
+          set -euo pipefail
+          logs="$RUNNER_TEMP/logs"
+          log="$logs/vulkan-env.log"
+          tarball="$RUNNER_TEMP/vulkan_sdk.tar.xz"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" \
+            "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkan_sdk.tar.xz"
+          echo "$VULKAN_SDK_SHA256  $tarball" | sha256sum -c - | tee "$log"
+          mkdir -p "$RUNNER_TEMP/vulkan_sdk"
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/vulkan_sdk"
+          glslc_path=$(find "$RUNNER_TEMP/vulkan_sdk" -type f -name glslc -print -quit)
+          if [ -z "$glslc_path" ]; then
+            echo "::error::no glslc in the SDK tarball" >&2
+            exit 1
+          fi
+          sdk_root=$(dirname "$(dirname "$glslc_path")")
+          # PATH and LD_LIBRARY_PATH are set by the Vulkan steps themselves, so the HIP steps keep a clean environment
+          echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
+          # FindVulkan wants an unversioned libvulkan.so; the runner has only the versioned loader
+          vk_lib=""
+          for lib in "$sdk_root/lib/libvulkan.so" "$sdk_root"/x86_64/lib/libvulkan.so /usr/lib/x86_64-linux-gnu/libvulkan.so /lib/x86_64-linux-gnu/libvulkan.so; do
+            if [ -f "$lib" ]; then
+              vk_lib="$lib"
+              break
+            fi
+          done
+          if [ -z "$vk_lib" ]; then
+            for lib in "$sdk_root"/lib/libvulkan.so.1 "$sdk_root"/x86_64/lib/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /lib/x86_64-linux-gnu/libvulkan.so.1; do
+              if [ -f "$lib" ]; then
+                mkdir -p "$RUNNER_TEMP/vkdev"
+                ln -sf "$lib" "$RUNNER_TEMP/vkdev/libvulkan.so"
+                vk_lib="$RUNNER_TEMP/vkdev/libvulkan.so"
+                break
+              fi
+            done
+          fi
+          if [ -z "$vk_lib" ]; then
+            echo "::error::no Vulkan loader found in the SDK or system library paths" >&2
+            exit 1
+          fi
+          echo "VULKAN_LIBRARY=$vk_lib" >> "$GITHUB_ENV"
+          {
+            echo "VULKAN_SDK=$sdk_root"
+            echo "VULKAN_LIBRARY=$vk_lib"
+            "$sdk_root/bin/glslc" --version | head -2
+            if [ -x "$sdk_root/bin/vulkaninfo" ]; then
+              "$sdk_root/bin/vulkaninfo" --summary 2>&1 | head -40 || true
+            fi
+          } 2>&1 | tee -a "$log"
+
+      - name: Build (Vulkan)
+        id: build_vulkan
+        if: ${{ !cancelled() && steps.vulkan_sdk.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          export PATH="$VULKAN_SDK/bin:$PATH"
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
+
+          # same flags as the vulkan branch of bench-gfx1151.yml
+          configure=(cmake -B build-vulkan -S .
+            -DCMAKE_BUILD_TYPE=Release
+            -DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF
+            "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
+            -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
+          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench test-backend-ops)
+
+          printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
+          printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
+          "${configure[@]}" 2>&1 | tee "$logs/build-vulkan-configure.log"
+          "${build[@]}" > "$logs/build-vulkan-make.log" 2>&1 || { tail -100 "$logs/build-vulkan-make.log"; exit 1; }
+          tail -5 "$logs/build-vulkan-make.log"
+
+      - name: Detect GPU device (Vulkan)
+        id: device_vulkan
+        if: ${{ !cancelled() && steps.build_vulkan.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          rc=0
+          ./build-vulkan/bin/llama-bench --list-devices > "$logs/devices-vulkan.txt" 2>&1 || rc=$?
+          cat "$logs/devices-vulkan.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::llama-bench --list-devices failed (exit $rc)" >&2
+            exit "$rc"
+          fi
+          if ! grep -qE '^  Vulkan0:' "$logs/devices-vulkan.txt"; then
+            echo "::error::Vulkan0 is not registered; the Vulkan backend did not build in or found no GPU" >&2
+            exit 1
+          fi
+
       - name: Fetch the Wikitext-2 sample
         id: wikitext
         if: ${{ !cancelled() && inputs.ppl && steps.device_hip.outcome == 'success' }}
@@ -325,13 +448,14 @@ jobs:
           echo "$WIKITEXT_TEST_SHA256  $dir/wikitext-2-raw/wiki.test.raw" | sha256sum -c -
           echo "WIKITEXT_FILE=$dir/wikitext-2-raw/wiki.test.raw" >> "$GITHUB_ENV"
 
-      - name: Download models, run llama-bench and llama-perplexity
+      - name: Download models, run llama-bench and llama-perplexity (HIP)
         id: bench
         if: ${{ !cancelled() && steps.device_hip.outcome == 'success' }}
         timeout-minutes: 600
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
           RUN_PPL: ${{ inputs.ppl }}
+          KEEP_MODELS: ${{ inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
         run: |
           # the runner starts bash with -e; drop it so one failed model does not stop the next
           set +e
@@ -460,156 +584,80 @@ jobs:
                 fi
               done
             fi
-            rm -rf "$dest"
+            # the Vulkan llama-bench step reuses the file and deletes it
+            [ "$KEEP_MODELS" = "true" ] || rm -rf "$dest"
+          done
+          exit "$failed"
+
+      - name: llama-bench (Vulkan)
+        id: bench_vulkan
+        if: ${{ !cancelled() && inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
+        timeout-minutes: 480
+        run: |
+          # after all HIP work, so a Vulkan failure or device reset cannot touch the HIP numbers
+          set +e
+          set -uo pipefail
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
+          failed=0
+          IFS=',' read -ra want <<< "$BENCH_MODELS"
+          for name in "${want[@]}"; do
+            # the HIP step records verified downloads in models.tsv: key, repo, revision, file, ..., status
+            file=$(awk -F'\t' -v n="$name" '$1 == n && $8 == "verified" { print $4; exit }' "$logs/models.tsv")
+            out="$RUNNER_TEMP/models/$name/$file"
+            if [ -z "$file" ] || [ ! -s "$out" ]; then
+              echo "::error::SKIP Vulkan llama-bench $name: no verified model file"
+              printf 'llama-bench-vulkan\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
+              failed=1
+              continue
+            fi
+            # the same flags as the HIP run
+            cmd=(timeout 18000 ./build-vulkan/bin/llama-bench
+              -m "$out"
+              -p "$BENCH_N_PROMPT" -n "$BENCH_N_GEN"
+              -b "$BENCH_N_BATCH" -ub "$BENCH_UBATCH"
+              -d "$BENCH_DEPTHS"
+              -lzm on-direct
+              -ngl 99 -fa on -ctk f16 -ctv f16
+              -r "$BENCH_REPS" -o jsonl --progress)
+            printf 'llama-bench-vulkan-%s\t%s\n' "$name" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
+            echo "=== llama-bench (Vulkan) $name ==="
+            "${cmd[@]}" > "$logs/llama-bench-vulkan-$name.jsonl" 2> "$logs/llama-bench-vulkan-$name.log"
+            rc=$?
+            cat "$logs/llama-bench-vulkan-$name.log"
+            rows=$(wc -l < "$logs/llama-bench-vulkan-$name.jsonl")
+            printf 'llama-bench-vulkan\t%s\t%s\t%s\n' "$name" "$rc" "$rows" >> "$logs/results.tsv"
+            echo "$name: exit $rc, $rows jsonl rows"
+            if [ "$rc" -ne 0 ] || [ "$rows" -eq 0 ]; then
+              echo "::error::Vulkan llama-bench failed for $name (exit $rc, $rows rows)"
+              failed=1
+            fi
+            rm -rf "$RUNNER_TEMP/models/$name"
           done
           exit "$failed"
 
       - name: test-backend-ops perf (ROCm0)
         id: ops_rocm
-        if: ${{ !cancelled() && inputs.ops_perf && steps.build_hip.outcome == 'success' }}
-        timeout-minutes: 150
+        if: ${{ !cancelled() && inputs.ops_perf && steps.device_hip.outcome == 'success' }}
+        timeout-minutes: 90
         env:
           # SOLVE_TRI aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR in
           # solve_tri_f32_cublas), seen on ROCm 7.2.1 on this pool, see bench-gfx1151.yml. These
           # perf numbers are graphs-off; remove this once the capture issue is fixed.
           GGML_CUDA_DISABLE_GRAPHS: "1"
-          OPS_BIN: ./build-hip/bin/test-backend-ops
-          OPS_DEVICE: ROCm0
         run: |
-          set +e
-          set -uo pipefail
-          logs="$RUNNER_TEMP/logs"
-          log="$logs/ops-perf-$OPS_DEVICE.log"
-          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-          cmd=("$OPS_BIN" perf -b "$OPS_DEVICE")
-          printf 'ops-perf-%s\t%s\n' "$OPS_DEVICE" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-          "${cmd[@]}" 2>&1 | tee "$log"
-          rc=${PIPESTATUS[0]}
-          rows=$(grep -c 'us/run' "$log")
-          printf 'ops-perf\t%s\t%s\t%s\n' "$OPS_DEVICE" "$rc" "$rows" >> "$logs/results.tsv"
-
-          # `-b` with a name that matches no device exits 0, so prove the device ran
-          awk -v dev="$OPS_DEVICE" '
-            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
-              seen = 1
-              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
-            }
-            END { exit !(seen && ran) }
-          ' "$log" || { echo "::error::$OPS_DEVICE never ran" >&2; exit 1; }
-          [ "$rows" -gt 0 ] || { echo "::error::no perf rows on $OPS_DEVICE" >&2; exit 1; }
-          exit "$rc"
-
-      - name: Provide the Vulkan toolchain
-        id: vulkan_sdk
-        if: ${{ !cancelled() && inputs.ops_perf && steps.checkout.outcome == 'success' }}
-        timeout-minutes: 20
-        run: |
-          # the pool has Mesa and the loader but no glslc, headers, SPIRV-Headers config or
-          # passwordless sudo, so unpack the Lunarg SDK into $RUNNER_TEMP (recipe from bench-gfx1151)
-          set -euo pipefail
-          logs="$RUNNER_TEMP/logs"
-          log="$logs/vulkan-env.log"
-          tarball="$RUNNER_TEMP/vulkan_sdk.tar.xz"
-          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" \
-            "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkan_sdk.tar.xz"
-          echo "$VULKAN_SDK_SHA256  $tarball" | sha256sum -c - | tee "$log"
-          mkdir -p "$RUNNER_TEMP/vulkan_sdk"
-          tar -xJf "$tarball" -C "$RUNNER_TEMP/vulkan_sdk"
-          glslc_path=$(find "$RUNNER_TEMP/vulkan_sdk" -type f -name glslc -print -quit)
-          if [ -z "$glslc_path" ]; then
-            echo "::error::no glslc in the SDK tarball" >&2
-            exit 1
-          fi
-          sdk_root=$(dirname "$(dirname "$glslc_path")")
-          # GITHUB_PATH only reaches later steps; all later steps are Vulkan steps
-          echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
-          echo "$sdk_root/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$sdk_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-          # FindVulkan wants an unversioned libvulkan.so; the runner has only the versioned loader
-          vk_lib=""
-          for lib in "$sdk_root/lib/libvulkan.so" "$sdk_root"/x86_64/lib/libvulkan.so /usr/lib/x86_64-linux-gnu/libvulkan.so /lib/x86_64-linux-gnu/libvulkan.so; do
-            if [ -f "$lib" ]; then
-              vk_lib="$lib"
-              break
-            fi
-          done
-          if [ -z "$vk_lib" ]; then
-            for lib in "$sdk_root"/lib/libvulkan.so.1 "$sdk_root"/x86_64/lib/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /lib/x86_64-linux-gnu/libvulkan.so.1; do
-              if [ -f "$lib" ]; then
-                mkdir -p "$RUNNER_TEMP/vkdev"
-                ln -sf "$lib" "$RUNNER_TEMP/vkdev/libvulkan.so"
-                vk_lib="$RUNNER_TEMP/vkdev/libvulkan.so"
-                break
-              fi
-            done
-          fi
-          if [ -z "$vk_lib" ]; then
-            echo "::error::no Vulkan loader found in the SDK or system library paths" >&2
-            exit 1
-          fi
-          echo "VULKAN_LIBRARY=$vk_lib" >> "$GITHUB_ENV"
-          {
-            echo "VULKAN_SDK=$sdk_root"
-            echo "VULKAN_LIBRARY=$vk_lib"
-            "$sdk_root/bin/glslc" --version | head -2
-            if [ -x "$sdk_root/bin/vulkaninfo" ]; then
-              "$sdk_root/bin/vulkaninfo" --summary 2>&1 | head -40 || true
-            fi
-          } 2>&1 | tee -a "$log"
-
-      - name: Build (Vulkan)
-        id: build_vulkan
-        if: ${{ !cancelled() && steps.vulkan_sdk.outcome == 'success' }}
-        timeout-minutes: 45
-        run: |
-          set -euo pipefail
-          logs="$RUNNER_TEMP/logs"
-          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-
-          # same flags as the vulkan branch of bench-gfx1151.yml
-          configure=(cmake -B build-vulkan -S .
-            -DCMAKE_BUILD_TYPE=Release
-            -DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF
-            "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
-            -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
-            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
-          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target test-backend-ops)
-
-          printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
-          printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
-          "${configure[@]}" 2>&1 | tee "$logs/build-vulkan-configure.log"
-          "${build[@]}" > "$logs/build-vulkan-make.log" 2>&1 || { tail -100 "$logs/build-vulkan-make.log"; exit 1; }
-          tail -5 "$logs/build-vulkan-make.log"
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-hip/bin/test-backend-ops ROCm0 \
+            "$RUNNER_TEMP/logs/ops-perf-ROCm0.log" .bench-lane/scripts/bench-history/perf-cases.txt
 
       - name: test-backend-ops perf (Vulkan0)
         id: ops_vulkan
-        if: ${{ !cancelled() && steps.build_vulkan.outcome == 'success' }}
-        timeout-minutes: 150
-        env:
-          OPS_BIN: ./build-vulkan/bin/test-backend-ops
-          OPS_DEVICE: Vulkan0
+        if: ${{ !cancelled() && inputs.ops_perf && steps.device_vulkan.outcome == 'success' }}
+        timeout-minutes: 90
         run: |
-          set +e
-          set -uo pipefail
-          logs="$RUNNER_TEMP/logs"
-          log="$logs/ops-perf-$OPS_DEVICE.log"
-          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-          cmd=("$OPS_BIN" perf -b "$OPS_DEVICE")
-          printf 'ops-perf-%s\t%s\n' "$OPS_DEVICE" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-          "${cmd[@]}" 2>&1 | tee "$log"
-          rc=${PIPESTATUS[0]}
-          rows=$(grep -c 'us/run' "$log")
-          printf 'ops-perf\t%s\t%s\t%s\n' "$OPS_DEVICE" "$rc" "$rows" >> "$logs/results.tsv"
-
-          awk -v dev="$OPS_DEVICE" '
-            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
-              seen = 1
-              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
-            }
-            END { exit !(seen && ran) }
-          ' "$log" || { echo "::error::$OPS_DEVICE never ran" >&2; exit 1; }
-          [ "$rows" -gt 0 ] || { echo "::error::no perf rows on $OPS_DEVICE" >&2; exit 1; }
-          exit "$rc"
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-vulkan/bin/test-backend-ops Vulkan0 \
+            "$RUNNER_TEMP/logs/ops-perf-Vulkan0.log" .bench-lane/scripts/bench-history/perf-cases.txt
 
       - name: Write run manifest
         if: ${{ always() }}
@@ -617,11 +665,13 @@ jobs:
           S_VALIDATE: ${{ steps.validate.outcome }}
           S_BUILD_HIP: ${{ steps.build_hip.outcome }}
           S_DEVICE_HIP: ${{ steps.device_hip.outcome }}
-          S_WIKITEXT: ${{ steps.wikitext.outcome }}
-          S_BENCH: ${{ steps.bench.outcome }}
-          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
           S_VULKAN_SDK: ${{ steps.vulkan_sdk.outcome }}
           S_BUILD_VULKAN: ${{ steps.build_vulkan.outcome }}
+          S_DEVICE_VULKAN: ${{ steps.device_vulkan.outcome }}
+          S_WIKITEXT: ${{ steps.wikitext.outcome }}
+          S_BENCH: ${{ steps.bench.outcome }}
+          S_BENCH_VULKAN: ${{ steps.bench_vulkan.outcome }}
+          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
           S_OPS_VULKAN: ${{ steps.ops_vulkan.outcome }}
         run: |
           logs="$RUNNER_TEMP/logs"
@@ -630,11 +680,13 @@ jobs:
             printf 'validate\t%s\n' "$S_VALIDATE"
             printf 'build-hip\t%s\n' "$S_BUILD_HIP"
             printf 'device-hip\t%s\n' "$S_DEVICE_HIP"
-            printf 'wikitext\t%s\n' "$S_WIKITEXT"
-            printf 'llama-bench-ppl\t%s\n' "$S_BENCH"
-            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
             printf 'vulkan-sdk\t%s\n' "$S_VULKAN_SDK"
             printf 'build-vulkan\t%s\n' "$S_BUILD_VULKAN"
+            printf 'device-vulkan\t%s\n' "$S_DEVICE_VULKAN"
+            printf 'wikitext\t%s\n' "$S_WIKITEXT"
+            printf 'models-hip\t%s\n' "$S_BENCH"
+            printf 'llama-bench-vulkan\t%s\n' "$S_BENCH_VULKAN"
+            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
             printf 'ops-perf-Vulkan0\t%s\n' "$S_OPS_VULKAN"
           } > "$logs/steps.tsv"
           echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$logs/meta.env"
