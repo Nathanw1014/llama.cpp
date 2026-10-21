@@ -415,6 +415,13 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_Q2_0:
+            case GGML_TYPE_PTQ1_0:
+            case GGML_TYPE_TQ2_T:
+            case GGML_TYPE_TQK6:
+            case GGML_TYPE_TQK7:
+            case GGML_TYPE_TQP5:
+            case GGML_TYPE_TQP6:
+            case GGML_TYPE_TQP7:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
@@ -693,6 +700,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_IQ3_S;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
+                new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_PTQ1_0) {
                 new_type = GGML_TYPE_Q4_K;
             }
         }
@@ -1035,10 +1045,36 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         ++qs.i_ffn_up;
     }
 
+    // qwen4exp: the output projection of the full-attention layers carries most of the KLD of a trunk
+    // requantisation (measured one tensor class at a time on a Q5_K trunk: attn_output alone recovered
+    // 40% of the KLD excess for 1.6% more decode bytes). Never take it below Q8_0, or below its source
+    // type when the source is already lower than Q8_0.
+    if (arch == LLM_ARCH_QWEN4EXP && category == tensor_category::ATTENTION_OUTPUT) {
+        auto bits = [](ggml_type t) { return 8.0 * ggml_type_size(t) / ggml_blck_size(t); };
+        const ggml_type floor_type = bits(tensor->type) >= bits(GGML_TYPE_Q8_0) ? GGML_TYPE_Q8_0 : tensor->type;
+        if (bits(new_type) < bits(floor_type)) {
+            new_type = floor_type;
+        }
+    }
+
     return new_type;
 }
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
+static bool llama_type_is_offline_trellis(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
@@ -1258,6 +1294,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0: return GGML_TYPE_PTQ1_0;
+        case LLAMA_FTYPE_MOSTLY_TQ2_T:  return GGML_TYPE_TQ2_T;
+        case LLAMA_FTYPE_MOSTLY_TQK6:  return GGML_TYPE_TQK6;
+        case LLAMA_FTYPE_MOSTLY_TQK7:  return GGML_TYPE_TQK7;
+        case LLAMA_FTYPE_MOSTLY_TQP5:  return GGML_TYPE_TQP5;
+        case LLAMA_FTYPE_MOSTLY_TQP6:  return GGML_TYPE_TQP6;
+        case LLAMA_FTYPE_MOSTLY_TQP7:  return GGML_TYPE_TQP7;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
@@ -1492,6 +1535,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
+        }
+
+        // the in-tree TQ2_T / TQK / TQP encoders are placeholders: real files come from the offline encoder
+        if (metadata[i].target_type != tensor->type && llama_type_is_offline_trellis(metadata[i].target_type)) {
+            throw std::runtime_error(format("%s: %s tensors can only be written by the offline trellis encoder",
+                tensor->name, ggml_type_name(metadata[i].target_type)));
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);

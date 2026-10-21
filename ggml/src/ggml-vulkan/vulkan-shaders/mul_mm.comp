@@ -249,6 +249,9 @@ shared SCACHE_T scache_dm[BM * 8];
 #endif
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+#include "ptq1_0.glsl"
+#endif
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
 #ifdef COOPMAT

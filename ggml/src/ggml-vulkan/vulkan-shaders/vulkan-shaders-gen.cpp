@@ -50,6 +50,15 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+#ifdef GGML_USE_TRELLIS
+    "ptq1_0",
+    "tq2_t",
+    "tqk6",
+    "tqk7",
+    "tqp5",
+    "tqp6",
+    "tqp7",
+#endif
     "q2_0",
     "q4_0",
     "q4_1",
@@ -255,11 +264,28 @@ bool is_rocmfpx_quant(const std::string& type_name) {
     return type_name == "rocmfp4" || type_name == "rocmfp4_fast" || type_name == "rocmfpx_fp3" || type_name == "rocmfpx_fp6" || type_name == "rocmfpx_fp8";
 }
 
+// Trellis/ternary types: per-type mul_mm SPIR-V like the LUT types, no coopmat2
+bool is_trellis_quant(const std::string& type_name) {
+    return type_name == "ptq1_0" || type_name == "tq2_t" || type_name == "tqk6" || type_name == "tqk7" ||
+           type_name == "tqp5" || type_name == "tqp6" || type_name == "tqp7";
+}
+
+// types compiled as their own matmul shader instead of the MmTypeA quant shader
 bool is_lut_quant(const std::string& type_name) {
+#ifdef GGML_USE_TRELLIS
+    if (is_trellis_quant(type_name)) {
+        return true;
+    }
+#endif
     return is_iq_quant(type_name) || type_name == "mxfp4" || type_name == "nvfp4" || is_rocmfpx_quant(type_name);
 }
 
 std::string lut_load_vec_a(const std::string& type_name) {
+#ifdef GGML_USE_TRELLIS
+    if (is_trellis_quant(type_name)) {
+        return "8";
+    }
+#endif
     if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs") {
         return "8";
     }
@@ -608,6 +634,16 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
+#ifdef GGML_USE_TRELLIS
+        // The trellis types have no coopmat2 decoder: dequant_funcs_cm2.glsl carries no entry
+        // for them, so emitting mul_mm_cm2 fails shader compilation and takes the whole
+        // Vulkan build down. Skip them. A coopmat2 device then has no trellis matmul
+        // pipelines: MUL_MAT dequantizes to f16, and batched MUL_MAT_ID is declined in
+        // supports_op.
+        if (coopmat2 && is_trellis_quant(tname)) {
+            continue;
+        }
+#endif
 
         // Float types keep per-type compilation (different accumulation loop structure)
         if (tname == "f32" || tname == "f16") {
