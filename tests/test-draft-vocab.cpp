@@ -1,5 +1,3 @@
-// tests the reduced draft LM head (llama_context_params::n_vocab_dynamic) against the full head on a small random model
-
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
@@ -87,7 +85,6 @@ static int run(llama_model * model, uint32_t n_dynamic, int32_t n_expect, bool q
 
     int n_fail = 0;
 
-    // a batch with no outputs, a batch with several outputs and a batch with one output
     const std::vector<std::vector<bool>> steps = {
         std::vector<bool>(8, false),
         std::vector<bool>(16, true),

@@ -1706,7 +1706,6 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 }
             };
 
-            // exact logits for the lowest n_base ids, -inf for the rest until they get picked
             ggml_tensor * logits = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, n_embd, n_base, w->nb[1], 0), cur);
             set_prec(logits);
             logits = ggml_concat(ctx0, logits, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab - n_base, n_outputs), -INFINITY), 0);
@@ -1723,7 +1722,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 }
 
                 // one output per op: CUDA's multi-row top_k is slow and its multi-column MUL_MAT_ID reads 2 rows per expert
-                ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab); // one-row experts, only the picked rows are read
+                ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab);
                 ggml_tensor * ids    = nullptr;
                 ggml_tensor * picked = nullptr;
                 for (int64_t i = 0; i < n_outputs; ++i) {

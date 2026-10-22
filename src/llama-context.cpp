@@ -3145,7 +3145,6 @@ void llama_context::vsub_init(uint32_t n_dynamic) {
         head.basis  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], rank);
         head.scorer = ggml_new_tensor_2d(ctx, type,          rank,     n_vocab - n_base);
 
-        // the eog ids are stored next to the first head
         const bool with_eog = vsub->eog == nullptr && !eog.empty();
         if (with_eog) {
             vsub->eog = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, eog.size());
@@ -3185,7 +3184,6 @@ void llama_context::vsub_init_head(ggml_tensor * w, const llama_vocab_subset::he
     const int     n_iter  = 12;
     const int64_t n_chunk = 4096; // head rows per graph
 
-    // run on the backend of the head
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head.basis->buffer);
 
     ggml_backend_t backend = ggml_backend_buft_is_host(buft) ? backend_cpu : nullptr;
@@ -3203,7 +3201,6 @@ void llama_context::vsub_init_head(ggml_tensor * w, const llama_vocab_subset::he
         }
     }
 
-    // identity, Gram matrix G = W^T W and the iterated block q
     ggml_init_params ip = {
         /*.mem_size   =*/ 3*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -3286,7 +3283,6 @@ void llama_context::vsub_init_head(ggml_tensor * w, const llama_vocab_subset::he
     }
     ggml_backend_tensor_set(head.basis, qf.data(), 0, ggml_nbytes(head.basis));
 
-    // scorer rows are rows n_base.. of W B
     const size_t row_size = ggml_row_size(head.scorer->type, n_rank);
 
     std::vector<uint8_t> data((n_rows - n_base)*row_size);
