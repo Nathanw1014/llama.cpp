@@ -102,7 +102,13 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 // Fused MUL epilogue: one scale per (expert slot, token), broadcast down the M dimension.
 // Always bound; p.fusion_flags == 0 means ignore it.
+#ifdef GLU_UP
+// MUL_MAT_ID+CPY(f16)+SWIGLU (the trellis f16-output id pipelines): binding 5 carries the other projection (f16, laid out
+// like D) instead of the router weights; p.fusion_flags is 1 when this GEMM is the gate projection, 0 when it is the up one
+layout (binding = 5) readonly buffer GluOther {float16_t data_glu_other[];};
+#else
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -460,6 +466,21 @@ uint abl_first(uvec4 r[3]) { return r[0].x; }
 // compiler turn the multiply and the f16 conversion into one single-rounding mixed-precision op: about 6 values in 100000
 // came out one f16 ulp away from the unfused chain (double rounding vs single, test-mmid-d16-exact 10-13). The product goes
 // through an XOR with a push-constant zero (p.fusion_flags is 1 whenever the scale is applied) so its f32 rounding is kept.
+#ifdef GLU_UP
+#if !defined(COOPMAT) || !defined(D_F16)
+#error "GLU_UP: f16-output KHR coopmat MUL_MAT_ID only"
+#endif
+// The fused MUL_MAT_ID + CPY(f16) + SWIGLU store, equal to the unfused chain: this GEMM's value goes through the f16 the CPY
+// stores (the GLU reads both projections as f16), then the SWIGLU op's expression (swiglu.comp), then the f16 store. Both
+// conversions go through an XOR with the push-constant zero p.fusion_flags & ~1u, so the compiler can neither drop the
+// float(float16_t(x)) round trip nor fuse the last multiply into the f16 conversion.
+D_TYPE mmid_glu_store(const float acc, const float other) {
+    const float v16 = float(unpackFloat2x16(packFloat2x16(f16vec2(acc, 0.0f)) ^ (p.fusion_flags & ~1u)).x);
+    const float g = (p.fusion_flags & 1u) != 0 ? v16 : other;
+    const float u = (p.fusion_flags & 1u) != 0 ? other : v16;
+    return D_TYPE(uintBitsToFloat(floatBitsToUint(g / (1.0f + exp(-g)) * u) ^ (p.fusion_flags & ~1u)));
+}
+#endif
 D_TYPE mmid_scaled_store(const float acc, const float scale) {
 #ifdef D_F16
     const float prod = uintBitsToFloat(floatBitsToUint(acc * scale) ^ (p.fusion_flags & ~1u));
@@ -953,11 +974,15 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
                 if (dr + cm_row * TM + store_r < p.M) {
                     const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
+#ifdef GLU_UP
+                    data_d[didx] = mmid_glu_store(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), float(data_glu_other[didx]));
+#else
                     if (p.fusion_flags != 0) {
                         data_d[didx] = mmid_scaled_store(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), data_fscale[row_idx.y * p.nei0 + row_idx.x]);
                     } else {
                         data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                     }
+#endif
                 }
             }
             barrier();

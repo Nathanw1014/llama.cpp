@@ -492,6 +492,45 @@ static int run_f16b(ggml_backend_t be, int64_t m, int64_t n, int64_t k, bool mmi
     return fails;
 }
 
+// MUL_MAT_ID+CPY(f16)+SWIGLU (the trellis GLU store): the gate / up projections with their f16 casts and the f16 SWIGLU,
+// against the same chain with every intermediate as a graph output. up_first: the gate GEMM (built second) is the fused one.
+static int run_mmid_glu(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type type, int64_t m, int64_t k, int64_t nt, int n_mats, int n_used, bool up_first) {
+    ggml_init_params ip = { 48 * ggml_tensor_overhead() + 6 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * gw  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+    ggml_tensor * uw  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, nt);
+    auto chain = [&](bool ref) {
+        ggml_tensor * mm1 = ggml_mul_mat_id(ctx, up_first ? uw : gw, b, ids); if (ref) ggml_set_output(mm1);
+        ggml_tensor * c1  = ggml_cast(ctx, mm1, GGML_TYPE_F16);                if (ref) ggml_set_output(c1);
+        ggml_tensor * mm2 = ggml_mul_mat_id(ctx, up_first ? gw : uw, b, ids); if (ref) ggml_set_output(mm2);
+        ggml_tensor * c2  = ggml_cast(ctx, mm2, GGML_TYPE_F16);                if (ref) ggml_set_output(c2);
+        ggml_tensor * o = ggml_swiglu_split(ctx, up_first ? c2 : c1, up_first ? c1 : c2);
+        ggml_set_output(o);
+        return o;
+    };
+    ggml_tensor * of = chain(false);
+    ggml_tensor * orr = chain(true);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::mt19937 rng(23 + (int) type + (int) nt + (up_first ? 1 : 0));
+    fill(gw, rng, -1.0f, 1.0f); fill(uw, rng, -1.0f, 1.0f); fill(b, rng, -1.0f, 1.0f);
+    std::vector<int32_t> idv(n_used * nt), perm(n_mats);
+    for (int64_t t = 0; t < nt; ++t) {
+        for (int e = 0; e < n_mats; ++e) perm[e] = e;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int j = 0; j < n_used; ++j) idv[t * n_used + j] = perm[j];
+    }
+    ggml_backend_tensor_set(ids, idv.data(), 0, idv.size() * 4);
+    char label[96];
+    snprintf(label, sizeof(label), "MUL_MAT_ID_CPY16_SWIGLU %s %lldx%lldx%lld %s", ggml_type_name(type), (long long) m, (long long) k,
+             (long long) nt, up_first ? "gate" : "up");
+    const int fails = run_pair(be, reg, label, "MUL_MAT_ID_CPY16_SWIGLU", 1, ctx, of, orr, nullptr, [&]() { bump(b); });
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
@@ -512,6 +551,25 @@ int main() {
         };
         for (const auto & sh : shapes) fails += run_shape(be, reg, sh);
     }
+#ifdef GGML_USE_TRELLIS
+    // the trellis expert types (Gyro-M TQ2_T experts, k a multiple of the 128-weight block; host quantization is slow, so
+    // smaller shapes): the down projection with the router weight, the gate / up without, f32 and f16 B; then the SwiGLU store
+    for (ggml_type t : { GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQP6 }) {
+        const shape shapes[] = {
+            { t, 640, 256, 512, 16, 4, true,  false },
+            { t, 640, 256,  77, 16, 4, true,  false },
+            { t, 640, 256, 512, 16, 4, true,  true  },
+            { t, 256, 640, 512, 16, 4, false, false },
+            { t, 256, 640, 512, 16, 4, false, true  },
+        };
+        for (const auto & sh : shapes) fails += run_shape(be, reg, sh);
+    }
+    for (ggml_type t : { GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQP6 }) {
+        fails += run_mmid_glu(be, reg, t, 256, 640, 512, 16, 4, true);
+        fails += run_mmid_glu(be, reg, t, 256, 640, 512, 16, 4, false);
+    }
+    fails += run_mmid_glu(be, reg, GGML_TYPE_TQ2_T, 200, 256, 77, 16, 4, true);   // ragged rows and tokens
+#endif
     // f16-output norms: the 35B attn / post-attn norm (2048 wide, rms_norm.comp), the 35B GDN output norm (128 x 32, silu gate,
     // rms_norm_small.comp) and the Flash-Next one (128 x 48, sigmoid gate)
     fails += run_norm(be, reg, 2048,  1, 512, 0);

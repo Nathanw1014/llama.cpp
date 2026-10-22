@@ -660,6 +660,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                                                        tname == "q2_k" || tname == "q3_k" || tname == "q5_k")))) {
             string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
         }
+        // the trellis expert GEMMs (Gyro-M TQ2_T): the same id-only f16-output variant, plus the gate / up projection with
+        // the SwiGLU in the f16 store (GLU_UP: binding 5 carries the other projection instead of the router weights)
+        if (coopmat && !coopmat2 && fp16 && !dot2 && matmul_id_type == MatMulIdType::SUBGROUP && is_trellis_quant(tname)) {
+            string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+            string_to_spv(shader_name + "_" + tname + "_f16_d16_glu", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}, {"GLU_UP", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+        }
         // qwen4exp hc up-projection with the hyper-connection mix epilogue (HC_EPI): the f16 mixed stream, never the gate
         if (coopmat && !coopmat2 && fp16 && !dot2 && matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
             string_to_spv(shader_name + "_" + tname + "_f16_hcmix", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
@@ -1093,7 +1099,7 @@ void process_shaders() {
     string_to_spv("geglu_f32",      "geglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("reglu_f16",      "reglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("reglu_f32",      "reglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
-    string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"D_F16", "1"}});
     string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});

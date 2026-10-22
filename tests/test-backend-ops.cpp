@@ -4716,6 +4716,58 @@ struct test_mul_mat_id_cpy16 : public test_case {
     }
 };
 
+// The MoE gate / up projections with f16 casts and the SwiGLU (LLAMA_MOE_F16 at prefill): the second GEMM, next to the GLU,
+// takes the Vulkan MUL_MAT_ID_CPY16_SWIGLU fusion where its type has the GLU store (trellis), the first MUL_MAT_ID_CPY16.
+// up_first: the up projection is built first (build_moe_ffn's order), so the gate is the GEMM next to the SwiGLU.
+struct test_mul_mat_id_glu16 : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool up_first;
+    const int64_t m, n, k;   // m = ff rows, n = tokens
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_CPY16_SWIGLU";
+    }
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, up_first, m, n, k);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_id_glu16(ggml_type type_a, int n_mats, int n_used, bool up_first, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), up_first(up_first), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gw = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gw, "gate_exps");
+        ggml_tensor * uw = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(uw, "up_exps");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+        // the expert input broadcast over the used experts, as build_moe_ffn hands it over
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * first  = ggml_cast(ctx, ggml_mul_mat_id(ctx, up_first ? uw : gw, b, ids), GGML_TYPE_F16);
+        if (gf) {
+            ggml_build_forward_expand(gf, first);
+        }
+        ggml_tensor * second = ggml_cast(ctx, ggml_mul_mat_id(ctx, up_first ? gw : uw, b, ids), GGML_TYPE_F16);
+        ggml_tensor * gate = up_first ? second : first;
+        ggml_tensor * up   = up_first ? first : second;
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // The MoE combine over f16 expert outputs: views of an f16 [n_embd, n_used, n_tokens] tensor summed in f32
 // (ggml_add_cast then adds); Vulkan fuses the chain into the f16-source MULTI_ADD kernel.
 struct test_multi_add_f16 : public test_case {
@@ -9856,6 +9908,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // the 35B-A3B down projection shape: 2048 x 512 experts, top-8 of 32 here (256 in the model), k = 512
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_K, 32, 8, true, 2048, 96, 512));
+#ifdef GGML_USE_TRELLIS
+    // the trellis expert types (Gyro-M TQ2_T): f16 output with and without the router weight, and the SwiGLU store in either
+    // operand order; k stays a multiple of the 128-weight trellis block, m = 200 leaves a ragged row tile
+    for (ggml_type t : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) {
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 640));
+        test_cases.emplace_back(new test_mul_mat_id_glu16(t, 16, 4, true, 128, 129, 256));
+    }
+    for (int64_t nt : {33, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 4, true,  128, nt, 256));
+        test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 4, false, 128, nt, 256));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 10, true, 640, 129, 512));   // the Gyro-M ff width
+    test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 4, true, 200, 65, 256));     // ragged rows
+    test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 4, true, 128, 5, 256));      // mat-vec: no fusion
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, 32, 10, true, 640, 96, 512));
+#endif
     // LLAMA_NORM_F16B's f16-B shapes (f32 x f16 MUL_MAT, quant x f16 MUL_MAT_ID) are checked in test-mmid-d16-exact: the CPU
     // backend has no f32 x f16 matmul and asserts on an f16 MUL_MAT_ID B, so it cannot be the reference here
     // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged
