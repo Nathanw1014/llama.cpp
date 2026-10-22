@@ -145,8 +145,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
         ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            GGML_ASSERT(head_offsets[h] + head_vocab_sizes[h] <= INT32_MAX &&
-                        "PLE head range does not fit the int32 row index");
+            // check each value before the sum so a wrapped uint64 cannot pass, and reject an empty head
+            // (the hash takes the row modulo the head's vocab size)
+            if (head_vocab_sizes[h] == 0 ||
+                head_offsets[h]     > INT32_MAX ||
+                head_vocab_sizes[h] > INT32_MAX ||
+                head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+            }
             hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
             hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
         }
@@ -203,6 +209,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         if (ple_w != nullptr) {
+            // the head ranges are what the gather indexes, so they set the minimum row count
+            int64_t ple_rows_min = 0;
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                ple_rows_min = std::max(ple_rows_min, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+            }
+            if (ple_w->tensor->ne[1] < ple_rows_min) {
+                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows_min));
+            }
             const int64_t ple_rows = ple_w->tensor->ne[1];
             // the PLE/engram table is gathered 16 random rows per token and never read densely, so
             // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
