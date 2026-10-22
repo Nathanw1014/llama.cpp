@@ -1200,6 +1200,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_exl3_route, pipeline_exl3_rotate_id, pipeline_exl3_rotate_split_id;
     vk_pipeline pipeline_exl3_mmv_id[11][3][4];
     vk_pipeline pipeline_exl3_mm_id[11][3][2];
+    // the dot kernel with the input rotation inside (GGML_VK_EXL3_FUSED_ROT): [rate][codebook][rows], one token of experts
+    vk_pipeline pipeline_exl3_mmv_fused[11][3][4];
+    vk_pipeline pipeline_exl3_mmv_fused_id1[11][3];
     vk_pipeline pipeline_gdn_scan_quad;   // register-resident sequential prefill form (GGML_VK_GDN_SCAN=1)
     vk_pipeline pipeline_mmid_swiglu_iq3xxs[2];   // MUL_MAT_ID_SWIGLU: [0] f16acc, [1] f32acc siblings of the REG_A a_m d16 pipeline
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe
@@ -2081,6 +2084,7 @@ struct vk_op_exl3_rotate_push_constants {
     uint32_t k, rows, ne1, ne2;
     uint32_t s1, s2, s3, x_off;
     uint32_t n_counters, n_used, ids_s1;
+    uint32_t glu_on;  // ID: x is the gate of a fused SwiGLU (up bound separately)
 };
 
 // exl3_rotate_split.comp: strides and offsets in floats
@@ -2088,11 +2092,17 @@ struct vk_op_exl3_rotate_split_push_constants {
     uint32_t k, rows, ne1, ne2;
     uint32_t s1, s2, s3, x_off;
     uint32_t zero, lo, n_used, ids_s1;
+    uint32_t glu_on;  // ID: x is the gate of a fused SwiGLU (up bound separately)
 };
 
 // exl3_mul_mat_vec.comp, exl3_mul_mm_cm1.comp; tq_stride: uint32 words of one expert's trellis (ID)
 struct vk_op_exl3_mmv_push_constants {
     uint32_t k, n, rows, tq_stride;
+    // the fused-rotation dot kernel only: x strides and offset in floats, slots per token, ids row stride
+    uint32_t ne1, ne2, s1, s2, s3, x_off, n_used, ids_s1;
+    // ID: 1 = dst row p times w[p] (EXL3_MUL_MAT_ID + MUL fused)
+    uint32_t w_on;
+    uint32_t glu_on;  // fused one-token dot kernel: x is the gate of a fused SwiGLU
 };
 
 // exl3_route.comp
@@ -2761,6 +2771,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // EXL3 fused dot kernel: persistent self-resetting arrival counters, used round-robin
+    vk_buffer exl3_cnt;
+    uint32_t exl3_cnt_off = 0;
     // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
     uint64_t fa_dequant_gate_sz;
     bool fa_dequant_gate_fits;
@@ -2830,6 +2843,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_exl3_glu {};   // GLU -> EXL3_MUL_MAT_ID (-> MUL): the SwiGLU in the expert input rotation
     bool fused_rms_norm_scale {};   // RMS_NORM+SCALE (the GDN q/k l2 norm)
     bool fused_rms_norm_sig {};     // RMS_NORM+MUL+SIGMOID+MUL+CPY(f16) (the GDN output norm, f16 only)
     bool fused_rms_norm_silu {};    // with fused_rms_norm_sig: the gate is SILU(z), not SIGMOID(z) (qwen35moe)
@@ -7796,9 +7810,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_exl3_route, "exl3_route_f32", exl3_route_f32_len, exl3_route_f32_data,
             "main", 4, sizeof(vk_op_exl3_route_push_constants), {1, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_id, "exl3_rotate_id_f32", exl3_rotate_id_f32_len,
-            exl3_rotate_id_f32_data, "main", 6, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            exl3_rotate_id_f32_data, "main", 7, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split_id, "exl3_rotate_split_id_f32", exl3_rotate_split_id_f32_len,
-            exl3_rotate_split_id_f32_data, "main", 7, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            exl3_rotate_split_id_f32_data, "main", 8, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
         static const uint32_t exl3_m[4] = { 1, 2, 4, 8 };
         for (uint32_t ri = 0; ri < 11; ++ri) {
             const uint32_t ka   = ri < 8 ? ri + 1 : ri - 7;
@@ -7814,8 +7828,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         exl3_mul_mat_vec_f32_data, "main", 5, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                         {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
                     ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv_id[ri][cb][mi], name + "_id", exl3_mul_mat_vec_id_f32_len,
-                        exl3_mul_mat_vec_id_f32_data, "main", 7, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        exl3_mul_mat_vec_id_f32_data, "main", 8, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                         {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                    ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv_fused[ri][cb][mi], name + "_fused", exl3_mul_mat_vec_fused_f32_len,
+                        exl3_mul_mat_vec_fused_f32_data, "main", 6, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                    if (mi == 0) {
+                        ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv_fused_id1[ri][cb], name + "_fused_id1",
+                            exl3_mul_mat_vec_fused_id1_f32_len, exl3_mul_mat_vec_fused_id1_f32_data, "main", 9,
+                            sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1}, {256, ka, half, cb, 1}, 1, true, true, 32);
+                    }
                 }
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 if (ggml_vk_exl3_device_cm1(device)) {
@@ -7826,7 +7848,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             exl3_mul_mm_cm1_data, "main", 6, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                             {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
                         ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm_id[ri][cb][pi], name + "_id", exl3_mul_mm_id_cm1_len,
-                            exl3_mul_mm_id_cm1_data, "main", 8, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                            exl3_mul_mm_id_cm1_data, "main", 9, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                             {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
                     }
                 }
@@ -17403,6 +17425,31 @@ static uint32_t ggml_vk_exl3_dot_max_rows() {
     return r;
 }
 
+// GGML_VK_EXL3_FUSED_ROT=1: few rows (M*k <= 4096 floats) take the dot kernel with the input rotation inside, one
+// dispatch and no scratch (one token of experts: no routing either)
+#define EXL3_FUSED_XH   4096u
+#define EXL3_CNT_WORDS  (1u << 18)
+static bool ggml_vk_exl3_fused_rot() {
+    static const bool f = [] { const char * e = getenv("GGML_VK_EXL3_FUSED_ROT"); return e && atoi(e) != 0; }();
+    return f;
+}
+
+// n counters of the persistent buffer (zero between uses): a region past the last one handed out, so that ops not
+// separated by a barrier never share one
+static vk_subbuffer ggml_vk_exl3_counters(ggml_backend_vk_context * ctx, uint32_t n) {
+    if (!ctx->exl3_cnt) {
+        ctx->exl3_cnt = ggml_vk_create_buffer_device(ctx->device, EXL3_CNT_WORDS*sizeof(uint32_t));
+        ggml_vk_buffer_memset(ctx->exl3_cnt, 0, 0, EXL3_CNT_WORDS*sizeof(uint32_t));
+    }
+    n = GGML_PAD(n, 64u);
+    if (ctx->exl3_cnt_off + n > EXL3_CNT_WORDS) {
+        ctx->exl3_cnt_off = 0;
+    }
+    const vk_subbuffer b = { ctx->exl3_cnt, ctx->exl3_cnt_off*sizeof(uint32_t), n*sizeof(uint32_t) };
+    ctx->exl3_cnt_off += n;
+    return b;
+}
+
 // products of the GEMM: 1 (xh rounded to f16 once) or 2 (hi + lo); GGML_VK_EXL3_GEMM_PRODUCTS=1|2
 static uint32_t ggml_vk_exl3_gemm_products() {
     static const uint32_t p = [] {
@@ -17457,8 +17504,9 @@ static void ggml_vk_exl3_mul_mm(ggml_backend_vk_context * ctx, vk_context & subc
     ggml_vk_dispatch_pipeline(ctx, subctx, rot,
         { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf }, rpc, { rows_pad, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_perf_mark_subop(ctx, subctx, "EXL3_ROTATE_SPLIT (sub-op)");
 
-    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0 };
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     ggml_vk_dispatch_pipeline(ctx, subctx, mm,
         { ggml_vk_tensor_subbuffer(ctx, trellis), hi_buf, lo_buf, inv_buf, ggml_vk_tensor_subbuffer(ctx, svh),
           ggml_vk_tensor_subbuffer(ctx, dst) },
@@ -17468,6 +17516,65 @@ static void ggml_vk_exl3_mul_mm(ggml_backend_vk_context * ctx, vk_context & subc
 
 // EXL3_MUL_MAT_ID: x F32 [k, ne11, n_tokens], ids I32 [n_used, n_tokens], experts stacked in dim 3 of the trellis
 #define EXL3_MAX_EXPERTS 1024 // exl3_route.comp
+
+// EXL3_MUL_MAT_ID followed by a MUL by the router weights [1, n_used, n_tokens] (GGML_VK_EXL3_FUSE_MUL=1): the kernels
+// multiply each dst row by its weight as they store it (the same two f32 roundings as the separate MUL)
+static bool ggml_vk_exl3_can_fuse_mul(const struct ggml_cgraph * cgraph, int node_idx);
+
+// EXL3_MUL_MAT_ID that runs as one kernel reading x and writing dst (the fused-rotation one-token dot kernel)
+static bool ggml_vk_exl3_glu_single_pass(const ggml_tensor * mmid) {
+    return ggml_vk_exl3_fused_rot() && mmid->src[2]->ne[1] == 1;
+}
+
+// SwiGLU (split, not swapped, F32, gate and up with the same layout) read only by an EXL3_MUL_MAT_ID as x
+// (GGML_VK_EXL3_FUSE_GLU=1): the expert input rotation computes the SwiGLU as swiglu.comp does
+static bool ggml_vk_exl3_can_fuse_glu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool with_mul) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXL3_FUSE_GLU"); return e && atoi(e) != 0; }();
+    if (!on) {
+        return false;
+    }
+    // ggml_can_fuse wants equal shapes along the chain: check the GLU -> EXL3_MUL_MAT_ID link by hand
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * glu  = cgraph->nodes[node_idx];
+    const ggml_tensor * mmid = cgraph->nodes[node_idx + 1];
+    if (glu->op != GGML_OP_GLU || mmid->op != GGML_OP_EXL3_MUL_MAT_ID || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (mmid->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+    const ggml_tensor * g    = glu->src[0];
+    const ggml_tensor * u    = glu->src[1];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || u == nullptr ||
+        mmid->src[1] != glu || g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(g, glu) || !ggml_are_same_stride(g, u) || !ggml_are_same_shape(g, u) ||
+        g->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // one token on the single-kernel path: the SwiGLU would run once per workgroup there, keep the GLU op
+    if (ggml_vk_exl3_glu_single_pass(mmid)) {
+        return false;
+    }
+    // the shaders index up with the gate's offset: both must sit at an aligned descriptor offset
+    const uint64_t al = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    if ((vk_tensor_offset(g) + g->view_offs) % al != 0 || (vk_tensor_offset(u) + u->view_offs) % al != 0) {
+        return false;
+    }
+    return !with_mul || ggml_vk_exl3_can_fuse_mul(cgraph, node_idx + 1);
+}
+
+static bool ggml_vk_exl3_can_fuse_mul(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXL3_FUSE_MUL"); return e && atoi(e) != 0; }();
+    if (!on || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_EXL3_MUL_MAT_ID, GGML_OP_MUL })) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * w    = mul->src[0] == mmid ? mul->src[1] : mul->src[0];
+    return w->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(mul) &&
+           ggml_are_same_shape(mul, mmid) && w->ne[0] == 1 && w->ne[1] == mmid->ne[1] && w->ne[2] == mmid->ne[2] &&
+           w->ne[3] == 1 && mmid->ne[3] == 1;
+}
 
 static bool ggml_vk_exl3_mul_mat_id_supports_op(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * trellis = op->src[0];
@@ -17488,9 +17595,12 @@ static bool ggml_vk_exl3_mul_mat_id_supports_op(const vk_device & device, const 
            (ggml_nelements(ids) + 128)*trellis->ne[2]*16 < INT32_MAX;
 }
 
-static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+// mul: a fused MUL of the result by the router weights [1, n_used, n_tokens] (the result goes to mul), or nullptr
+// glu: a fused SwiGLU whose output is x (its gate is read as x, its up beside it), or nullptr
+static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst, ggml_tensor * mul,
+                                    const ggml_tensor * glu = nullptr) {
     const ggml_tensor * trellis = dst->src[0];
-    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * x       = glu ? glu->src[0] : dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
     const ggml_tensor * suh     = dst->src[3];
     const ggml_tensor * svh     = dst->src[4];
@@ -17504,6 +17614,28 @@ static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & 
     const uint32_t n_pairs  = n_used*n_tokens;
     const uint32_t tq_words = (uint32_t) (trellis->ne[0]*trellis->ne[1]*trellis->ne[2]/2);
     const int      ri       = ggml_vk_exl3_rate_idx(trellis->ne[0]);
+    const uint32_t w_on     = mul != nullptr;
+    const uint32_t glu_on   = glu != nullptr;
+    vk_subbuffer   out_buf  = ggml_vk_tensor_subbuffer(ctx, mul ? mul : dst);
+    vk_subbuffer   w_buf    = mul ? ggml_vk_tensor_subbuffer(ctx, mul->src[0] == dst ? mul->src[1] : mul->src[0]) : out_buf;
+    vk_subbuffer   up_buf   = glu ? ggml_vk_tensor_subbuffer(ctx, glu->src[1], true) : out_buf;
+
+    if (ggml_vk_exl3_fused_rot() && n_tokens == 1 && k <= EXL3_FUSED_XH && n_pairs*(n/128) <= EXL3_CNT_WORDS/4 &&
+        ctx->device->pipeline_exl3_mmv_fused_id1[ri][cb]) {
+        vk_pipeline fp = ctx->device->pipeline_exl3_mmv_fused_id1[ri][cb];
+        ggml_pipeline_request_descriptor_sets(ctx, fp, 1);
+        vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x, true);
+        const vk_op_exl3_mmv_push_constants fpc = {
+            k, n, n_pairs, tq_words, (uint32_t) x->ne[1], 1,
+            (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), 0,
+            (uint32_t) ((x_buf.size - ggml_nbytes(x))/sizeof(float)), n_used, (uint32_t) (ids->nb[1]/sizeof(int32_t)), w_on, glu_on,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, fp,
+            { ggml_vk_tensor_subbuffer(ctx, trellis), x_buf, ggml_vk_tensor_subbuffer(ctx, svh), out_buf,
+              ggml_vk_exl3_counters(ctx, n_pairs*(n/128)), ggml_vk_tensor_subbuffer(ctx, suh), ggml_vk_tensor_subbuffer(ctx, ids), w_buf, up_buf },
+            fpc, { n/32, n_pairs, 1 });
+        return;
+    }
 
     // the GEMM (groups of up to 128 rows of one expert) from 8 rows per expert on average, else the dot kernel in
     // groups of up to 8 rows (one token: every pair is a group of one row, distinct experts)
@@ -17552,8 +17684,9 @@ static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & 
     const vk_op_exl3_route_push_constants rpc = { n_used, n_tokens, ids_s1, n_exp, gsize, g_max, n_counters };
     ggml_vk_dispatch_pipeline(ctx, subctx, route, { ids_buf, ord_buf, grp_buf, cn_buf }, rpc, { 1, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_perf_mark_subop(ctx, subctx, "EXL3_ROUTE (sub-op)");
 
-    const vk_op_exl3_mmv_push_constants mpc = { k, n, n_pairs, tq_words };
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, n_pairs, tq_words, 0, 0, 0, 0, 0, 0, 0, 0, w_on };
     if (gemm) {
         vk_subbuffer inv_buf = { sb, head, inv_size };
         vk_subbuffer hi_buf  = { sb, head + inv_size, h_size };
@@ -17561,29 +17694,31 @@ static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & 
         const vk_op_exl3_rotate_split_push_constants spc = {
             k, n_pairs, (uint32_t) x->ne[1], 1,
             (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), 0, x_off,
-            0, products == 2 ? 1u : 0u, n_used, ids_s1,
+            0, products == 2 ? 1u : 0u, n_used, ids_s1, glu_on,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, rot,
-            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf, ids_buf, ord_buf }, spc, { rows_pad, 1, 1 });
+            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf, ids_buf, ord_buf, up_buf }, spc, { rows_pad, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_perf_mark_subop(ctx, subctx, "EXL3_ID_ROTATE_SPLIT (sub-op)");
         ggml_vk_dispatch_pipeline(ctx, subctx, mm,
             { ggml_vk_tensor_subbuffer(ctx, trellis), hi_buf, lo_buf, inv_buf, ggml_vk_tensor_subbuffer(ctx, svh),
-              ggml_vk_tensor_subbuffer(ctx, dst), grp_buf, ord_buf },
+              out_buf, grp_buf, ord_buf, w_buf },
             mpc, { n/128, g_max, 1 });
     } else {
         vk_subbuffer xh_buf = { sb, head, xh_size };
         const vk_op_exl3_rotate_push_constants xpc = {
             k, n_pairs, (uint32_t) x->ne[1], 1,
             (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), 0, x_off,
-            0, n_used, ids_s1,
+            0, n_used, ids_s1, glu_on,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, rot,
-            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf, ids_buf, ord_buf }, xpc,
+            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf, ids_buf, ord_buf, up_buf }, xpc,
             { std::max(1u, CEIL_DIV(n_pairs*(k/128), 8u)), 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_perf_mark_subop(ctx, subctx, "EXL3_ID_ROTATE (sub-op)");
         ggml_vk_dispatch_pipeline(ctx, subctx, mm,
             { ggml_vk_tensor_subbuffer(ctx, trellis), xh_buf, ggml_vk_tensor_subbuffer(ctx, svh),
-              ggml_vk_tensor_subbuffer(ctx, dst), cn_buf, grp_buf, ord_buf },
+              out_buf, cn_buf, grp_buf, ord_buf, w_buf },
             mpc, { n/32, g_max, 1 });
     }
     ctx->prealloc_split_k_need_sync = true;
@@ -17611,6 +17746,23 @@ static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & sub
     const uint32_t mi       = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;
     const uint32_t m        = 1u << mi;
     const uint32_t n_groups = CEIL_DIV(rows, m);
+
+    if (ggml_vk_exl3_fused_rot() && m*k <= EXL3_FUSED_XH && n_groups*(n/128) <= EXL3_CNT_WORDS/4 &&
+        ctx->device->pipeline_exl3_mmv_fused[ri][cb][mi]) {
+        vk_pipeline fp = ctx->device->pipeline_exl3_mmv_fused[ri][cb][mi];
+        ggml_pipeline_request_descriptor_sets(ctx, fp, 1);
+        vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x, true);
+        const vk_op_exl3_mmv_push_constants fpc = {
+            k, n, rows, 0, (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+            (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), (uint32_t) (x->nb[3]/sizeof(float)),
+            (uint32_t) ((x_buf.size - ggml_nbytes(x))/sizeof(float)), 1, 0, 0,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, fp,
+            { ggml_vk_tensor_subbuffer(ctx, trellis), x_buf, ggml_vk_tensor_subbuffer(ctx, svh), ggml_vk_tensor_subbuffer(ctx, dst),
+              ggml_vk_exl3_counters(ctx, n_groups*(n/128)), ggml_vk_tensor_subbuffer(ctx, suh) },
+            fpc, { n/32, n_groups, 1 });
+        return;
+    }
 
     // scratch: arrival counters, then xh (f32 [rows, k])
     const uint32_t n_counters = n_groups*(n/128);
@@ -17644,8 +17796,9 @@ static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & sub
     ggml_vk_dispatch_pipeline(ctx, subctx, rot,
         { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf }, rpc, { rot_wgs, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_perf_mark_subop(ctx, subctx, "EXL3_ROTATE (sub-op)");
 
-    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0 };
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     ggml_vk_dispatch_pipeline(ctx, subctx, mmv,
         { ggml_vk_tensor_subbuffer(ctx, trellis), xh_buf, ggml_vk_tensor_subbuffer(ctx, svh), ggml_vk_tensor_subbuffer(ctx, dst), cn_buf },
         mpc, { n/32, n_groups, 1 });
@@ -21287,6 +21440,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
         break;
     case GGML_OP_GLU:
+#if defined(GGML_USE_EXL3)
+        if (ctx->fused_exl3_glu) {
+            ggml_vk_exl3_mul_mat_id(ctx, compute_ctx, cgraph->nodes[node_idx + 1],
+                ctx->num_additional_fused_ops == 2 ? cgraph->nodes[node_idx + 2] : nullptr, node);
+            break;
+        }
+#endif
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -21446,7 +21606,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_EXL3_MUL_MAT_ID:
-        ggml_vk_exl3_mul_mat_id(ctx, compute_ctx, node);
+        ggml_vk_exl3_mul_mat_id(ctx, compute_ctx, node, ctx->num_additional_fused_ops == 1 ? cgraph->nodes[node_idx + 1] : nullptr);
 
         break;
 #endif
@@ -21636,6 +21796,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->exl3_cnt);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->fa_union_stat);
     ggml_vk_destroy_buffer(ctx->sync_staging);
@@ -23929,6 +24090,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_moe_logits_scratch = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_exl3_glu = false;
                 ctx->fused_topk_qsa_out_scratch = false;
         ctx->fused_rms_norm_scale = false;
         ctx->fused_rms_norm_sig = false;
@@ -24052,6 +24214,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+#if defined(GGML_USE_EXL3)
+            } else if (ggml_vk_exl3_can_fuse_glu(ctx, cgraph, i, true)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_exl3_glu = true;
+                fusion_string = "EXL3_GLU_MUL_MAT_ID_MUL";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_exl3_can_fuse_glu(ctx, cgraph, i, false)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_exl3_glu = true;
+                fusion_string = "EXL3_GLU_MUL_MAT_ID";
+                std::fill_n(op_srcs_fused_elementwise, 2, false);
+            } else if (ggml_vk_exl3_can_fuse_mul(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "EXL3_MUL_MAT_ID_MUL";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+#endif
             } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, cgraph, i, true)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_MUL_CPY16";
@@ -24271,6 +24450,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             if (!src || src->op == GGML_OP_NONE) {
                                 continue;
                             }
+                            // EXL3 SwiGLU fusion on the two-pass paths: the rotation reads gate and up into the scratch,
+                            // and a barrier separates it from the kernel that writes the result
+                            if (ctx->fused_exl3_glu && k == 0 && !ggml_vk_exl3_glu_single_pass(cgraph->nodes[i + 1])) {
+                                continue;
+                            }
                             if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                                 bool found = false;
                                 for (int n = 0; n < k; ++n) {
@@ -24329,6 +24513,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_moe_logits_scratch = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_exl3_glu = false;
                 ctx->fused_topk_qsa_out_scratch = false;
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_rms_norm_sig = false;
@@ -24789,6 +24974,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_EXL3_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_GLU && graph->nodes[j]->op == GGML_OP_EXL3_MUL_MAT_ID) &&
                     // a matmul followed by its f16 cast (MUL_MAT(_ID)(+MUL)+CPY(f16) fusions): keep the cast behind the matmul,
                     // otherwise the grab pulls the next independent matmul in between and the pair never fuses
                     !(j == c+1 && c == current_set.back() && (graph->nodes[c]->op == GGML_OP_MUL_MAT || graph->nodes[c]->op == GGML_OP_MUL_MAT_ID) &&

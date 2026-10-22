@@ -33,6 +33,9 @@ layout(push_constant) uniform parameter {
     uint n;
     uint rows;
     uint tq_stride;   // ID: uint32 words of one expert's trellis
+    uint ne1, ne2, s1, s2, s3, x_off, n_used, ids_s1;  // unused here (shared layout with the dot kernel)
+    uint w_on;        // ID: dst row p times w[p] (the fused MUL by the router weights)
+    uint glu_on;      // unused here
 } p;
 
 layout(binding = 0) readonly buffer TR  { uint data_t[]; };
@@ -45,6 +48,7 @@ layout(binding = 5) writeonly buffer D  { float data_d[]; };
 // ID: group g = (expert, first row, rows) of exl3_route.comp; row r of the scratch is pair ord[r] = its dst row
 layout(binding = 6) readonly buffer GRP { uint data_grp[]; };
 layout(binding = 7) readonly buffer ORD { uint data_ord[]; };
+layout(binding = 8) readonly buffer WT  { float data_w[]; };
 #endif
 
 #define EXL3_FWHT
@@ -154,7 +158,9 @@ void main() {
                 const float inv = data_inv[row0 + rr];
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
 #ifdef ID
-                    data_d[data_ord[row0 + rr]*p.n + seg0 + i*32 + lane] = (v[i]*inv)*sv[i];
+                    const uint pr = data_ord[row0 + rr];
+                    const float y = (v[i]*inv)*sv[i];
+                    data_d[pr*p.n + seg0 + i*32 + lane] = p.w_on != 0 ? y*data_w[pr] : y;
 #else
                     data_d[(row0 + rr)*p.n + seg0 + i*32 + lane] = (v[i]*inv)*sv[i];
 #endif

@@ -24,6 +24,7 @@ layout(push_constant) uniform parameter {
     uint n_counters;
     uint n_used;      // ID: slots per token
     uint ids_s1;      // ID: ids row stride in int32
+    uint glu_on;      // ID: x is the gate of a SwiGLU with up (EXL3_MUL_MAT_ID reading GLU, fused)
 } p;
 
 layout(binding = 0) readonly buffer X  { float     data_x[];  };
@@ -34,6 +35,21 @@ layout(binding = 3) writeonly buffer CN { uint     data_c[];  };
 layout(binding = 4) readonly buffer IDS { int      data_ids[]; };
 layout(binding = 5) readonly buffer ORD { uint     data_ord[]; };
 #endif
+#ifdef ID
+#define GLU_BINDING
+layout(binding = 6) readonly buffer UP { float data_up[]; };
+#endif
+
+// the input element i: x, or with p.glu_on the SwiGLU of gate x and up, computed as swiglu.comp computes it
+float exl3_xin(const uint i) {
+#ifdef GLU_BINDING
+    if (p.glu_on != 0) {
+        const float a = data_x[i];
+        return a / (1.0f + exp(-a)) * data_up[i];
+    }
+#endif
+    return data_x[i];
+}
 
 void exl3_fwht128(inout float v[4], const uint lane) {
     [[unroll]] for (uint h = 1; h < 32; h <<= 1) {
@@ -88,7 +104,7 @@ void main() {
     float v[4];
     [[unroll]] for (uint i = 0; i < 4; ++i) {
         // the product must not contract into the first butterfly
-        precise float t = data_x[xb + i*32 + lane]*float(data_su[sb + i*32 + lane]);
+        precise float t = exl3_xin(xb + i*32 + lane)*float(data_su[sb + i*32 + lane]);
         v[i] = t;
     }
     exl3_fwht128(v, lane);

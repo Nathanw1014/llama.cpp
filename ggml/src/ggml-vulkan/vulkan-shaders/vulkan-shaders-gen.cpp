@@ -880,6 +880,8 @@ void process_shaders() {
     string_to_spv("exl3_route_f32", "exl3_route.comp", {});
     string_to_spv("exl3_rotate_id_f32", "exl3_rotate.comp", {{"ID", "1"}});
     string_to_spv("exl3_mul_mat_vec_id_f32", "exl3_mul_mat_vec.comp", {{"ID", "1"}});
+    string_to_spv("exl3_mul_mat_vec_fused_f32", "exl3_mul_mat_vec.comp", {{"FUSED", "1"}});
+    string_to_spv("exl3_mul_mat_vec_fused_id1_f32", "exl3_mul_mat_vec.comp", {{"FUSED", "1"}, {"ID1", "1"}});
     string_to_spv("exl3_rotate_split_id_f32", "exl3_rotate_split.comp", {{"ID", "1"}});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("exl3_mul_mm", "exl3_mul_mm_cm1.comp", {}, true, true);

@@ -27,6 +27,7 @@ layout(push_constant) uniform parameter {
     uint lo;          // 1: write lo
     uint n_used;      // ID: slots per token
     uint ids_s1;      // ID: ids row stride in int32
+    uint glu_on;      // ID: x is the gate of a SwiGLU with up (EXL3_MUL_MAT_ID reading GLU, fused)
 } p;
 
 layout(binding = 0) readonly buffer X  { float     data_x[];  };
@@ -38,6 +39,21 @@ layout(binding = 4) writeonly buffer INV { float data_inv[]; };
 layout(binding = 5) readonly buffer IDS { int data_ids[]; };
 layout(binding = 6) readonly buffer ORD { uint data_ord[]; };
 #endif
+#ifdef ID
+#define GLU_BINDING
+layout(binding = 7) readonly buffer UP { float data_up[]; };
+#endif
+
+// the input element i: x, or with p.glu_on the SwiGLU of gate x and up, computed as swiglu.comp computes it
+float exl3_xin(const uint i) {
+#ifdef GLU_BINDING
+    if (p.glu_on != 0) {
+        const float a = data_x[i];
+        return a / (1.0f + exp(-a)) * data_up[i];
+    }
+#endif
+    return data_x[i];
+}
 
 shared float sh_max[8];
 
@@ -97,7 +113,7 @@ void main() {
     for (uint seg = warp; seg < segs; seg += 8) {
         float v[4];
         [[unroll]] for (uint i = 0; i < 4; ++i) {
-            precise float t = data_x[xb + seg*128 + i*32 + lane]*float(data_su[sb + seg*128 + i*32 + lane]);
+            precise float t = exl3_xin(xb + seg*128 + i*32 + lane)*float(data_su[sb + seg*128 + i*32 + lane]);
             v[i] = t;
         }
         exl3_fwht128(v, lane);
@@ -125,7 +141,7 @@ void main() {
     for (uint seg = warp; seg < segs; seg += 8) {
         float v[4];
         [[unroll]] for (uint i = 0; i < 4; ++i) {
-            precise float t = data_x[xb + seg*128 + i*32 + lane]*float(data_su[sb + seg*128 + i*32 + lane]);
+            precise float t = exl3_xin(xb + seg*128 + i*32 + lane)*float(data_su[sb + seg*128 + i*32 + lane]);
             v[i] = t;
         }
         exl3_fwht128(v, lane);
