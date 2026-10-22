@@ -886,6 +886,13 @@ static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const gg
     return p;
 }
 
+struct vk_op_sum_push_constants {
+    uint32_t n;
+    uint32_t chunk;
+    uint32_t a_offset;
+    uint32_t d_offset;
+};
+
 template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p) {
     init_fastdiv_values(p.ne01*p.ne02, p.ne0_12mp, p.ne0_12L);
     init_fastdiv_values(p.ne01,        p.ne0_1mp,  p.ne0_1L);
