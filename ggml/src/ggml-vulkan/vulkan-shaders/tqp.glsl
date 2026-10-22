@@ -14,9 +14,11 @@
 #define TQP_QS_BYTES (8u*TQP_K)
 #define TQP_QS_WORDS (4u*TQP_K)
 
-// Stream bit at which the window of step t starts.
+// Stream bit at which the window of step t starts. t is masked to 0..63 so an out-of-range step
+// (e.g. dequantize4 with iqs = 126 asking for t + 1 = 64) stays inside the block instead of wrapping
+// to a huge offset.
 uint tqp_off(uint t) {
-    return (63u - t) * TQP_K;
+    return (63u - (t & 63u)) * TQP_K;
 }
 
 // i + 1 .. i + 4 modulo the stream length, for i < TQP_QS_BYTES (TQP_QS_WORDS).
