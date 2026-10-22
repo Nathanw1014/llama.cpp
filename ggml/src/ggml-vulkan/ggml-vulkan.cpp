@@ -898,6 +898,21 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
                 VK_LOG_DEBUG(pipeline->name << " " << s.name << ": " << s.value.u64 << " registers");
                 pipeline->register_count = (uint32_t)s.value.u64;
             }
+            // RADV reports spills and scratch per subgroup (the MUL_MAT XL tier falls back to L when its pipeline spills)
+            const bool spill_stat = strcmp(s.name, "Spilled SGPRs") == 0 || strcmp(s.name, "Spilled VGPRs") == 0;
+            if (spill_stat || strcmp(s.name, "Scratch size") == 0) {
+                uint64_t v = 0;
+                switch (s.format) {
+                    case vk::PipelineExecutableStatisticFormatKHR::eUint64: v = s.value.u64; break;
+                    case vk::PipelineExecutableStatisticFormatKHR::eInt64:  v = (uint64_t) std::max<int64_t>(s.value.i64, 0); break;
+                    default: break;
+                }
+                if (spill_stat) {
+                    pipeline->spilled_regs += (uint32_t) v;
+                } else {
+                    pipeline->scratch_size = (uint32_t) v;
+                }
+            }
         }
     }
 
@@ -7609,6 +7624,27 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
     return 2 * waves_xl <= waves_l;
 }
 
+// Whether an XL pipeline spills depends on the GPU and the compiler (gfx1150 / Mesa 26.1.6: 179 spilled VGPRs, 10-14x slower);
+// where it does, the L tile is kept. Decided from the compiled pipeline's statistics; GGML_VK_MM_XL=2 skips the check.
+static bool ggml_vk_mm_xl_spills(vk_device & device, vk_pipeline & pipeline) {
+    static const bool force = [] { const char * e = getenv("GGML_VK_MM_XL"); return e && atoi(e) == 2; }();
+    if (force) {
+        return false;
+    }
+    if (!pipeline->compiled) {
+        ggml_vk_load_shaders(device, pipeline);
+    }
+    const bool spills = pipeline->spilled_regs > 0 || pipeline->scratch_size > 0;
+    if (spills) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile spills (%s: %u spilled registers, scratch %u), using the L tile\n",
+                          pipeline->name.c_str(), pipeline->spilled_regs, pipeline->scratch_size);
+        }
+    }
+    return spills;
+}
+
 // RDNA3.x WMMA is wave32-native (a wave64 subgroup issues each coopmat op as two halves): the prefetch dense pipelines run as
 // wave32 subgroups at the same BLOCK_SIZE. GGML_VK_DENSE_WAVE32=0 keeps the driver default (wave64 on RADV).
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
@@ -7873,7 +7909,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             kx.f16acc = !f16acc;
             itx = ctx->device->pipeline_matmul.find(kx);
         }
-        if (itx != ctx->device->pipeline_matmul.end() && !itx->second.empty() && itx->second[0].aligned) {
+        if (itx != ctx->device->pipeline_matmul.end() && !itx->second.empty() && itx->second[0].aligned &&
+            !ggml_vk_mm_xl_spills(ctx->device, itx->second[0].aligned)) {
             static bool xl_logged = false;
             if (!xl_logged) {
                 xl_logged = true;
