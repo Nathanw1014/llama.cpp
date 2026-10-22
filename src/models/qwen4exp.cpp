@@ -127,10 +127,18 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,             hparams.ple_conv_kernel);
         qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
 
-        hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+        // range-check both factors and multiply in uint64: a uint32 product wraps (n-gram size 3 with
+        // 0x80000001 heads per n-gram gives 2) and the hash loops then run heads_per_ngram times
+        if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
+            throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
+        }
+        const uint64_t ple_n_heads = (uint64_t) (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+        if (hparams.ple_heads_per_ngram == 0 || ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+            throw std::runtime_error(format("PLE head count %" PRIu64 " (%u per n-gram) is out of range",
+                                            ple_n_heads, hparams.ple_heads_per_ngram));
+        }
+        hparams.ple_n_heads  = (uint32_t) ple_n_heads;
         hparams.ple_head_dim = hparams.n_embd_per_layer;
-        GGML_ASSERT(hparams.ple_ngram_size >= 2 && hparams.ple_ngram_size <= LLAMA_MAX_PLE_NGRAM);
-        GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
 
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
