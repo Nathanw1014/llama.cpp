@@ -277,7 +277,8 @@ static void bump(ggml_tensor * t) {   // add 0.5 to element 0 of an f32 / f16 te
 }
 
 // RMS_NORM + MUL + ROPE + VIEW + SET_ROWS (norm = true) or ROPE + VIEW + SET_ROWS into an f16 cache: the KV write
-static int run_rope_set_rows(ggml_backend_t be, ggml_backend_reg_t reg, bool norm, int mode, int64_t hd, int64_t nh, int64_t nt) {
+// nd: rotated dims (0: all of hd). A partial multi-section rope uses qwen35's sections (n_rot 64 of head_dim 256).
+static int run_rope_set_rows(ggml_backend_t be, ggml_backend_reg_t reg, bool norm, int mode, int64_t hd, int64_t nh, int64_t nt, int64_t nd = 0) {
     ggml_init_params ip = { 48 * ggml_tensor_overhead() + 6 * ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     const bool multi = (mode & GGML_ROPE_TYPE_MROPE) != 0;
@@ -294,8 +295,10 @@ static int run_rope_set_rows(ggml_backend_t be, ggml_backend_reg_t reg, bool nor
             ggml_tensor * n = ggml_rms_norm(ctx, x, 1e-6f); if (ref) ggml_set_output(n);
             a = ggml_mul(ctx, n, w);                         if (ref) ggml_set_output(a);
         }
+        const int n_rot = nd > 0 ? (int) nd : (int) hd / 2 * 2;
         int sections[4] = { (int) hd / 6, (int) hd / 6, (int) hd / 6, 0 };
-        ggml_tensor * r = multi ? ggml_rope_multi(ctx, a, pos, nullptr, (int) hd / 2 * 2, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)
+        if (n_rot < hd) { sections[0] = 11; sections[1] = 11; sections[2] = 10; }
+        ggml_tensor * r = multi ? ggml_rope_multi(ctx, a, pos, nullptr, n_rot, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)
                                 : ggml_rope(ctx, a, pos, (int) hd, mode);
         if (ref) { ggml_set_output(r); rope_r = r; }
         ggml_tensor * v = ggml_view_2d(ctx, r, hd * nh, nt, r->nb[2], 0);
@@ -314,14 +317,15 @@ static int run_rope_set_rows(ggml_backend_t be, ggml_backend_reg_t reg, bool nor
     ggml_backend_tensor_set(idx, iv.data(), 0, iv.size() * 8);
     // the reference f32 in cache-row order, for the RTE check: rope_r is [hd, nh, nt], row t goes to cache row iv[t]
     char label[96];
-    snprintf(label, sizeof(label), "%s mode=%d %lldx%lldx%lld", norm ? "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS" : "ROPE_VIEW_SET_ROWS",
-             mode, (long long) hd, (long long) nh, (long long) nt);
+    snprintf(label, sizeof(label), "%s mode=%d %lldx%lldx%lld rot %lld", norm ? "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS" : "ROPE_VIEW_SET_ROWS",
+             mode, (long long) hd, (long long) nh, (long long) nt, (long long) (nd > 0 ? nd : hd));
     const char * fname = norm ? "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS" : "ROPE_VIEW_SET_ROWS";
     // no ref32 tensor in cache order: check RTE by hand after the pair run
     // RMS_NORM_MUL_ROPE(_VIEW_SET_ROWS) is upstream's fusion and differs from the unfused chain in ~1e-4 of values (10-13: 51 of
     // 521216, 6 of 78848), while ROPE_VIEW_SET_ROWS alone is exact: the norm*gamma -> rope expression, not the f16 store. Listed
     // as known-inexact (a decision for the gate owner), so its RTE check below only reports too.
-    int fails = run_pair(be, reg, label, fname, norm || !multi ? 1 : -1, ctx, of, orr, nullptr, [&]() { bump(x); }, !norm);
+    // every mode fuses (mrope / imrope since the multi-section norm + rope fusion), so the fused count is required everywhere
+    int fails = run_pair(be, reg, label, fname, 1, ctx, of, orr, nullptr, [&]() { bump(x); }, !norm);
     {
         // RTE: recompute the reference (the perturbation changed x; restore by re-running both on the bumped input)
         ggml_cgraph * gr = ggml_new_graph(ctx); ggml_build_forward_expand(gr, orr);
@@ -524,6 +528,10 @@ int main() {
     fails += run_rope_set_rows(be, reg, false, GGML_ROPE_TYPE_NEOX, 128, 8, 509);
     fails += run_rope_set_rows(be, reg, true,  GGML_ROPE_TYPE_NORMAL, 128, 8, 77);
     fails += run_rope_set_rows(be, reg, false, GGML_ROPE_TYPE_IMROPE, 256, 2, 509);
+    // qwen35 (27B / 35B-A3B) k path: head_dim 256, n_rot 64, imrope, with the fused norm and without
+    fails += run_rope_set_rows(be, reg, true,  GGML_ROPE_TYPE_IMROPE, 256, 4, 509, 64);
+    fails += run_rope_set_rows(be, reg, false, GGML_ROPE_TYPE_IMROPE, 256, 4, 509, 64);
+    fails += run_rope_set_rows(be, reg, true,  GGML_ROPE_TYPE_MROPE,  128, 8,  77);
     // qwen4exp hc: the post-combine norm and the up-projection mix (Flash-Next n_embd 2560, low rank 320)
     fails += run_hc_post_norm(be, reg, 2560, 512);
     fails += run_hc_up_mix(be, reg, 2560, 512, 320);

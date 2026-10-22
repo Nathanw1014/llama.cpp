@@ -2685,9 +2685,17 @@ struct test_rms_norm_mul_rope : public test_case {
 
         a = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
 
-        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
+        const bool multi = mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, multi ? 4 * ne[2] : ne[2]);
 
-        ggml_tensor * rope = ggml_rope(ctx, a, pos, ne[0], mode);
+        ggml_tensor * rope;
+        if (multi) {
+            // partial rotation (n_dims = ne0 / 2), sections as qwen35 lays them out
+            int sections[GGML_MROPE_SECTIONS] = { (int) ne[0] / 16, (int) ne[0] / 32 + 1, (int) ne[0] / 32, 0 };
+            rope = ggml_rope_multi(ctx, a, pos, nullptr, ne[0] / 2, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            rope = ggml_rope(ctx, a, pos, ne[0], mode);
+        }
 
         ggml_tensor * out;
 
@@ -2716,6 +2724,15 @@ struct test_rms_norm_mul_rope : public test_case {
                     continue;
                 }
 
+                if (t->type == GGML_TYPE_I32 && t->ne[0] == 4 * ne[2]) {
+                    // multi-section positions: four position streams, distinct so a wrong section shows
+                    std::vector<int32_t> p(t->ne[0]);
+                    for (int64_t k = 0; k < t->ne[0]; ++k) {
+                        p[k] = (int32_t) ((k % ne[2]) + 7 * (k / ne[2]));
+                    }
+                    ggml_backend_tensor_set(t, p.data(), 0, p.size() * sizeof(int32_t));
+                    continue;
+                }
                 init_set_rows_row_ids(t, ne[2]);
             } else {
                 init_tensor_uniform(t);
@@ -10629,7 +10646,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
             for (auto broadcast : {false, true}) {
-                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
+                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
