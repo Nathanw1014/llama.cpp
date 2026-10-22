@@ -1257,13 +1257,123 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+bool llama_context::nextn_resident_enable(llama_context & draft) {
+    if (model.arch != LLM_ARCH_QWEN4EXP || draft.model.arch != LLM_ARCH_QWEN4EXP ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || draft.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+            draft.model.hparams.n_layer_nextn != 1 || model.devices.size() != 1 || draft.model.devices.size() != 1 ||
+            model.n_gpu_layers() <= (int) model.hparams.n_layer_all || draft.model.n_gpu_layers() <= (int) draft.model.hparams.n_layer_all ||
+            cparams.n_seq_max != 1 || draft.cparams.n_seq_max != 1 ||
+            !cparams.embeddings_nextn || cparams.embeddings_nextn_masked || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return false;
+    }
+    ggml_backend_t producer = nullptr;
+    ggml_backend_t consumer = nullptr;
+    for (auto & backend : backends) {
+        if (strncmp(ggml_backend_name(backend.get()), "ROCm", 4) == 0) {
+            producer = backend.get();
+        }
+    }
+    for (auto & backend : draft.backends) {
+        if (producer && ggml_backend_get_device(backend.get()) == ggml_backend_get_device(producer)) {
+            consumer = backend.get();
+        }
+    }
+    if (!producer || !consumer) {
+        return false;
+    }
+    auto rows = std::make_shared<llama_resident_nextn>();
+    rows->producer = producer;
+    rows->consumer = consumer;
+    rows->ready = ggml_backend_event_new(ggml_backend_get_device(producer));
+    rows->done = ggml_backend_event_new(ggml_backend_get_device(consumer));
+    if (!rows->ready || !rows->done) {
+        return false;
+    }
+    nextn_resident = std::move(rows);
+    return true;
+}
+
+void llama_context::nextn_resident_begin(const llama_batch_ext & batch) {
+    nextn_resident_active = false;
+    nextn_resident_host_ready = true;
+    if (!nextn_resident || batch.tokens.empty() || batch.n_embd ||
+            !cparams.embeddings_nextn || cparams.embeddings_nextn_masked || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return;
+    }
+    const auto & first = batch.tokens.front();
+    if (first.seq_ids.size() != 1) {
+        return;
+    }
+    const auto seq_id = *first.seq_ids.begin();
+    for (size_t i = 0; i < batch.tokens.size(); ++i) {
+        const auto & tok = batch.tokens[i];
+        if (tok.id == LLAMA_TOKEN_NULL || tok.has_embd || tok.seq_ids.size() != 1 ||
+                *tok.seq_ids.begin() != seq_id || tok.pos[0] != first.pos[0] + (llama_pos) i) {
+            return;
+        }
+    }
+    auto & rows = *nextn_resident;
+    if (!rows.tensor) {
+        rows.ctx.reset(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+        rows.tensor = ggml_new_tensor_2d(rows.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_batch + 1);
+        rows.buffer.reset(ggml_backend_alloc_ctx_tensors(rows.ctx.get(), rows.producer));
+        if (!rows.buffer) {
+            rows.tensor = nullptr;
+            return;
+        }
+        ++rows.allocation_generation;
+    }
+    ++rows.generation;
+    rows.n_rows = batch.tokens.size();
+    rows.n_exported = 0;
+    rows.seq_id = seq_id;
+    rows.positions.resize(rows.n_rows);
+    for (size_t i = 0; i < rows.n_rows; ++i) {
+        rows.positions[i] = batch.tokens[i].pos[0];
+    }
+    nextn_resident_active = true;
+    nextn_resident_host_ready = false;
+}
+
+std::shared_ptr<llama_resident_nextn> llama_context::nextn_resident_prepare(llama_batch_ext & batch, const float * carry) {
+    if (!nextn_resident_active || batch.tokens.size() != nextn_resident->n_rows || batch.n_embd) {
+        return nullptr;
+    }
+    auto & rows = *nextn_resident;
+    GGML_ASSERT(rows.n_exported == rows.n_rows);
+    for (size_t i = 0; i < rows.n_rows; ++i) {
+        const auto & tok = batch.tokens[i];
+        if (tok.id == LLAMA_TOKEN_NULL || tok.has_embd || tok.seq_ids.size() != 1 ||
+                *tok.seq_ids.begin() != rows.seq_id || tok.pos[0] != rows.positions[i]) {
+            return nullptr;
+        }
+    }
+    rows.set_carry(carry);
+    batch.resident = nextn_resident;
+    GGML_ASSERT(batch.n_embd_state == (size_t) rows.tensor->ne[0]);
+    return nextn_resident;
+}
+
+void llama_context::nextn_resident_materialize() {
+    if (!nextn_resident_active || nextn_resident_host_ready) {
+        return;
+    }
+    auto & rows = *nextn_resident;
+    GGML_ASSERT(rows.n_exported == rows.n_rows);
+    ggml_backend_event_synchronize(rows.ready);
+    ggml_backend_tensor_get(rows.tensor, embd_nextn.data, rows.tensor->nb[1], rows.n_rows * rows.tensor->nb[1]);
+    nextn_resident_host_ready = true;
+}
+
 float * llama_context::get_embeddings_nextn() {
+    nextn_resident_materialize();
     output_reorder();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    nextn_resident_materialize();
     output_reorder();
 
     try {
@@ -1748,6 +1858,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (ubatch.resident) {
+        ggml_backend_event_record(ubatch.resident->done, ubatch.resident->consumer);
+        ubatch.resident->done_recorded = true;
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2091,6 +2206,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
+    nextn_resident_begin(batch_inp);
+
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
@@ -2334,7 +2451,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (nextn_resident_active) {
+                    auto & rows = *nextn_resident;
+                    GGML_ASSERT(ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == rows.seq_id);
+                    for (int64_t i = 0; i < n_rows; ++i) {
+                        GGML_ASSERT(ubatch.pos[i] == rows.positions[offset + i]);
+                    }
+                    rows.export_rows(backend_h, t_h_nextn, offset);
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
@@ -4478,6 +4604,51 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_nextn_resident_enable(llama_context * target, llama_context * draft) {
+    return target->nextn_resident_enable(*draft);
+}
+
+std::shared_ptr<llama_resident_nextn> llama_nextn_resident_prepare(llama_context * target, llama_batch_ext * batch, const float * carry) {
+    return target->nextn_resident_prepare(*batch, carry);
+}
+
+uint64_t llama_nextn_resident_generation(const std::shared_ptr<llama_resident_nextn> & rows) {
+    return rows->generation;
+}
+
+std::shared_ptr<llama_resident_nextn> llama_nextn_resident_snapshot(const std::shared_ptr<llama_resident_nextn> & rows, std::shared_ptr<llama_resident_nextn> snapshot) {
+    if (!snapshot || snapshot->producer != rows->producer || snapshot->tensor->ne[0] != rows->tensor->ne[0] || snapshot->tensor->ne[1] < rows->tensor->ne[1]) {
+        snapshot = std::make_shared<llama_resident_nextn>();
+        snapshot->producer = rows->producer;
+        snapshot->ctx.reset(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+        snapshot->tensor = ggml_new_tensor_2d(snapshot->ctx.get(), GGML_TYPE_F32, rows->tensor->ne[0], rows->tensor->ne[1]);
+        snapshot->buffer.reset(ggml_backend_alloc_ctx_tensors(snapshot->ctx.get(), snapshot->producer));
+        snapshot->ready = ggml_backend_event_new(ggml_backend_get_device(snapshot->producer));
+        if (!snapshot->buffer || !snapshot->ready) {
+            return nullptr;
+        }
+        ++snapshot->allocation_generation;
+    }
+    ++snapshot->generation;
+    snapshot->n_rows = rows->n_rows;
+    snapshot->n_exported = 0;
+    snapshot->seq_id = rows->seq_id;
+    snapshot->positions = rows->positions;
+    ggml_tensor src = *rows->tensor;
+    src.ne[1] = rows->n_rows;
+    src.nb[2] = src.nb[1] * src.ne[1];
+    src.nb[3] = src.nb[2];
+    src.data = (char *) src.data + src.nb[1];
+    snapshot->export_rows(rows->producer, &src, 0);
+    return snapshot;
+}
+
+void llama_nextn_resident_read(const std::shared_ptr<llama_resident_nextn> & rows, uint64_t generation, int32_t row, float * dst) {
+    GGML_ASSERT(rows && rows->generation == generation && row >= 0 && (size_t) row < rows->n_rows);
+    ggml_backend_event_synchronize(rows->ready);
+    ggml_backend_tensor_get(rows->tensor, dst, ((size_t) row + 1) * rows->tensor->nb[1], rows->tensor->nb[1]);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

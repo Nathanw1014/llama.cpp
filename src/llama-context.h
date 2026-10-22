@@ -91,6 +91,9 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    bool nextn_resident_enable(llama_context & draft);
+    std::shared_ptr<llama_resident_nextn> nextn_resident_prepare(llama_batch_ext & batch, const float * carry);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -237,6 +240,9 @@ private:
 
     void output_reorder();
 
+    void nextn_resident_begin(const llama_batch_ext & batch);
+    void nextn_resident_materialize();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -327,6 +333,9 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    std::shared_ptr<llama_resident_nextn> nextn_resident;
+    bool nextn_resident_active = false;
+    bool nextn_resident_host_ready = true;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -138,10 +138,27 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_embd_h::bind_resident(ggml_backend_sched_t sched, const llama_ubatch & ubatch) {
+    resident = ubatch.resident;
+    resident_offset = ubatch.resident_offset;
+    allocation_generation = resident->allocation_generation;
+    h->buffer = resident->tensor->buffer;
+    h->data = (char *) resident->tensor->data + resident_offset * resident->tensor->nb[1];
+    ggml_backend_sched_set_tensor_backend(sched, h, resident->consumer);
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     ASSERT_EMBD_OR_TOKEN(*ubatch);
 
     const int64_t n_tokens = ubatch->n_tokens;
+
+    if (resident) {
+        GGML_ASSERT(ubatch->resident == resident && ubatch->resident_offset == resident_offset);
+        GGML_ASSERT(ubatch->token && !ubatch->embd);
+        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        ggml_backend_event_wait(resident->consumer, resident->ready);
+        return;
+    }
 
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -161,6 +178,14 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
+
+    if (resident || params.ubatch.resident) {
+        return resident && resident == params.ubatch.resident &&
+                allocation_generation == resident->allocation_generation &&
+                resident_offset == params.ubatch.resident_offset &&
+                tokens && tokens->ne[0] == params.ubatch.n_tokens &&
+                h && h->ne[1] == params.ubatch.n_tokens;
+    }
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);

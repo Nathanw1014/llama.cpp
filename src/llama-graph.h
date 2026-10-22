@@ -169,10 +169,15 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void bind_resident(ggml_backend_sched_t sched, const llama_ubatch & ubatch);
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+
+    std::shared_ptr<llama_resident_nextn> resident;
+    size_t resident_offset = 0;
+    uint64_t allocation_generation = 0;
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
