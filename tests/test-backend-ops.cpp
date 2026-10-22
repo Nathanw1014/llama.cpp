@@ -2722,6 +2722,14 @@ struct test_rms_norm_mul_rope : public test_case {
             }
         }
     }
+
+    // large positions amplify the difference between the GPU and CPU trig functions (ggml-org #28175)
+    double max_nmse_err() override {
+        if (ne[2] > 8192) {
+            return 1e-5;
+        }
+        return test_case::max_nmse_err();
+    }
 };
 
 // GGML_OP_ARGMAX
@@ -10606,6 +10614,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 48, 9, 1 }, 1e-6f, false));
         test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 16, 7, 2 }, 1e-6f, true));
     }
+    // more than 65535 channels or samples (rows > 256 take the Vulkan grid y/z path, clamped since #30145)
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {300, 1, 70000, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {300, 1, 1, 70000}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {300, 1, 70000, 1}, 1e-6f, false));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 1, 70000, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 1, 70000, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
