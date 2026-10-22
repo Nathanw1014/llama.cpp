@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -65,7 +66,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--ple-bounds]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -731,6 +732,181 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// crafted qwen4exp PLE metadata must fail the load with a clear error, never crash or read out of bounds
+struct ple_cfg {
+    std::vector<uint32_t> layers           = {0};   // layer 0 is linear attention in the fixture, layer 1 full
+    uint32_t              ngram_size       = 3;
+    uint32_t              heads_per_ngram  = 2;
+    std::vector<uint64_t> head_offsets     = {0, 16, 32, 48};
+    std::vector<uint64_t> head_vocab_sizes = {16, 16, 16, 16};
+};
+
+static const uint32_t ple_head_dim = 32;
+
+static void add_ple_kv(gguf_context * gguf_ctx, const ple_cfg & cfg) {
+    llama_model_saver ms(LLM_ARCH_QWEN4EXP, gguf_ctx);
+    ms.add_kv(LLM_KV_PLE_LAYERS,                  cfg.layers);
+    ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              cfg.ngram_size);
+    ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         cfg.heads_per_ngram);
+    ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+    ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(1));
+    ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+    ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>(cfg.ngram_size, 0x9E3779B97F4A7C15ull));
+    ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            cfg.head_offsets);
+    ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        cfg.head_vocab_sizes);
+}
+
+static std::string ple_log;
+
+static void ple_log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_CONT) {
+        ple_log += text;
+    }
+}
+
+static llama_model_params ple_model_params(std::vector<ggml_backend_dev_t> & no_devs) {
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    no_devs = { nullptr };
+    mp.devices = no_devs.data(); // CPU only: the checks run before any backend work
+    return mp;
+}
+
+// metadata-only load (no file): covers the hparams checks and the per-head table path
+static bool ple_case_meta(const char * name, const ple_cfg & cfg, const char * expect_err, size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    add_ple_kv(gguf_ctx.get(), cfg);
+
+    std::vector<ggml_backend_dev_t> no_devs;
+    llama_model_params mp = ple_model_params(no_devs);
+
+    ple_log.clear();
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, mp));
+
+    bool ok;
+    if (expect_err == nullptr) {
+        ok = model != nullptr;
+    } else {
+        ok = model == nullptr && ple_log.find(expect_err) != std::string::npos;
+    }
+    printf("  %-40s %s\n", name, ok ? "OK" : "FAIL");
+    if (!ok) {
+        printf("    expected %s, log:\n%s\n", expect_err ? expect_err : "a successful load", ple_log.c_str());
+    }
+    return ok;
+}
+
+// file load with a real per_layer_token_embd: covers the table row-count check of the flat path.
+// The file is an MTP-only sidecar (blk.1.nextn.eh_proj present, no trunk), so the trunk tensors are
+// optional and the load reaches the PLE table before it stops on the missing draft-block tensors.
+static bool ple_case_file(const char * name, const ple_cfg & cfg, int64_t n_rows, const char * expect_err) {
+    // the fixture's KV pairs only: its placeholder tensors have no data or strides and cannot be written
+    gguf_context_ptr fixture = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    gguf_context_ptr gguf_ctx(gguf_init_empty());
+    gguf_set_kv(gguf_ctx.get(), fixture.get());
+    add_ple_kv(gguf_ctx.get(), cfg);
+    llama_model_saver ms(LLM_ARCH_QWEN4EXP, gguf_ctx.get());
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+
+    ggml_init_params ip = { /*.mem_size =*/ 4*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * ple = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ple_head_dim, n_rows);
+    ggml_set_name(ple, "per_layer_token_embd.weight");
+    memset(ple->data, 0, ggml_nbytes(ple));
+    ggml_tensor * eh = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 8);
+    ggml_set_name(eh, "blk.1.nextn.eh_proj.weight");
+    memset(eh->data, 0, ggml_nbytes(eh));
+    gguf_add_tensor(gguf_ctx.get(), ple);
+    gguf_add_tensor(gguf_ctx.get(), eh);
+
+    const std::string path = (std::filesystem::temp_directory_path() /
+        ("test-qwen4exp-ple-" + std::to_string(std::random_device{}()) + ".gguf")).string();
+    GGML_ASSERT(gguf_write_to_file(gguf_ctx.get(), path.c_str(), false));
+
+    std::vector<ggml_backend_dev_t> no_devs;
+    llama_model_params mp = ple_model_params(no_devs);
+
+    ple_log.clear();
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), mp));
+    std::filesystem::remove(path);
+
+    static const char * rows_err = "too few for the PLE head ranges";
+    bool ok;
+    if (expect_err == nullptr) {
+        // positive control: the PLE checks pass and the load stops later, on the draft block
+        ok = ple_log.find(rows_err) == std::string::npos && ple_log.find("PLE") == std::string::npos;
+    } else {
+        ok = model == nullptr && ple_log.find(expect_err) != std::string::npos;
+    }
+    printf("  %-40s %s\n", name, ok ? "OK" : "FAIL");
+    if (!ok) {
+        printf("    expected %s, log:\n%s\n", expect_err ? expect_err : "no PLE error", ple_log.c_str());
+    }
+    return ok;
+}
+
+static int test_qwen4exp_ple_bounds(const size_t seed) {
+    ggml_log_callback old_cb;
+    void * old_ud;
+    llama_log_get(&old_cb, &old_ud);
+    llama_log_set(ple_log_cb, nullptr);
+
+    static const char * range_err = "range does not fit the int32 row index";
+    bool ok = true;
+    printf("%s:\n", __func__);
+
+    ok &= ple_case_meta("valid", ple_cfg{}, nullptr, seed);
+
+    {   // offset 2^64-1 + vocab 1 wraps the uint64 sum to 0 (row -1 after the int32 narrowing)
+        ple_cfg c; c.head_offsets[1] = UINT64_MAX; c.head_vocab_sizes[1] = 1;
+        ok &= ple_case_meta("offset wraps the uint64 sum", c, range_err, seed);
+    }
+    {   // offset 2^64-2^31 + vocab 2^31 wraps to 0 as well
+        ple_cfg c; c.head_offsets[2] = 0ull - (1ull << 31); c.head_vocab_sizes[2] = 1ull << 31;
+        ok &= ple_case_meta("offset + vocab wraps to zero", c, range_err, seed);
+    }
+    {
+        ple_cfg c; c.head_vocab_sizes[0] = 0;
+        ok &= ple_case_meta("vocab 0", c, range_err, seed);
+    }
+    {
+        ple_cfg c; c.head_offsets[3] = INT32_MAX; c.head_vocab_sizes[3] = 1;
+        ok &= ple_case_meta("offset + vocab past INT32_MAX", c, range_err, seed);
+    }
+    {   // (3 - 1) * 0x80000001 wraps to 2 in uint32
+        ple_cfg c; c.heads_per_ngram = 0x80000001u; c.head_offsets.resize(2); c.head_vocab_sizes.resize(2);
+        ok &= ple_case_meta("heads_per_ngram wraps the head count", c, "PLE head count", seed);
+    }
+    {
+        ple_cfg c; c.heads_per_ngram = 0;
+        ok &= ple_case_meta("heads_per_ngram 0", c, "PLE head count", seed);
+    }
+    {
+        ple_cfg c; c.ngram_size = 1;
+        ok &= ple_case_meta("n-gram size 1", c, "PLE n-gram size", seed);
+    }
+    {
+        ple_cfg c; c.layers = {1};
+        ok &= ple_case_meta("PLE on a full attention layer", c, "is not a linear attention layer", seed);
+    }
+    {
+        ple_cfg c; c.layers = {7};
+        ok &= ple_case_meta("PLE layer out of range", c, "is out of range", seed);
+    }
+
+    ok &= ple_case_file("table rows cover the ranges", ple_cfg{}, 64, nullptr);
+    ok &= ple_case_file("table rows too few", ple_cfg{}, 63, "too few for the PLE head ranges");
+    {   // ne[1] = 1024 against a 1e6-row head
+        ple_cfg c; c.head_vocab_sizes[3] = 1000000;
+        ok &= ple_case_file("table far shorter than a head", c, 1024, "too few for the PLE head ranges");
+    }
+
+    llama_log_set(old_cb, old_ud);
+    printf("%s: %s\n", __func__, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -740,6 +916,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool ple_bounds = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -763,6 +940,10 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--ple-bounds") == 0) {
+            ple_bounds = true;
+            continue;
+        }
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             log_level = GGML_LOG_LEVEL_INFO;
             continue;
@@ -779,6 +960,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (ple_bounds) {
+            return test_qwen4exp_ple_bounds(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
