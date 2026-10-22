@@ -1381,6 +1381,13 @@ public:
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias,
                             pool_idxs, pool_cells, pool_pos, tail_idxs, ubatch, ratio, blk_bias);
+        if (rows && rows->data) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(rows->buffer));
+            int32_t * data = (int32_t *) rows->data;
+            for (int64_t i = 0; i < rows->ne[0]; ++i) {
+                data[i] = (int32_t) i;
+            }
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -1397,6 +1404,10 @@ public:
     ggml_tensor * pool_pos   = nullptr;  // I32 [4*n_recomp]
     // complete-block selection only: the query's own partial block, -1 padded
     ggml_tensor * tail_idxs  = nullptr;  // I32 [ratio-1, n_tokens/n_stream, n_stream]
+    // masked selection in row tiles: 0 .. n_tps-1, the tiles gather their bias and KQ mask rows with it. Views of
+    // the host inputs would each become a device input copy, and the scheduler allocates all input copies of a
+    // split at its start, so every tile's rows stayed resident next to the whole mask. Set by build_qsa_top_k.
+    ggml_tensor * rows       = nullptr;  // I32 [n_tokens]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -1456,6 +1467,8 @@ bool llama_model_qwen4exp::llm_graph_input_qsa::can_reuse(const llm_graph_params
         res &= cell_blk != nullptr && cell_blk->buffer != nullptr && cell_blk->ne[0] == n_kv;
         res &= cell_blk != nullptr && cell_blk->ne[1] == n_stream;
     }
+    // rows follows the tiling, which n_kv and n_tokens pin
+    res &= rows == nullptr || (rows->buffer != nullptr && rows->ne[0] == n_tokens);
     if (!shortcut) {
         res &= bias     != nullptr && bias->buffer     != nullptr;
         res &= bias     != nullptr && bias->ne[0] == (blk_bias ? n_blocks : n_kv);
@@ -1706,23 +1719,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
 
+    // the row tiles gather their bias and mask rows from the one device copy of each input (see llm_graph_input_qsa::rows);
+    // set below when the ubatch is tiled, before the first select_rows
+    ggml_tensor * rows = nullptr;
+
     // score, expand, mask and select for query rows [t0, t0 + nt) of every stream
     auto select_rows = [&](int64_t t0, int64_t nt) {
         const bool all = t0 == 0 && nt == n_tps;
         ggml_tensor * qr = all ? q3 : ggml_view_3d(ctx0, q3, idx_dim, n_idx_h*nt, n_stream,
                 q3->nb[1], q3->nb[2], t0*n_idx_h*q3->nb[1]);
-        ggml_tensor * bias = all ? inp->bias : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], nt, n_stream,
-                inp->bias->nb[1], inp->bias->nb[2], t0*inp->bias->nb[1]);
-        ggml_tensor * mask_rows = !blk_bias || all ? kq_mask : ggml_view_4d(ctx0, kq_mask, n_kv, nt, 1, n_stream,
-                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t0*kq_mask->nb[1]);
+        ggml_tensor * rows_t = all ? nullptr : ggml_view_1d(ctx0, rows, nt, t0*rows->nb[0]);
+        ggml_tensor * bias = all ? inp->bias : ggml_get_rows(ctx0, inp->bias, rows_t);
         if (!all) {
-            // put the row views in the graph ahead of the chain: Vulkan fuses the scorer (QSA_SCORE) and the
-            // selection (TOPK_QSA) by matching the exact node order of the untiled chain, and a view visited in
-            // the middle of either breaks the match (-12% pp at 32k with two tiles, measured 2026-10-04)
+            // put the row list and the bias rows in the graph ahead of the chain: Vulkan fuses the scorer (QSA_SCORE)
+            // and the selection (TOPK_QSA) by matching the exact node order of the untiled chain, and a node visited in
+            // the middle of either breaks the match (-12% pp at 32k with two tiles, measured 2026-10-04). The mask
+            // gather stays inside: TOPK_QSA takes it in place of the cast.
+            ggml_build_forward_expand(gf, rows_t);
             ggml_build_forward_expand(gf, bias);
-            if (blk_bias) {
-                ggml_build_forward_expand(gf, mask_rows);
-            }
         }
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
@@ -1754,8 +1768,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
         if (blk_bias) {
-            // flash attention keeps the mask in f16; the scores are f32
-            ggml_tensor * mask = mask_rows->type == GGML_TYPE_F32 && all ? mask_rows : ggml_cast(ctx0, mask_rows, GGML_TYPE_F32);
+            // flash attention keeps the mask in f16; the scores are f32 (get_rows converts)
+            ggml_tensor * mask = !all ? ggml_get_rows(ctx0, kq_mask, rows_t) :
+                kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
             expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, nt, n_stream));
         } else {
             expanded = ggml_add(ctx0, expanded, bias);
@@ -1768,9 +1783,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // Every query row selects on its own, so a large ubatch is scored in row tiles: the f32 tensors
     // above are n_kv x rows (4 B per cell and query, six of them), which passes the 4 GiB single
     // buffer limit of RADV at ub x n_kv = 2^30 (ub 8192 at 128k) and sets the compute-buffer peak.
-    // Tiles keep each one under LLAMA_QSA_IDX_TILE_MB (default 1024, 0 = off), split evenly: a short tail tile
+    // Tiles keep each one under LLAMA_QSA_IDX_TILE_MB (default 256, 0 = off), split evenly: a short tail tile
     // costs a whole pass of the chain (ub 2048 at 32k as 1927 + 121 rows was -4.4% pp). The selection is the same.
-    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 1024; }();
+    // The default was 1024. With the rows gathered from the one device copy (llm_graph_input_qsa::rows) a tile costs only its
+    // own scratch, so smaller tiles lower the peak: micro-qwen4exp c262144 ub2048, compute buffer 5473 MiB at 1024, 3489 at 256.
+    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 256; }();
     int64_t tile = n_tps;
     if (tile_mb > 0 && n_stream == 1) {
         const int64_t max_rows = std::max<int64_t>(256, (tile_mb << 20) / (4*n_kv));
@@ -1782,6 +1799,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (tile >= n_tps) {
         top_k = select_rows(0, n_tps);
     } else {
+        // tiles happen with one stream only, so a row of the mask and the bias is a query
+        if (inp->rows == nullptr) {
+            inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tps);
+            ggml_set_input(inp->rows);
+        }
+        // on the device once, so the tile views of it are not input copies of their own
+        rows = ggml_cont(ctx0, inp->rows);
+        ggml_build_forward_expand(gf, rows);
         std::vector<ggml_tensor *> parts;
         for (int64_t t0 = 0; t0 < n_tps; t0 += tile) {
             parts.push_back(select_rows(t0, std::min(tile, n_tps - t0)));
@@ -1865,18 +1890,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // the row tiles gather their mask rows from the one device copy, as the indexer's do (llm_graph_input_qsa::rows);
+    // set below when the attention is tiled
+    ggml_tensor * rows = nullptr;
+
     // rebuild the mask and attend for query rows [t0, t0 + nt) of every stream
     auto attn_rows = [&](int64_t t0, int64_t nt) {
         const bool all = t0 == 0 && nt == q_cur->ne[2];
         ggml_tensor * q      = all ? q_cur : ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], nt,
                 q_cur->nb[1], q_cur->nb[2], t0*q_cur->nb[2]);
-        ggml_tensor * mask   = all ? kq_mask : ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], nt, 1, kq_mask->ne[3],
-                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t0*kq_mask->nb[1]);
         ggml_tensor * sel    = all ? top_k : ggml_view_4d(ctx0, top_k, top_k->ne[0], nt, 1, top_k->ne[3],
                 top_k->nb[1], top_k->nb[2], top_k->nb[3], t0*top_k->nb[1]);
 
-        // prepare new kq mask - starts filled with -INFINITY
-        ggml_tensor * kq_mask_all = ggml_fill(ctx0, mask, -INFINITY);
+        // prepare new kq mask - starts filled with -INFINITY. A tile gathers its mask rows (f32) and fills an f16 copy
+        // of them in place, so no buffer of the host mask's shape is needed; the sum below adds the f32 rows back.
+        ggml_tensor * mask        = kq_mask;
+        ggml_tensor * kq_mask_all = nullptr;
+        if (all) {
+            kq_mask_all = ggml_fill(ctx0, mask, -INFINITY);
+        } else {
+            mask = ggml_get_rows(ctx0, kq_mask, ggml_view_1d(ctx0, rows, nt, t0*rows->nb[0]));
+            kq_mask_all = ggml_fill_inplace(ctx0, ggml_cast(ctx0, mask, kq_mask->type), -INFINITY);
+        }
 
         // reshape KQ mask into tensor with rows of size 1:
         // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
@@ -1913,13 +1948,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // The rebuilt mask is n_kv x rows (2 B per cell and query for flash attention's f16, three of them), and
     // passes the 4 GiB single-buffer limit of RADV at ub x n_kv = 2^31 (ub 8192 at 256k), where the chain and
     // the attention fall back to the CPU. Query rows attend on their own, so a large ubatch runs in row tiles
-    // under the indexer's LLAMA_QSA_IDX_TILE_MB budget, split evenly; the result is the same.
-    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 1024; }();
+    // under the indexer's LLAMA_QSA_IDX_TILE_MB budget, split evenly; the result is the same. A tile's gathered rows are
+    // f32, so the budget counts 4 B per cell.
+    static const int64_t tile_mb = [] { const char * e = getenv("LLAMA_QSA_IDX_TILE_MB"); return e ? atoll(e) : 256; }();
     const int64_t n_rows = q_cur->ne[2];
     const int64_t n_kv   = kq_mask->ne[0];
     int64_t tile = n_rows;
-    if (tile_mb > 0 && kq_mask->ne[3] == 1 && (int64_t) ggml_row_size(kq_mask->type, n_kv)*n_rows > (tile_mb << 20)) {
-        const int64_t max_rows = std::max<int64_t>(256, (tile_mb << 20) / (int64_t) ggml_row_size(kq_mask->type, n_kv));
+    if (tile_mb > 0 && kq_mask->ne[3] == 1 && 4*n_kv*n_rows > (tile_mb << 20)) {
+        const int64_t max_rows = std::max<int64_t>(256, (tile_mb << 20) / (4*n_kv));
         const int64_t n_tiles  = (n_rows + max_rows - 1)/max_rows;
         tile = (n_rows + n_tiles - 1)/n_tiles;
     }
@@ -1928,6 +1964,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     if (tile >= n_rows) {
         cur = attn_rows(0, n_rows);
     } else {
+        // the input set of this ratio was made by the indexer; it has rows when the indexer tiled too
+        GGML_ASSERT(shared_qsa != qsa_inps.end());
+        llm_graph_input_qsa * qsa = shared_qsa->second;
+        if (qsa->rows == nullptr) {
+            qsa->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+            ggml_set_input(qsa->rows);
+        }
+        GGML_ASSERT(qsa->rows->ne[0] == n_rows);
+        rows = ggml_cont(ctx0, qsa->rows);
+        ggml_build_forward_expand(gf, rows);
         std::vector<ggml_tensor *> parts;
         for (int64_t t0 = 0; t0 < n_rows; t0 += tile) {
             parts.push_back(attn_rows(t0, std::min(tile, n_rows - t0)));

@@ -712,6 +712,11 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
+// the same chain for a row tile: the tile gathers its f16 mask rows (GET_ROWS) instead of casting the whole mask
+static constexpr std::initializer_list<ggml_op> topk_qsa_rows_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
+                                                                        GGML_OP_CONT,     GGML_OP_GET_ROWS,
+                                                                        GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                        GGML_OP_TOP_K };
 // qwen4exp QSA indexer scorer as build_qsa_top_k emits it (QSA_SCORE, see ggml_vk_match_qsa_score): the GEMM,
 // the relu, the four head slices summed and the block bias. graph_optimize keeps it in this order; without that
 // the mask build's FILL and views are hoisted into the head sum and the chain never fuses.
@@ -725,7 +730,7 @@ static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
     { 2, 0, 1 }, // cont->src[0]    == permute
-    { 4, 0, 3 }, // reshape->src[0] == cpy (mask cast)
+    { 4, 0, 3 }, // reshape->src[0] == cpy (mask cast) or get_rows (mask rows)
     { 5, 0, 2 }, // add->src[0]     == cont
     { 5, 1, 4 }, // add->src[1]     == reshape
     { 6, 0, 5 }, // top_k->src[0]   == add
@@ -1922,6 +1927,7 @@ struct vk_op_topk_radix_push_constants {
     uint32_t a_st_t;
     uint32_t a_st_b;
     uint32_t a_st_s;
+    uint32_t mask_rows; // QSA only: the mask row of query t is rows[t] (binding 5)
 };
 
 struct vk_op_im2col_push_constants {
@@ -7141,12 +7147,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // variant (spec constant 1) additionally gathers the qwen4 indexer input on the fly.
     {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[0], "topk_radix_qsa_reg8",  topk_radix_qsa_reg8_len,  topk_radix_qsa_reg8_data,  "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[1], "topk_radix_qsa_reg16", topk_radix_qsa_reg16_len, topk_radix_qsa_reg16_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[2], "topk_radix_qsa_reg32", topk_radix_qsa_reg32_len, topk_radix_qsa_reg32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[3], "topk_radix_qsa_reg64", topk_radix_qsa_reg64_len, topk_radix_qsa_reg64_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[0], "topk_radix_qsa_reg8",  topk_radix_qsa_reg8_len,  topk_radix_qsa_reg8_data,  "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[1], "topk_radix_qsa_reg16", topk_radix_qsa_reg16_len, topk_radix_qsa_reg16_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[2], "topk_radix_qsa_reg32", topk_radix_qsa_reg32_len, topk_radix_qsa_reg32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[3], "topk_radix_qsa_reg64", topk_radix_qsa_reg64_len, topk_radix_qsa_reg64_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true, true);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -18838,7 +18844,7 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0 };
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, 0, 0, 0, 0 };
         std::array<uint32_t, 3> elements {
             pipeline->wg_denoms[0],
             std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -18849,7 +18855,7 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
         vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { src0_buf, dst_buf, src0_buf, src0_buf, src0_buf }, pc, elements);
+            { src0_buf, dst_buf, src0_buf, src0_buf, src0_buf, src0_buf }, pc, elements);
         return;
     }
 
@@ -19007,9 +19013,14 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
 
-    // raw f16 mask: follow the reshape/cpy chain back to the materialized input
+    // raw f16 mask: follow the reshape/cpy chain back to the materialized input, or a row tile's get_rows to the whole mask
     const ggml_tensor * mask = add->src[1];
     while (mask->op == GGML_OP_RESHAPE || mask->op == GGML_OP_CPY) {
+        mask = mask->src[0];
+    }
+    const ggml_tensor * rows = nullptr;
+    if (mask->op == GGML_OP_GET_ROWS) {
+        rows = mask->src[1];
         mask = mask->src[0];
     }
 
@@ -19078,7 +19089,7 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         }
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, a_st_t, a_st_b, a_st_s };
+    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, a_st_t, a_st_b, a_st_s, rows ? 1u : 0u };
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -19099,7 +19110,7 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, a), out_buf,
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
-          scratch_buf }, pc, elements);
+          scratch_buf, ggml_vk_tensor_subbuffer(ctx, rows ? rows : cell_blk) }, pc, elements);
     if (ctx->fused_topk_qsa_out_scratch) {
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_buffer_copy_async(subctx, dst_buf.buffer, dst_buf.offset, ctx->prealloc_x, out_off, out_size);
@@ -22628,7 +22639,8 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
     }
 
     const int n_ops = topk_qsa_pattern.size();
-    if (!ggml_vk_match_ops(cgraph, node_idx, topk_qsa_pattern) ||
+    static_assert(topk_qsa_pattern.size() == topk_qsa_rows_pattern.size());
+    if ((!ggml_vk_match_ops(cgraph, node_idx, topk_qsa_pattern) && !ggml_vk_match_ops(cgraph, node_idx, topk_qsa_rows_pattern)) ||
         !ggml_check_edges(cgraph, node_idx, topk_qsa_edges)) {
         return false;
     }
@@ -22650,10 +22662,18 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
     const ggml_tensor * expanded = add->src[0];      // [n_kv, n_tps, n_stream]
 
-    // raw mask: follow the reshape/cpy chain back to the materialized f16 input
+    // raw mask: follow the reshape/cpy chain back to the materialized f16 input; a row tile reads the whole mask
     const ggml_tensor * mask = add->src[1];
     while (mask && (mask->op == GGML_OP_RESHAPE || mask->op == GGML_OP_CPY)) {
         mask = mask->src[0];
+    }
+    const ggml_tensor * rows = nullptr;
+    if (mask && mask->op == GGML_OP_GET_ROWS) {
+        rows = mask->src[1];
+        mask = mask->src[0];
+        if (!rows || rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) || ggml_nrows(rows) != 1) {
+            return false;
+        }
     }
     if (!mask || mask->type != GGML_TYPE_F16) {
         return false;
@@ -22674,8 +22694,11 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
     const int64_t width    = top_k->ne[0];
 
     // pin the indexer layout the shader's addressing assumes
+    if (rows && (n_stream != 1 || rows->ne[0] != n_tps || mask->ne[0] != n_kv || mask->ne[2] != 1 || mask->ne[3] != 1)) {
+        return false;
+    }
     if (scores->ne[3] != 1 || cell_blk->ne[1] != n_stream || ggml_nrows(cell_blk) != n_stream ||
-        ggml_nelements(mask) != n_kv * n_tps * n_stream ||
+        (!rows && ggml_nelements(mask) != n_kv * n_tps * n_stream) ||
         expanded->ne[0] != n_kv || expanded->ne[1] != n_tps || expanded->ne[2] != n_stream ||
         top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
         n_blocks <= 0 || n_kv <= 0 || width <= 0 || width > n_kv) {
@@ -24270,7 +24293,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (ggml_vk_mmid_swiglu_merged_wiring(graph, first_unused) && keep_pattern(mmid_swiglu_merged_pattern)) {
             continue;
         }
-        if (keep_pattern(topk_qsa_pattern)) {
+        if (keep_pattern(topk_qsa_pattern) || keep_pattern(topk_qsa_rows_pattern)) {
             continue;
         }
         // prefill only (the fusion needs more than 64 query-head columns); decode graphs keep their order
@@ -24322,7 +24345,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
                 for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
-                    if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
+                    if (n - o >= 0 && (match_pattern(topk_qsa_pattern, n - o) || match_pattern(topk_qsa_rows_pattern, n - o))) {
                         return true;
                     }
                 }
