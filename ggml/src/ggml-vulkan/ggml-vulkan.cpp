@@ -7362,6 +7362,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     device->gdn_chunk_scan_nsplit = 8 / nw;
                     ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_lds_f32", gdn_chunk_scan_lds_f32_len, gdn_chunk_scan_lds_f32_data,
                         "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {nw * 32}, 1, true, true, 32);
+                } else if (!(getenv("GGML_VK_GDN_CHUNK_KSPLIT") && atoi(getenv("GGML_VK_GDN_CHUNK_KSPLIT")) == 1) &&
+                           !(getenv("GGML_VK_GDN_CHUNK_CPW") && atoi(getenv("GGML_VK_GDN_CHUNK_CPW")) == 2)) {
+                    // default: two waves per 16-column tile, each with half of the state's k blocks: twice the waves in flight
+                    // (the scan is latency-bound; Qwen3.8-27B 1806 -> 1547 us per layer, +1.0% pp2048). GGML_VK_GDN_CHUNK_KSPLIT=1
+                    // keeps one wave per tile
+                    device->gdn_chunk_scan_nsplit = 8;
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_ks2_f32", gdn_chunk_scan_ks2_f32_len, gdn_chunk_scan_ks2_f32_data,
+                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {64}, 1, true, true, 32);
+                } else if (getenv("GGML_VK_GDN_CHUNK_CPW") && atoi(getenv("GGML_VK_GDN_CHUNK_CPW")) == 2) {
+                    // one wave of 32 state columns per workgroup: each operand fragment feeds two column tiles
+                    device->gdn_chunk_scan_nsplit = 4;
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_cpw2_f32", gdn_chunk_scan_cpw2_f32_len, gdn_chunk_scan_cpw2_f32_data,
+                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
                 } else {
                     // one wave (16 state columns) per workgroup, operands straight from the scratch
                     device->gdn_chunk_scan_nsplit = 8;

@@ -24,6 +24,12 @@
 // sequential kernel. Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
 
 layout(constant_id = 0) const uint WGT = 128;        // NW waves of 32
+#ifndef KSPLIT
+#define KSPLIT 1 // waves sharing one 16-column tile, each with KT / KSPLIT of the state's k blocks (KSPLIT 2: WGT 64)
+#endif
+#ifndef CPW
+#define CPW 1    // 16-column state tiles per wave (CPW 2: each A operand load feeds two tiles; not with USE_LDS)
+#endif
 const uint NW = WGT / 32;
 
 #define S_V 128
@@ -125,6 +131,155 @@ float gd(uint i) { return uintBitsToFloat(L[L_G + i / 4][i % 4]); }   // gam [0,
         b[4 * m_ + 3] = od_.y; \
     } }
 
+#if KSPLIT == 2
+// partial K S / Q S exchange: [chunk parity][wave][tile (KS j, QS j)][element][lane]
+shared float XS[2][2][2 * NT][8][32];
+void main() {
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint lr    = lane % 16;
+    const uint hi    = lane / 16;
+    const uint la    = 2 * lr;
+    const uint w     = gl_SubgroupID;                // this wave's k half
+    const uint ow    = 1 - w;
+    const uint KH    = KT / 2;
+    const uint h     = gl_WorkGroupID.x / 8;
+    const uint seq   = gl_WorkGroupID.y;
+    const uint iq1   = h % neq1;
+    const uint v0    = (gl_WorkGroupID.x % 8) * 16;
+
+    const uint state_base = (seq * H + h) * S_V * S_V + (v0 + lr) * S_V;
+    const uint v_lane     = seq * sv3 + h * sv1 + v0 + lr + hi * sv2;
+    const uint o_lane     = (seq * n_tokens * H + h) * S_V + v0 + lr + hi * (S_V * H);
+    const uint qk_base4   = (seq * nch * neq1 + iq1) * (QKU / 4);
+    const uint tp_base4   = (n_seqs * nch * neq1 * QKU + (seq * nch * H + h) * TPU) / 4;
+
+    ACC S[KT / 2];
+    [[unroll]] for (uint q = 0; q < KH; q++) {
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            S[q][i] = data_state[state_base + (w * KH + q) * 16 + AROW(i)];
+        }
+    }
+
+    for (uint c = 0; c < nch; c++) {
+        const uint t0  = c * CL;
+        const uint qk4 = qk_base4 + c * neq1 * (QKU / 4);
+        const uint tp4 = tp_base4 + c * H * (TPU / 4);
+        const uint par = c & 1;
+        float vv[NT][8];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                const uint t = t0 + 16 * j + 2 * i;
+                vv[j][i] = data_v[v_lane + min(t, n_tokens - 1 - hi) * sv2];
+            }
+        }
+        const float gam_last = gd(CL - 1);
+
+        // phase 1 over this wave's k blocks, then add the other wave's partial sums
+        ACC KS[NT], QS[NT];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            KS[j] = ACC(0.0);
+            QS[j] = ACC(0.0);
+        }
+        [[unroll]] for (uint q = 0; q < KH; q++) {
+            const uint kt = w * KH + q;
+            MATB sb;
+            TO_B(sb, S[q]);
+            S[q] = S[q] * gam_last;
+            [[unroll]] for (uint j = 0; j < NT; j++) {
+                MATA a;
+                LOAD_A(a, A_K, QFRAG(j, kt));
+                KS[j] = coopMatMulAdd(a, sb, KS[j]);
+                LOAD_A(a, A_Q, QFRAG(j, kt));
+                QS[j] = coopMatMulAdd(a, sb, QS[j]);
+            }
+        }
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                XS[par][w][j][i][lane]      = KS[j][i];
+                XS[par][w][NT + j][i][lane] = QS[j][i];
+            }
+        }
+        barrier();
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                // the same sum order in both waves (k half 0 + k half 1), so they agree bit for bit; the own half stays in
+                // registers (reading it back from LDS as well measured 1677 vs 1547 us per layer, gap 47)
+                const float k0 = w == 0 ? KS[j][i] : XS[par][ow][j][i][lane];
+                const float k1 = w == 0 ? XS[par][ow][j][i][lane] : KS[j][i];
+                const float q0 = w == 0 ? QS[j][i] : XS[par][ow][NT + j][i][lane];
+                const float q1 = w == 0 ? XS[par][ow][NT + j][i][lane] : QS[j][i];
+                KS[j][i] = k0 + k1;
+                QS[j][i] = q0 + q1;
+            }
+        }
+
+        MATB RB[NT];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            ACC r;
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                const uint t = 16 * j + AROW(i);
+                const float v = t0 + t < n_tokens ? vv[j][i] : 0.0;
+                r[i] = v - gd(t) * KS[j][i];
+            }
+            TO_B(RB[j], r);
+        }
+
+        MATB DB[NT];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            ACC d = ACC(0.0);
+            [[unroll]] for (uint i = 0; i <= j; i++) {
+                MATA a;
+                LOAD_A(a, A_T, TFRAG(j, i));
+                d = coopMatMulAdd(a, RB[i], d);
+            }
+            TO_B(DB[j], d);
+
+            // S += K_j^T diag(dec_j) Delta_j over this wave's k blocks
+            ACC ds;
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                ds[i] = d[i] * gd(CL + 16 * j + AROW(i));
+            }
+            MATB dsb;
+            TO_B(dsb, ds);
+            [[unroll]] for (uint q = 0; q < KH; q++) {
+                MATA a;
+                LOAD_A(a, A_KT, KTFRAG(w * KH + q, j));
+                S[q] = coopMatMulAdd(a, dsb, S[q]);
+            }
+
+            // O_j: wave j % 2 computes and stores token block j
+            if ((j & 1) == w) {
+                ACC o = QS[j];
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    o[i] *= scale * gd(16 * j + AROW(i));
+                }
+                [[unroll]] for (uint i = 0; i <= j; i++) {
+                    MATA a;
+                    LOAD_A(a, A_P, TFRAG(j, i));
+                    o = coopMatMulAdd(a, DB[i], o);
+                }
+                if (t0 + CL <= n_tokens) {
+                    [[unroll]] for (uint i = 0; i < 8; i++) {
+                        data_dst[o_lane + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[i];
+                    }
+                } else {
+                    [[unroll]] for (uint i = 0; i < 8; i++) {
+                        if (t0 + 16 * j + AROW(i) < n_tokens) {
+                            data_dst[o_lane + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint q = 0; q < KH; q++) {
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            data_dst[s_off + state_base + (w * KH + q) * 16 + AROW(i)] = S[q][i];
+        }
+    }
+}
+#elif defined(USE_LDS) || CPW == 1
 void main() {
     const uint lane  = gl_SubgroupInvocationID;
     const uint lr    = lane % 16;
@@ -281,3 +436,165 @@ void main() {
         }
     }
 }
+#else
+void main() {
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint lr    = lane % 16;
+    const uint hi    = lane / 16;
+    const uint la    = 2 * lr;                       // this lane's row within a fragment tile
+    const uint tid   = gl_LocalInvocationIndex;
+    const uint nsplit = 8 / (NW * CPW);
+    const uint h     = gl_WorkGroupID.x / nsplit;
+    const uint seq   = gl_WorkGroupID.y;
+    const uint iq1   = h % neq1;
+    const uint v0    = ((gl_WorkGroupID.x % nsplit) * NW + gl_SubgroupID) * 16 * CPW;
+
+    uint state_base[CPW], v_lane[CPW], o_lane[CPW];
+    [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+        state_base[cp] = (seq * H + h) * S_V * S_V + (v0 + 16 * cp + lr) * S_V;
+        // token-row addressing: lane part (column, half-wave row parity) + a uniform row offset
+        v_lane[cp]     = seq * sv3 + h * sv1 + v0 + 16 * cp + lr + hi * sv2;
+        o_lane[cp]     = (seq * n_tokens * H + h) * S_V + v0 + 16 * cp + lr + hi * (S_V * H);
+    }
+    // scratch is chunk-major (all heads of a chunk adjacent), see gdn_chunk_prep.comp
+    const uint qk_base4   = (seq * nch * neq1 + iq1) * (QKU / 4);
+    const uint tp_base4   = (n_seqs * nch * neq1 * QKU + (seq * nch * H + h) * TPU) / 4;
+
+    ACC S[CPW][KT];
+    [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+        [[unroll]] for (uint kt = 0; kt < KT; kt++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                S[cp][kt][i] = data_state[state_base[cp] + kt * 16 + AROW(i)];
+            }
+        }
+    }
+
+    for (uint c = 0; c < nch; c++) {
+        const uint t0  = c * CL;
+        const uint qk4 = qk_base4 + c * neq1 * (QKU / 4);
+        const uint tp4 = tp_base4 + c * H * (TPU / 4);
+        // V rows of this chunk, issued before phase 1 (rows past n_tokens clamp to the last row and are masked)
+        float vv[CPW][NT][8];
+        [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+            [[unroll]] for (uint j = 0; j < NT; j++) {
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    const uint t = t0 + 16 * j + 2 * i;      // uniform; the lane adds hi
+                    vv[cp][j][i] = data_v[v_lane[cp] + min(t, n_tokens - 1 - hi) * sv2];
+                }
+            }
+        }
+        const float gam_last = gd(CL - 1);
+
+        // phase 1, all reads of the chunk-start state S: KS_j = K_j S, QS_j = Q_j S; S *= gam_last
+        ACC KS[CPW][NT], QS[CPW][NT];
+        [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+            [[unroll]] for (uint j = 0; j < NT; j++) {
+                KS[cp][j] = ACC(0.0);
+                QS[cp][j] = ACC(0.0);
+            }
+        }
+        [[unroll]] for (uint kt = 0; kt < KT; kt++) {
+            MATB sb[CPW];
+            [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                TO_B(sb[cp], S[cp][kt]);
+                S[cp][kt] = S[cp][kt] * gam_last;
+            }
+            [[unroll]] for (uint j = 0; j < NT; j++) {
+                MATA a;
+                LOAD_A(a, A_K, QFRAG(j, kt));
+                [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                    KS[cp][j] = coopMatMulAdd(a, sb[cp], KS[cp][j]);
+                }
+                LOAD_A(a, A_Q, QFRAG(j, kt));
+                [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                    QS[cp][j] = coopMatMulAdd(a, sb[cp], QS[cp][j]);
+                }
+            }
+        }
+
+        // R_j = V_j - diag(gam) KS_j
+        MATB RB[CPW][NT];
+        [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+            [[unroll]] for (uint j = 0; j < NT; j++) {
+                ACC r;
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    const uint t = 16 * j + AROW(i);
+                    const float v = t0 + t < n_tokens ? vv[cp][j][i] : 0.0;
+                    r[i] = v - gd(t) * KS[cp][j][i];
+                }
+                TO_B(RB[cp][j], r);
+            }
+        }
+
+        MATB DB[CPW][NT];
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            // Delta_j = sum_{i <= j} T_ji R_i
+            ACC d[CPW];
+            [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                d[cp] = ACC(0.0);
+            }
+            [[unroll]] for (uint i = 0; i <= j; i++) {
+                MATA a;
+                LOAD_A(a, A_T, TFRAG(j, i));
+                [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                    d[cp] = coopMatMulAdd(a, RB[cp][i], d[cp]);
+                }
+            }
+            MATB dsb[CPW];
+            [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                TO_B(DB[cp][j], d[cp]);
+                // S += K_j^T diag(dec_j) Delta_j
+                ACC ds;
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    ds[i] = d[cp][i] * gd(CL + 16 * j + AROW(i));
+                }
+                TO_B(dsb[cp], ds);
+            }
+            [[unroll]] for (uint kt = 0; kt < KT; kt++) {
+                MATA a;
+                LOAD_A(a, A_KT, KTFRAG(kt, j));
+                [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                    S[cp][kt] = coopMatMulAdd(a, dsb[cp], S[cp][kt]);
+                }
+            }
+
+            // O_j = scale diag(gam) QS_j + sum_{i <= j} P_ji Delta_i
+            ACC o[CPW];
+            [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                o[cp] = QS[cp][j];
+                [[unroll]] for (uint i = 0; i < 8; i++) {
+                    o[cp][i] *= scale * gd(16 * j + AROW(i));
+                }
+            }
+            [[unroll]] for (uint i = 0; i <= j; i++) {
+                MATA a;
+                LOAD_A(a, A_P, TFRAG(j, i));
+                [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                    o[cp] = coopMatMulAdd(a, DB[cp][i], o[cp]);
+                }
+            }
+            [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+                if (t0 + CL <= n_tokens) {
+                    [[unroll]] for (uint i = 0; i < 8; i++) {
+                        data_dst[o_lane[cp] + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[cp][i];
+                    }
+                } else {
+                    [[unroll]] for (uint i = 0; i < 8; i++) {
+                        if (t0 + 16 * j + AROW(i) < n_tokens) {
+                            data_dst[o_lane[cp] + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[cp][i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint cp = 0; cp < CPW; cp++) {
+        [[unroll]] for (uint kt = 0; kt < KT; kt++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                data_dst[s_off + state_base[cp] + kt * 16 + AROW(i)] = S[cp][kt][i];
+            }
+        }
+    }
+}
+#endif
