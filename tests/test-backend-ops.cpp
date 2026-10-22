@@ -4040,6 +4040,7 @@ struct test_rms_norm_scale : public test_case {
 struct test_mul_add_bcast : public test_case {
     const std::array<int64_t, 4> ne;
     const bool swap;
+    const int64_t b_div; // b's ne[1] is ne[1] / b_div: a proper divisor repeats b, which the fusion must decline
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4049,18 +4050,18 @@ struct test_mul_add_bcast : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, swap);
+        return VARS_TO_STR2(ne, swap) + (b_div != 1 ? "," + VAR_TO_STR(b_div) : "");
     }
 
-    test_mul_add_bcast(std::array<int64_t, 4> ne = {2560, 33, 1, 1}, bool swap = false)
-        : ne(ne), swap(swap) {}
+    test_mul_add_bcast(std::array<int64_t, 4> ne = {2560, 33, 1, 1}, bool swap = false, int64_t b_div = 1)
+        : ne(ne), swap(swap), b_div(b_div) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
         ggml_set_name(x, "x");
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
         ggml_set_name(a, "a");
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1] / b_div, ne[2], ne[3]);
         ggml_set_name(b, "b");
         ggml_tensor * m = ggml_mul(ctx, a, b);
         ggml_tensor * out = swap ? ggml_add(ctx, m, x) : ggml_add(ctx, x, m);
@@ -9931,6 +9932,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_add_bcast({2560, 33, 1, 1}, true));
     test_cases.emplace_back(new test_mul_add_bcast({100, 7, 3, 2}));
     test_cases.emplace_back(new test_mul_add_bcast({64, 5, 1, 1}, true));
+    // b repeated along rows (ne[1] a proper divisor): not a zero-stride broadcast, so the fusion must decline
+    test_cases.emplace_back(new test_mul_add_bcast({64, 8, 2, 1}, false, 4));
+    test_cases.emplace_back(new test_mul_add_bcast({64, 6, 3, 1}, true,  3));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));

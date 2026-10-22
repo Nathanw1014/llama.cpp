@@ -23254,6 +23254,13 @@ static bool ggml_vk_can_fuse_mul_add(const ggml_backend_vk_context * ctx, const 
         !ggml_are_same_shape(mul, add) || !ggml_can_repeat(b, a)) {
         return false;
     }
+    // multi_add.comp broadcasts by a zero stride, with no modulo: a dim of b must be 1 or the full size
+    // (ggml_can_repeat also admits a proper divisor, which would keep b's stride and read past it)
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (b->ne[d] != 1 && b->ne[d] != a->ne[d]) {
+            return false;
+        }
+    }
     if (!ggml_is_contiguous(add) || a->nb[0] != sizeof(float) || x->nb[0] != sizeof(float) ||
         ggml_nelements(add) > (int64_t) UINT32_MAX) {
         return false;
