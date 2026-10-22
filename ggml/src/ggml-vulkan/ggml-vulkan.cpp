@@ -13623,6 +13623,19 @@ struct vk_fa_compact_state {
 // [2] the candidate count it came from, [3] the batch it came from. Host-visible is a
 // requirement rather than a preference here - the whole point is that the host can read it
 // without submitting.
+// Every compact-scratch region is bound from its start with ggml_vk_subbuffer, which clamps the range to
+// maxStorageBufferRange, and the FA reads its head / slot strides as uint32. A region past the limit would be
+// silently truncated (writes dropped, reads of zeros or wrapped offsets), so the compact paths decline instead.
+static bool ggml_vk_fa_compact_regions_fit(const ggml_backend_vk_context * ctx, std::initializer_list<uint64_t> regions) {
+    const uint64_t range = std::min<uint64_t>(ctx->device->properties.limits.maxStorageBufferRange, UINT32_MAX);
+    for (const uint64_t r : regions) {
+        if (r > range) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_vk_fa_union_stat_init(ggml_backend_vk_context * ctx) {
     if (ctx->fa_union_stat) {
         return ctx->fa_union_stat->ptr != nullptr;
@@ -14056,6 +14069,9 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
         const size_t   need   = ukc_sz + umc_sz + ul_sz;
+        if (!ggml_vk_fa_compact_regions_fit(ctx, { ukc_sz, umc_sz, ul_sz })) {
+            goto union_unavailable;
+        }
         if (ctx->prealloc_size_y < need) {
             ctx->prealloc_size_y = need;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -14137,6 +14153,9 @@ union_unavailable:;
     const size_t   vc_sz = separate_v ? (size_t) ns * n_head_kv * kv_c * v_row_by : 0;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
+    if (!ggml_vk_fa_compact_regions_fit(ctx, { kc_sz, vc_sz, mc_sz })) {
+        return false;
+    }
     if (ctx->prealloc_size_y < kc_sz + vc_sz + mc_sz) {
         ctx->prealloc_size_y = kc_sz + vc_sz + mc_sz;
         ggml_vk_preallocate_buffers(ctx, subctx);
@@ -14336,6 +14355,10 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     const uint32_t n_slot = slotted ? G : 1u;
     const size_t mc_sz    = (size_t) n_slot * TILE * kv_c_max * sizeof(ggml_fp16_t);
     const size_t need     = lists_sz + (size_t) n_slot * (kc_sz + vc_sz) + mc_sz;
+    // the slotted FA binds all slots as one range and steps them with uint32 strides
+    if (!ggml_vk_fa_compact_regions_fit(ctx, { lists_sz, (uint64_t) n_slot * kc_sz, (uint64_t) n_slot * vc_sz, mc_sz })) {
+        return false;
+    }
     if (ctx->prealloc_size_y < need) {
         const size_t step = size_t{ 256 } << 20;   // grow in steps: a grow drains the device
         ctx->prealloc_size_y = ((need + step - 1) / step) * step;
