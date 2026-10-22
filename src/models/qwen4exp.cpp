@@ -113,7 +113,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
                                             ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
         }
         for (uint32_t il : ple_layers) {
-            GGML_ASSERT(il < hparams.n_layer_all);
+            if (il >= hparams.n_layer_all) {
+                throw std::runtime_error(format("PLE layer %u is out of range", il));
+            }
             hparams.is_ple_impl.set(il);
         }
 
@@ -173,6 +175,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+        }
+    }
+
+    // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+        if (hparams.is_ple(i) && !hparams.is_recr(i)) {
+            throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
         }
     }
 
