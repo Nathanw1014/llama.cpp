@@ -15022,7 +15022,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         v_type_eff == GGML_TYPE_F16 && (!fa_compact.active || fa_compact.separate_v) && neq1 >= 64 && nev3 == 1 &&
                         (KV % 64) == 0 && (HSV % 64) == 0 && ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
                         (use_dequant_kv || fa_compact.active || ((nbv1 % sizeof(ggml_fp16_t)) == 0 && (nbv2 % sizeof(ggml_fp16_t)) == 0)) &&
-                        (uint64_t)HSV * (KV + 128) * nev2 * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange;
+                        (uint64_t)HSV * (KV + 128) * nev2 * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                        // the transpose packs KV_pad = KV + 128 into 20 bits and the head count into 12 (see the
+                        // dispatch below): fall back past those instead of asserting at the end of a ~1M-token prompt
+                        (uint64_t)KV + 128 < (1u << 20) &&
+                        (uint64_t)nev2 * (fa_compact.slotted ? fa_compact.n_slots : 1) < 4096;
     // O in registers (GGML_VK_FA_OREG, default on with V^T): the per-query rescale of the accumulator
     // fragments assumes the gfx11 wave64 coopmat accumulator layout (RADV RDNA3 only, Br == 16, f32 O)
     static const char * fa_oreg_env = getenv("GGML_VK_FA_OREG");
