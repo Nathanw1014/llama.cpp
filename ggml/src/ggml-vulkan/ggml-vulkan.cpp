@@ -23103,6 +23103,12 @@ static bool ggml_vk_fuse_qsa_score_enabled() {
     return ggml_vk_qsa_score_mode() != 0;
 }
 
+// longest chain a variable-length fusion matcher may return (nodes, the first included), and the size of the
+// per-node fusion bookkeeping in ggml_backend_vk_graph_compute
+static constexpr int VK_MAX_FUSED_CHAIN = 16;
+static constexpr int VK_MAX_FUSED_NODES = 32;
+static_assert(VK_MAX_FUSED_CHAIN <= VK_MAX_FUSED_NODES, "fusion chain cap exceeds the bookkeeping arrays");
+
 static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
     *bias_out = nullptr;
     if (ggml_vk_qsa_score_mode() != 1 || !ctx->device->coopmat_support || ctx->device->coopmat2 ||
@@ -23132,8 +23138,8 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
     const ggml_tensor * cur     = nullptr;   // the running head sum
     int heads = 0;                          // heads summed into cur
     int last  = 0;
-    int idxs[16];
-    ggml_op ops[16];
+    int idxs[VK_MAX_FUSED_CHAIN];
+    ggml_op ops[VK_MAX_FUSED_CHAIN];
     int count = 0;
     idxs[count] = node_idx; ops[count++] = mm->op;
     // the view of head h of relu: [M, nt, ns] at offset h*nb[1]
@@ -23145,7 +23151,7 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
     auto is_sum = [&](const ggml_tensor * t) {
         return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == M && t->ne[1] == nt && t->ne[2] == ns && t->ne[3] == 1;
     };
-    for (int j = node_idx + 1; j < std::min(node_idx + 24, cgraph->n_nodes) && count < 16; ++j) {
+    for (int j = node_idx + 1; j < std::min(node_idx + 24, cgraph->n_nodes) && count < VK_MAX_FUSED_CHAIN; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         bool take = false;
         if (!reshape) {
@@ -23526,8 +23532,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
-        // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        // The array is sized to handle the largest fusion (asserted later). The variable-length matchers
+        // (QSA_SCORE, HC_UP_MIX) fill it before that assert, so they cap their chains at VK_MAX_FUSED_CHAIN nodes.
+        bool op_srcs_fused_elementwise[VK_MAX_FUSED_NODES];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
