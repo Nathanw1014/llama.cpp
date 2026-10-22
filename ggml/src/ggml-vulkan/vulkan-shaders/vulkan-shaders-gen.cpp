@@ -873,6 +873,9 @@ void process_shaders() {
     string_to_spv("gdn_chunk_scan_lds_f32", "gdn_chunk_scan.comp", {{"USE_LDS", "1"}});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
+    // EXL3 linears (codebook, rate and rows are specialization constants)
+    string_to_spv("exl3_rotate_f32", "exl3_rotate.comp", {});
+    string_to_spv("exl3_mul_mat_vec_f32", "exl3_mul_mat_vec.comp", {});
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
