@@ -15022,7 +15022,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         v_type_eff == GGML_TYPE_F16 && (!fa_compact.active || fa_compact.separate_v) && neq1 >= 64 && nev3 == 1 &&
                         (KV % 64) == 0 && (HSV % 64) == 0 && ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
                         (use_dequant_kv || fa_compact.active || ((nbv1 % sizeof(ggml_fp16_t)) == 0 && (nbv2 % sizeof(ggml_fp16_t)) == 0)) &&
-                        (uint64_t)HSV * (KV + 128) * nev2 * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                        // slotted: one V^T region per slot, all bound as one range
+                        (uint64_t)HSV * (KV + 128) * nev2 * (fa_compact.slotted ? fa_compact.n_slots : 1) * sizeof(ggml_fp16_t) <=
+                            ctx->device->properties.limits.maxStorageBufferRange &&
                         // the transpose packs KV_pad = KV + 128 into 20 bits and the head count into 12 (see the
                         // dispatch below): fall back past those instead of asserting at the end of a ~1M-token prompt
                         (uint64_t)KV + 128 < (1u << 20) &&
@@ -15400,6 +15402,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k | split_pmajor_bit };
 
+    // bit 31 of gqa_ratio (gather and slotted paths) flags the mask stride; the ratio is the low 16 bits
+    const uint32_t gqa_ratio_rows = gqa_ratio & 0xffffu;
+
     if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
 
@@ -15410,7 +15415,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // We reuse workgroups_x to mean the number of splits, so we need to
         // cancel out the divide by wg_denoms[0].
         uint32_t dispatch_x;
-        if (gqa_ratio > 1) {
+        if (gqa_ratio_rows > 1) {
             workgroups_x *= pipeline->wg_denoms[0];
             dispatch_x = split_k * workgroups_x;
         } else {
@@ -15429,7 +15434,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
     } else {
-        if (gqa_ratio > 1) {
+        if (gqa_ratio_rows > 1) {
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
