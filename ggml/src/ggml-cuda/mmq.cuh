@@ -1724,21 +1724,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
-        !config.stream_k && mmq_rdna3_5_id_use_compact(type, J);
-    if (use_compact_routed) {
-        const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
-        ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
-        build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
-            (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
+    // The runtime guard excludes the same type/J pairs.
+    if constexpr (mmq_rdna3_5_id_use_compact(type, J)) {
+        const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) &&
+            GGML_CUDA_CC_IS_RDNA3_5(cc) && !config.stream_k && mmq_rdna3_5_id_use_compact(type, J);
+        if (use_compact_routed) {
+            const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
+            ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
+            build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
+                (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
 
-        const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
-        const dim3 block_nums_compact(nty, descriptor_blocks, args.nsamples_y);
-        mul_mat_q_routed_compact<type, J, fallback, prec_src1><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
-             blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
-        return;
+            const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
+            const dim3 block_nums_compact(nty, descriptor_blocks, args.nsamples_y);
+            mul_mat_q_routed_compact<type, J, fallback, prec_src1><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
+            return;
+        }
     }
 
     if (!config.stream_k) {
