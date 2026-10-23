@@ -654,10 +654,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // the Flash-Next graph writes f16 from. D_F16 switches the epilogue's 16-byte store alignment rule.
         // iq3_xxs / iq4_xs: matmul_id only (the Unsloth UD-Q3_K_XL expert gate/up types; no dense f16-B pipeline on cm1)
         // q2_k / q3_k / q5_k: matmul_id only (the Unsloth UD-Q4_K_XL 35B-A3B expert down projections; GGML_VK_MMID_D16_KQ)
+        // q5_1: matmul_id only (the Unsloth UD-Q4_K_XL Flash-Next expert down projections; GGML_VK_MMID_D16_Q5_1)
         if (coopmat && !coopmat2 && fp16 && !dot2 &&
             (tname == "q4_k" || tname == "q5_0" || tname == "q8_0" || tname == "q6_k" || tname == "iq4_nl" ||
              (matmul_id_type != MatMulIdType::NONE && (tname == "iq3_xxs" || tname == "iq4_xs" ||
-                                                       tname == "q2_k" || tname == "q3_k" || tname == "q5_k")))) {
+                                                       tname == "q2_k" || tname == "q3_k" || tname == "q5_k" || tname == "q5_1")))) {
             string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
         }
         // qwen4exp hc up-projection with the hyper-connection mix epilogue (HC_EPI): the f16 mixed stream, never the gate
