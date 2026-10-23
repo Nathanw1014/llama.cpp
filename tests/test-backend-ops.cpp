@@ -13711,14 +13711,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_sub_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_div_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
 
-    // BF16 activations with F32 weights
+    // Mixed F32 and 16-bit operands
     for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {10, 5, 4, 3}, {1, 1, 1, 1}, 1, false, false, GGML_TYPE_F32));
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {10, 5, 4, 3}, {2, 2, 2, 2}, 1, false, false, GGML_TYPE_F32));
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {5120, 1, 1, 1}, {1, 32, 1, 1}, 1, false, false, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {17, 5, 1, 1}, {1, 2, 1, 1}, 1, false, false, GGML_TYPE_F16));
     }
 
     // fusion
+    for (auto op : {ggml_add, ggml_mul}) {
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {17, 5, 1, 1}, {1, 2, 1, 1}, 3, false, false, GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F16, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_BF16, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
