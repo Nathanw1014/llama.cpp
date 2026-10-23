@@ -99,7 +99,7 @@ jobs:
 
   hip:
     runs-on: ubuntu-22.04
-    container: rocm/dev-ubuntu-22.04:6.1.2
+    container: rocm/dev-ubuntu-22.04:10.1.0-full
 
     steps:
       - name: Clone
