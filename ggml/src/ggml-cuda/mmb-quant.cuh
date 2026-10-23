@@ -486,11 +486,18 @@ static constexpr bool mmb_quant_type_any(ggml_type type) {
 }
 
 // dense GEMMs: the two types measured faster than MMQ on every arch (#123)
+static constexpr bool mmb_quant_type_dense_supported(ggml_type type) {
+#ifdef GGML_USE_TRELLIS
+    if (ggml_cuda_type_is_tq(type)) return true;
+#endif
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+}
+
 static bool mmb_quant_type_dense(ggml_type type) {
 #ifdef GGML_USE_TRELLIS
     if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
 #endif
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+    return mmb_quant_type_dense_supported(type);
 }
 
 // routed experts: the types measured faster than MMQ at 512-4096 rows on gfx1151 (Q5_K / Q6_K decode the whole super-block and still won)

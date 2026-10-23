@@ -1268,8 +1268,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else if (mmb_quant_type_dense(src0->type)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
-            if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-            else     { MMB_SMALL_DENSE(WT, W); }
+            if constexpr (WT < 32 || mmb_quant_type_dense_supported(static_cast<ggml_type>(WT - 32))) {
+                if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+                else     { MMB_SMALL_DENSE(WT, W); }
+            }
         });
     } else {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
