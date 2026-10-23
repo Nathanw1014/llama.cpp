@@ -7368,6 +7368,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     device->gdn_chunk_scan_nsplit = 8 / nw;
                     ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_lds_f32", gdn_chunk_scan_lds_f32_len, gdn_chunk_scan_lds_f32_data,
                         "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {nw * 32}, 1, true, true, 32);
+                } else if (!(getenv("GGML_VK_GDN_CHUNK_KSPLIT") && atoi(getenv("GGML_VK_GDN_CHUNK_KSPLIT")) == 1) &&
+                           !(getenv("GGML_VK_GDN_CHUNK_CPW") && atoi(getenv("GGML_VK_GDN_CHUNK_CPW")) == 2)) {
+                    // default: two waves per 16-column tile, each with half of the state's k blocks: twice the waves in flight
+                    // (the scan is latency-bound; Qwen3.8-27B 1806 -> 1547 us per layer, +1.0% pp2048). GGML_VK_GDN_CHUNK_KSPLIT=1
+                    // keeps one wave per tile
+                    device->gdn_chunk_scan_nsplit = 8;
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_ks2_f32", gdn_chunk_scan_ks2_f32_len, gdn_chunk_scan_ks2_f32_data,
+                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {64}, 1, true, true, 32);
+                } else if (getenv("GGML_VK_GDN_CHUNK_CPW") && atoi(getenv("GGML_VK_GDN_CHUNK_CPW")) == 2) {
+                    // one wave of 32 state columns per workgroup: each operand fragment feeds two column tiles
+                    device->gdn_chunk_scan_nsplit = 4;
+                    ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_cpw2_f32", gdn_chunk_scan_cpw2_f32_len, gdn_chunk_scan_cpw2_f32_data,
+                        "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
                 } else {
                     // one wave (16 state columns) per workgroup, operands straight from the scratch
                     device->gdn_chunk_scan_nsplit = 8;
@@ -15269,6 +15282,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    // (local test, #29591 adapted) flash attention may write prealloc_y (mask opt bits, compaction scratch): drop the cached matmul B
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
 
     // Dequant+transpose quant K/V directly into a per-head-contiguous [HS, KV, n_head_kv, ns] f16
     // scratch (dequant_*_transpose shader) so the f16 FA reads KV coalesced. One pass, no temp.
@@ -18613,6 +18629,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
+
+        // the partial results overwrite a matmul input converted into prealloc_y
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
 

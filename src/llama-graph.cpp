@@ -1312,6 +1312,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_parts.clear();
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1352,6 +1353,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    for (ggml_tensor * part : t_logits_parts) {
+        ggml_set_output(part);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -1573,6 +1577,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     return res;
+}
+
+void llm_graph_context::build_output_logits(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s) const {
+    static const int64_t part_mb = [] { const char * e = getenv("LLAMA_LOGITS_PART_MB"); return e ? atoll(e) : 1024; }();
+
+    const int64_t n_rows  = cur->ne[1];
+    const int64_t n_vocab = w->ne[1];
+    const int64_t row_b   = n_vocab*(int64_t) sizeof(float);
+
+    if (part_mb <= 0 || cur->ne[2] != 1 || cur->ne[3] != 1 || !ggml_is_contiguous(cur) || n_rows*row_b <= (part_mb << 20)) {
+        cur = build_lora_mm(w, cur, w_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    const int64_t max_rows = std::max<int64_t>(1, (part_mb << 20)/row_b);
+    const int64_t n_parts  = (n_rows + max_rows - 1)/max_rows;
+    const int64_t rows     = (n_rows + n_parts - 1)/n_parts;
+
+    for (int64_t r0 = 0; r0 < n_rows; r0 += rows) {
+        const int64_t nr = std::min(rows, n_rows - r0);
+        ggml_tensor * part = build_lora_mm(w, ggml_view_2d(ctx0, cur, cur->ne[0], nr, cur->nb[1], r0*cur->nb[1]), w_s);
+        cb(part, "result_output", -1);
+        res->t_logits_parts.push_back(part);
+        ggml_build_forward_expand(gf, part);
+    }
+    res->t_logits = res->t_logits_parts[0];
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -3881,7 +3917,8 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    // the backend samplers read one logits tensor; split logits (a large all-rows batch) sample on the host
+    if (samplers.empty() || !res->t_logits || res->t_logits_parts.size() > 1) {
         return;
     }
 

@@ -1614,7 +1614,19 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        const auto & parts = res->get_logits_parts();
+        if (parts.empty()) {
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        } else {
+            int64_t row = 0;
+            for (ggml_tensor * part : parts) {
+                ggml_backend_t backend_part = ggml_backend_sched_get_tensor_backend(sched.get(), part);
+                GGML_ASSERT(backend_part != nullptr);
+                ggml_backend_tensor_get_async(backend_part, part, logits.data + row*n_vocab, 0, ggml_nbytes(part));
+                row += part->ne[1];
+            }
+            GGML_ASSERT(row == n_tokens);
+        }
     }
 
     // extract embeddings
@@ -2014,7 +2026,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const auto & parts = res->get_logits_parts();
+                if (parts.empty()) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // the LM head ran in row blocks (build_output_logits): copy each into its rows
+                    int64_t row = 0;
+                    for (ggml_tensor * part : parts) {
+                        ggml_backend_t backend_part = ggml_backend_sched_get_tensor_backend(sched.get(), part);
+                        GGML_ASSERT(backend_part != nullptr);
+                        ggml_backend_tensor_get_async(backend_part, part, logits_out + row*n_vocab, 0, ggml_nbytes(part));
+                        row += part->ne[1];
+                    }
+                    GGML_ASSERT(row == n_outputs);
+                }
             }
         }
 

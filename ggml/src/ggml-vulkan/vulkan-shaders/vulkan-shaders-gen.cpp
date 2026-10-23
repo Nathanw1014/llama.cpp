@@ -869,6 +869,8 @@ void process_shaders() {
     string_to_spv("gdn_chunk_prep_f32", "gdn_chunk_prep.comp", {});
     string_to_spv("gdn_scan_quad_f32", "gdn_scan_quad.comp", {});
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
+    string_to_spv("gdn_chunk_scan_cpw2_f32", "gdn_chunk_scan.comp", {{"CPW", "2"}});
+    string_to_spv("gdn_chunk_scan_ks2_f32", "gdn_chunk_scan.comp", {{"KSPLIT", "2"}});
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("gdn_chunk_scan_lds_f32", "gdn_chunk_scan.comp", {{"USE_LDS", "1"}});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
