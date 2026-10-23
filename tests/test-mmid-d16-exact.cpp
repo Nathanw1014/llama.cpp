@@ -531,6 +531,73 @@ static int run_mmid_glu(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type typ
     return fails;
 }
 
+// MUL_MAT_ID+CPY(f16)+SWIGLU with the SwiGLU output placed on the expert input (a computed node), as ggml-alloc may do once
+// the second GEMM has read it: the overlap check must drop the fusion and the chain must run unfused (it asserted before).
+// Reference: the same chain allocated normally (fused); the two outputs must be byte-equal.
+static int run_mmid_glu_alias(ggml_backend_t be, ggml_backend_reg_t reg, ggml_type type, int64_t m, int64_t k, int64_t nt, int n_mats, int n_used) {
+    GGML_ASSERT(2 * k >= m * n_used);   // the f16 [m, n_used, nt] output fits in the f32 [k, 1, nt] input
+    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
+    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
+    ggml_init_params ip = { 48 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * gw  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+    ggml_tensor * uw  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+    ggml_tensor * b0  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, nt);
+    ggml_tensor * b_alias = nullptr;
+    auto chain = [&](ggml_tensor ** b_out) {
+        ggml_tensor * b   = ggml_scale(ctx, b0, 1.0f);   // computed, so the overlap check looks at it
+        ggml_tensor * mm1 = ggml_mul_mat_id(ctx, uw, b, ids);
+        ggml_tensor * c1  = ggml_cast(ctx, mm1, GGML_TYPE_F16);
+        ggml_tensor * mm2 = ggml_mul_mat_id(ctx, gw, b, ids);
+        ggml_tensor * c2  = ggml_cast(ctx, mm2, GGML_TYPE_F16);
+        ggml_tensor * o   = ggml_swiglu_split(ctx, c2, c1);
+        ggml_set_output(o);
+        if (b_out) *b_out = b;
+        return o;
+    };
+    ggml_tensor * oa = chain(&b_alias);
+    ggml_tensor * orf = chain(nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(be);
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = align;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    ggml_tallocr ta = ggml_tallocr_new(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (t != oa) GGML_ASSERT(ggml_tallocr_alloc(&ta, t) == GGML_STATUS_SUCCESS);
+    }
+    GGML_ASSERT(ggml_backend_tensor_alloc(buf, oa, b_alias->data) == GGML_STATUS_SUCCESS);   // not a view: as ggml-alloc places it
+    std::mt19937 rng(41 + (int) type + (int) nt);
+    fill(gw, rng, -1.0f, 1.0f); fill(uw, rng, -1.0f, 1.0f); fill(b0, rng, -1.0f, 1.0f);
+    std::vector<int32_t> idv(n_used * nt), perm(n_mats);
+    for (int64_t t = 0; t < nt; ++t) {
+        for (int e = 0; e < n_mats; ++e) perm[e] = e;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int j = 0; j < n_used; ++j) idv[t * n_used + j] = perm[j];
+    }
+    ggml_backend_tensor_set(ids, idv.data(), 0, idv.size() * 4);
+    const size_t ne = ggml_nelements(oa);
+    std::vector<ggml_fp16_t> va(ne), vr(ne);
+    ggml_cgraph * ga = ggml_new_graph(ctx); ggml_build_forward_expand(ga, oa);
+    ggml_cgraph * gr = ggml_new_graph(ctx); ggml_build_forward_expand(gr, orf);
+    reset(); ggml_backend_graph_compute(be, ga); const uint64_t n_a = count("MUL_MAT_ID_CPY16_SWIGLU");
+    ggml_backend_tensor_get(oa, va.data(), 0, ne * 2);
+    reset(); ggml_backend_graph_compute(be, gr); const uint64_t n_r = count("MUL_MAT_ID_CPY16_SWIGLU");
+    ggml_backend_tensor_get(orf, vr.data(), 0, ne * 2);
+    size_t ndiff = 0;
+    for (size_t i = 0; i < ne; ++i) ndiff += va[i] != vr[i];
+    const int fails = (ndiff != 0) + (n_a != 0) + (n_r != 1);
+    printf("%s MUL_MAT_ID_CPY16_SWIGLU alias %s %lldx%lldx%lld  byte-equal=%s (%zu of %zu differ) fused alias/ref=%llu/%llu (want 0/1)\n",
+           fails ? "FAIL" : "ok", ggml_type_name(type), (long long) m, (long long) k, (long long) nt, ndiff ? "NO" : "yes", ndiff, ne,
+           (unsigned long long) n_a, (unsigned long long) n_r);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
@@ -569,6 +636,7 @@ int main() {
         fails += run_mmid_glu(be, reg, t, 256, 640, 512, 16, 4, false);
     }
     fails += run_mmid_glu(be, reg, GGML_TYPE_TQ2_T, 200, 256, 77, 16, 4, true);   // ragged rows and tokens
+    fails += run_mmid_glu_alias(be, reg, GGML_TYPE_TQ2_T, 128, 256, 129, 16, 4);    // the output on the input: fusion dropped
 #endif
     // f16-output norms: the 35B attn / post-attn norm (2048 wide, rms_norm.comp), the 35B GDN output norm (128 x 32, silu gate,
     // rms_norm_small.comp) and the Flash-Next one (128 x 48, sigmoid gate)
