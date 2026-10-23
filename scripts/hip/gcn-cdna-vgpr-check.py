@@ -63,13 +63,21 @@ def find_regressions(kernels, units, baseline, compiler_version):
         raise ValueError('unsupported baseline schema or architecture')
     if compiler_version != baseline['compiler_version']:
         raise ValueError('compiler identity changed; review the baseline')
-    if not baseline['translation_units'] or not baseline['kernels']:
-        raise ValueError('empty baseline coverage or budgets')
+    if not baseline['translation_units'] or any(type(count) is not int or count <= 0 for count in baseline['translation_units'].values()):
+        raise ValueError('empty or invalid baseline coverage')
+    minimum_kernels = baseline.get('minimum_kernel_count', max(baseline['translation_units'].values()))
+    if type(minimum_kernels) is not int or minimum_kernels <= 0:
+        raise ValueError('invalid minimum kernel count')
+    budgets = baseline.get('kernels', {})
     errors = []
+    if not kernels:
+        errors.append('empty kernel inventory')
+    if len(kernels) < minimum_kernels:
+        errors.append(f'total kernel coverage {len(kernels)} < {minimum_kernels}')
     for unit, count in baseline['translation_units'].items():
         if units.get(unit, 0) < count:
             errors.append(f'{unit}: kernel coverage {units.get(unit, 0)} < {count}')
-    for name, budget in baseline['kernels'].items():
+    for name, budget in budgets.items():
         if budget['reason'] not in baseline['reasons'] or not baseline['reasons'][budget['reason']]:
             raise ValueError(f'missing baseline reason: {name}')
         if any(type(budget[field]) is not int or budget[field] < 0 for field in FIELDS):
@@ -82,7 +90,7 @@ def find_regressions(kernels, units, baseline, compiler_version):
         # gfx1151 can address 256 VGPRs per lane; the shared SIMD pool is larger. See README.md.
         if usage['vgprs'] > 256:
             errors.append(f'{name}: VGPRs {usage["vgprs"]} > architectural limit 256')
-        budget = baseline['kernels'].get(name)
+        budget = budgets.get(name)
         if budget is None:
             if usage['spill_stores']:
                 errors.append(f'{name}: new spill ({usage["spill_stores"]} spill saves, {usage["scratch_bytes"]} scratch bytes/lane)')
@@ -94,7 +102,7 @@ def find_regressions(kernels, units, baseline, compiler_version):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Check final gfx1151 assembly against per-kernel spill budgets.')
+    parser = argparse.ArgumentParser(description='Require zero gfx1151 VGPR spills, or enforce explicit legacy budgets.')
     parser.add_argument('assembly_directory', type=Path)
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--compiler-version', required=True)
@@ -107,13 +115,15 @@ def main():
         print(f'Error: {error}', file=sys.stderr)  # noqa: NP100
         return 1
     print(f'Parsed {len(kernels)} kernels across {len(units)} translation units from final assembly.')  # noqa: NP100
-    print(f'{sum(bool(k["spill_stores"]) for k in kernels.values())} spilling symbols; {len(baseline["kernels"])} bounded baseline entries.')  # noqa: NP100
-    print(f'Baseline reasons: {dict(Counter(k["reason"] for k in baseline["kernels"].values()))}')  # noqa: NP100
+    budgets = baseline.get('kernels', {})
+    print(f'{sum(bool(k["spill_stores"]) for k in kernels.values())} spilling symbols; {len(budgets)} bounded baseline entries.')  # noqa: NP100
+    if budgets:
+        print(f'Baseline reasons: {dict(Counter(k["reason"] for k in budgets.values()))}')  # noqa: NP100
     for error in errors:
         print(error, file=sys.stderr)  # noqa: NP100
     if errors:
         return 1
-    print('PASS: no new spills or increases in per-kernel resource budgets.')  # noqa: NP100
+    print('PASS: no new spills or increases in per-kernel resource budgets.' if budgets else 'PASS: zero VGPR spills with complete baseline coverage.')  # noqa: NP100
     return 0
 
 

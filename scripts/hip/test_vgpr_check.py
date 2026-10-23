@@ -104,12 +104,47 @@ class TestVgprCheck(unittest.TestCase):
             checker.parse_assembly(text.replace('amdhsa.kernels: []', 'amdhsa.kernels: unknown'), 'gfx1151')
 
     def test_invalid_baseline_fails(self):
-        for change in [{'schema_version': 2}, {'architecture': 'gfx908'}, {'translation_units': {}}, {'kernels': {}}]:
+        for change in [{'schema_version': 2}, {'architecture': 'gfx908'}, {'translation_units': {}}, {'translation_units': {'sample': 0}}, {'minimum_kernel_count': 0}]:
             baseline = copy.deepcopy(self.baseline)
             baseline.update(change)
             with self.subTest(change=change):
                 with self.assertRaises(ValueError):
                     checker.find_regressions(self.kernels, self.units, baseline, 'fixture compiler')
+
+    def test_empty_budgets_single_spill_fails(self):
+        self.baseline['kernels'] = {}
+        del self.baseline['reasons']
+        self.kernels['_Z6kernelv']['spill_stores'] = 1
+        self.assertTrue(any('new spill (1 spill saves' in e for e in self.check()))
+
+    def test_empty_or_absent_budgets_zero_spills_pass(self):
+        self.baseline['kernels'] = {}
+        del self.baseline['reasons']
+        self.kernels['_Z6kernelv']['spill_stores'] = 0
+        self.assertEqual(self.check(), [])
+        del self.baseline['kernels']
+        self.assertEqual(self.check(), [])
+
+    def test_empty_budgets_coverage_shortfall_fails(self):
+        self.baseline['kernels'] = {}
+        self.kernels['_Z6kernelv']['spill_stores'] = 0
+        self.baseline['translation_units']['sample'] = 2
+        self.assertTrue(any('coverage 1 < 2' in e for e in self.check()))
+
+    def test_empty_budgets_empty_input_fails(self):
+        self.baseline['kernels'] = {}
+        self.kernels = {}
+        self.units = {}
+        self.assertTrue(any('empty kernel inventory' in e for e in self.check()))
+        self.assertTrue(any('coverage' in e for e in self.check()))
+
+    def test_empty_budgets_total_kernel_shortfall_fails(self):
+        self.baseline['kernels'] = {}
+        self.kernels['_Z6kernelv']['spill_stores'] = 0
+        self.baseline['translation_units']['other'] = 1
+        self.units['other'] = 1
+        self.baseline['minimum_kernel_count'] = 2
+        self.assertTrue(any('total kernel coverage 1 < 2' in e for e in self.check()))
 
 
 if __name__ == '__main__':
