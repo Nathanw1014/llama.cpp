@@ -10156,8 +10156,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 2560));
     }
-    // id-only f16-output types (Unsloth UD-Q3_K_XL expert gate/up; UD-Q4_K_XL 35B-A3B expert down: q2_K / q3_K / q5_K)
-    for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q5_K}) {
+    // id-only f16-output types (Unsloth UD-Q3_K_XL expert gate/up; UD-Q4_K_XL 35B-A3B expert down: q2_K / q3_K / q5_K;
+    // UD-Q4_K_XL Flash-Next expert down: q5_1)
+    for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1}) {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 2560));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  256, 64, 2560));
         test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 200, 70, 2560));
@@ -10182,6 +10183,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_glu16(GGML_TYPE_TQ2_T, 16, 4, true, 128, 5, 256));      // mat-vec: no fusion
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, 32, 10, true, 640, 96, 512));
 #endif
+    // the Flash-Next down projection shape: 2560 x 640, top-10 of 32 here (512 in the model)
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, 32, 10, true, 2560, 96, 640));
     // LLAMA_NORM_F16B's f16-B shapes (f32 x f16 MUL_MAT, quant x f16 MUL_MAT_ID) are checked in test-mmid-d16-exact: the CPU
     // backend has no f32 x f16 matmul and asserts on an f16 MUL_MAT_ID B, so it cannot be the reference here
     // shapes that pass the Vulkan XL-tile gate (m, k >= 1024, XL waves <= half of l's), exact and ragged

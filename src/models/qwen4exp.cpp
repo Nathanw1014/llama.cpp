@@ -14,6 +14,10 @@
 #include <algorithm>
 #include <cinttypes>
 
+// defined below, used by the graph constructor
+static bool    qwen4exp_last_attn_trim();
+static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -1192,10 +1196,27 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         ggml_build_forward_expand(gf, cur);
 
+        // LLAMA_FN_LAST_ATTN_TRIM: the last layer's attention for the last query strip only, when every output row is in
+        // it (same guard as the FFN trim below)
+        const bool last_trim_ok = il == n_layer - 1 && qwen4exp_last_attn_trim() && inp_out_ids && ubatch.output != nullptr &&
+                (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+        int64_t q_first = 0;
+        if (last_trim_ok) {
+            const int64_t strip = qwen4exp_query_strip(n_tokens, 1);
+            q_first = ((n_tokens - 1)/strip)*strip;
+            for (int64_t i = 0; i < q_first; ++i) {
+                if (ubatch.output[i]) {
+                    q_first = 0;
+                    break;
+                }
+            }
+        }
+        ggml_tensor * tile_out_ids = nullptr;
+
         if (hparams.is_recr(il)) {
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
-            cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il, q_first, &tile_out_ids);
         }
 
         if (il == n_layer - 1 && inp_out_ids &&
@@ -1204,7 +1225,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             // the reference port (upstream 6c84c7d5d) gathers here too; without it the last
             // layer's hc-combine/mix and MoE run over every ubatch row, and the output of a
             // request depends on how many requests the server has already served.
-            cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+            // a trimmed attention output holds only its tile's rows: its own output ids
+            cur    = ggml_get_rows(ctx0, cur,    tile_out_ids ? tile_out_ids : inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
@@ -1369,6 +1391,36 @@ static bool qwen4exp_block_selection(const llama_memory_hybrid_idx_context * mct
 
 // top block_budget blocks by score, in ascending block order, expanded to their cells (-1 for an invisible block:
 // its score is -inf, so step(score + 1) is 0), followed by the tail cells: [block_budget*r + r-1, n_query, 1, n_stream]
+// The maskless selection scores n_blocks x 4 heads x rows in f32, plus the relu of it: 2 x 2 GiB at ub 16384 and 32k
+// context, the Flash-Next compute-buffer peak (box 2, GGML_ALLOC_TRACE=2, 10-23). Scoring and selecting in row strips
+// keeps one strip's score live; each query row selects on its own, so the result is the same. Port of the strip scoring
+// of halo-box 8026a5cd0 (Piotr Wilkin). LLAMA_QSA_SEL_STRIP = rows per strip (default 2048), 0 = one strip. 2048 leaves
+// ub 2048 untiled; at ub 16384 / 32k it cuts the reserve 9772 -> 5706 MiB for -2.1% pp32k, where 512 rows cost -6%
+// (box 2, 10-23, measured).
+static int64_t qwen4exp_sel_strip(int64_t n_rows, int64_t n_stream) {
+    static const int64_t rows = [] { const char * e = getenv("LLAMA_QSA_SEL_STRIP"); return e ? std::max<int64_t>(0, atoll(e)) : 2048; }();
+    return rows == 0 || n_stream != 1 ? n_rows : std::min<int64_t>(n_rows, rows);
+}
+
+// the strips' selections join in a balanced concat tree (log2 copies of each row, not one per strip)
+static void qwen4exp_append_strip(ggml_context * ctx, std::vector<ggml_tensor *> & chunks, ggml_tensor * value) {
+    chunks.push_back(value);
+    while (chunks.size() > 1 && chunks.back()->ne[1] == chunks[chunks.size() - 2]->ne[1]) {
+        ggml_tensor * right = chunks.back(); chunks.pop_back();
+        ggml_tensor * left  = chunks.back(); chunks.pop_back();
+        chunks.push_back(ggml_concat(ctx, left, right, 1));
+    }
+}
+
+static ggml_tensor * qwen4exp_finish_strips(ggml_context * ctx, std::vector<ggml_tensor *> & chunks) {
+    while (chunks.size() > 1) {
+        ggml_tensor * right = chunks.back(); chunks.pop_back();
+        ggml_tensor * left  = chunks.back(); chunks.pop_back();
+        chunks.push_back(ggml_concat(ctx, left, right, 1));
+    }
+    return chunks.front();
+}
+
 static ggml_tensor * qwen4exp_select_complete_blocks(ggml_context * ctx0, ggml_tensor * score,
         ggml_tensor * block_cells, ggml_tensor * tail, int64_t block_budget, int64_t r) {
     const int64_t n_blocks = score->ne[0], n_query = score->ne[1], n_stream = score->ne[2];
@@ -1520,7 +1572,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        int64_t                                 q_first,
+        ggml_tensor *                           q_pos) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1702,44 +1756,65 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return nullptr;
     }
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, qwen4exp_indexer_in(ctx0, model.layers[il].index_q_proj, cur));
-    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
+    // LLAMA_FN_LAST_ATTN_TRIM: queries only for rows [q_first, n_tokens) (maskless, one stream, so rows are tokens)
+    GGML_ASSERT(q_first == 0 || (inp->maskless && n_stream == 1 && q_pos != nullptr));
+    const int64_t n_q = n_tokens - q_first;
+    ggml_tensor * cur_q = q_first == 0 ? cur : ggml_view_2d(ctx0, cur, cur->ne[0], n_q, cur->nb[1], q_first*cur->nb[1]);
+    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, qwen4exp_indexer_in(ctx0, model.layers[il].index_q_proj, cur_q));
+    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_q);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-    q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
+    q = ggml_rope_multi(ctx0, q, q_first == 0 ? inp_pos : q_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the maskless selection scores whole blocks: n_blocks x rows, a quarter of the masked chain, so it stays untiled
+    // the maskless selection scores whole blocks: n_blocks x rows, a quarter of the masked chain, in row strips (qwen4exp_sel_strip)
     if (inp->maskless) {
-        // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-        // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-        ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-        score = ggml_relu(ctx0, score);
+        // the trimmed rows [q_first, n_tps) and the strips take row views of the per-row inputs (one stream: rows are tokens)
+        const int64_t n_qr  = n_tps - q_first;
+        const int64_t strip = qwen4exp_sel_strip(n_qr, n_stream);
+        ggml_tensor * q3    = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_qr, n_stream);
 
-        // the heads sit side by side on ne[1] and there are only a few of them
-        ggml_tensor * summed = nullptr;
-        for (int64_t h = 0; h < n_idx_h; ++h) {
-            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                    score->nb[2], score->nb[3], h*score->nb[1]);
-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        std::vector<ggml_tensor *> selected;
+        for (int64_t first = q_first; first < n_tps; first += strip) {
+            const int64_t n_query = std::min(strip, n_tps - first);
+            const bool    whole   = first == 0 && n_query == n_tps;   // one strip: the original tensors, no views
+            ggml_tensor * qs   = whole ? q3 : ggml_view_3d(ctx0, q3, idx_dim, n_idx_h*n_query, n_stream,
+                    q3->nb[1], q3->nb[2], (first - q_first)*n_idx_h*q3->nb[1]);
+            ggml_tensor * bias = whole ? inp->bias : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
+                    inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
+            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx0, inp->tail_idxs, r-1, n_tps, 1, n_stream)
+                    : ggml_view_4d(ctx0, inp->tail_idxs, r-1, n_query, 1, n_stream,
+                        inp->tail_idxs->nb[1], inp->tail_idxs->nb[2], inp->tail_idxs->nb[2], first*inp->tail_idxs->nb[1]);
+
+            // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+            // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+            ggml_tensor * score = ggml_mul_mat(ctx0, pooled, qs);
+            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_query, n_stream);
+            score = ggml_relu(ctx0, score);
+
+            // the heads sit side by side on ne[1] and there are only a few of them
+            ggml_tensor * summed = nullptr;
+            for (int64_t h = 0; h < n_idx_h; ++h) {
+                ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_query, n_stream,
+                        score->nb[2], score->nb[3], h*score->nb[1]);
+                summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+            }
+
+            score = summed;
+            cb(score, "indexer_score", il);
+
+            // one value per block, so it is cheaper to bias here than after the cells are expanded
+            if (blk_bias) {
+                score = ggml_add(ctx0, score, bias);
+            }
+
+            ggml_tensor * top_k = qwen4exp_select_complete_blocks(ctx0, score, inp->blk_cells, tail,
+                    (int64_t) hparams.indexer_top_k/r, r);
+            cb(top_k, "indexer_top_k", il);
+            qwen4exp_append_strip(ctx0, selected, top_k);
         }
-
-        score = summed;
-        cb(score, "indexer_score", il);
-
-        // one value per block, so it is cheaper to bias here than after the cells are expanded
-        if (blk_bias) {
-            score = ggml_add(ctx0, score, inp->bias);
-        }
-
-        ggml_tensor * tail = ggml_reshape_4d(ctx0, inp->tail_idxs, r-1, n_tps, 1, n_stream);
-        ggml_tensor * top_k = qwen4exp_select_complete_blocks(ctx0, score, inp->blk_cells, tail,
-                (int64_t) hparams.indexer_top_k/r, r);
-        cb(top_k, "indexer_top_k", il);
-        return top_k;
+        return qwen4exp_finish_strips(ctx0, selected);
     }
 
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -2029,26 +2104,117 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     return cur;
 }
 
+// LLAMA_FN_LAST_ATTN_TRIM (default on, =0 disables): in the last layer, run the queries, the indexer queries, the selection
+// and the attention only for the last query strip of the ubatch, [q_first, n_tokens), when every output row lies in it (a
+// prefill ubatch whose only output is its last token). K/V and the indexer keys of every row are still stored, so the cache
+// is the same; the FFN half of the last layer is already trimmed to the output rows. Port of Gufo's final-layer query-tile
+// pruning (halo-box 6f20bcaa4 + ee0fcf2d8). The strip keeps prefill shapes (512 rows at a 2048-token ubatch), but a GEMM
+// over fewer columns may take another tile size: not bit-identical by construction, KL-gated.
+static bool qwen4exp_last_attn_trim() {
+    static const bool on = [] { const char * e = getenv("LLAMA_FN_LAST_ATTN_TRIM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// the trim's query strip: 512 rows for one stream (never more than the ubatch)
+static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
+    return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
+}
+
+// the trimmed tile's inputs: its positions (the layout llm_graph_input_pos uploads, rows [t0, n_tokens)) and the output rows
+// relative to t0. A graph built for one output pattern is reused only while every output stays inside the tile.
+struct llm_graph_input_qwen4exp_tile : public llm_graph_input_i {
+    llm_graph_input_qwen4exp_tile(int64_t t0, int64_t n_tokens, int64_t n_outputs, uint32_t n_pos_per_embd)
+        : t0(t0), n_tokens(n_tokens), n_outputs(n_outputs), n_pos_per_embd(n_pos_per_embd) {}
+
+    void set_input(const llama_ubatch * ub) override {
+        const int64_t nt = n_tokens - t0;
+        std::vector<int32_t> pos_data(nt*n_pos_per_embd);
+        for (uint32_t k = 0; k < n_pos_per_embd; ++k) {
+            for (int64_t i = 0; i < nt; ++i) {
+                // text tokens with M-RoPE: the three position dims repeat the 1-D position, the fourth is 0
+                pos_data[k*nt + i] = ub->token && n_pos_per_embd == 4 ? (k < 3 ? ub->pos[t0 + i] : 0) : ub->pos[k*n_tokens + t0 + i];
+            }
+        }
+        ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*sizeof(int32_t));
+        std::vector<int32_t> ids;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (ub->output[i]) {
+                GGML_ASSERT(i >= t0);   // can_reuse admits only output patterns inside the tile
+                ids.push_back((int32_t) (i - t0));
+            }
+        }
+        GGML_ASSERT((int64_t) ids.size() == n_outputs);
+        ggml_backend_tensor_set(out_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        if ((int64_t) params.ubatch.n_tokens != n_tokens || (int64_t) params.n_outputs != n_outputs || params.ubatch.output == nullptr) {
+            return false;
+        }
+        for (int64_t i = 0; i < t0; ++i) {
+            if (params.ubatch.output[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const int64_t  t0, n_tokens, n_outputs;
+    const uint32_t n_pos_per_embd;
+    ggml_tensor * pos     = nullptr;   // I32 [(n_tokens - t0) * n_pos_per_embd]
+    ggml_tensor * out_ids = nullptr;   // I32 [n_outputs]
+};
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        int64_t                   q_first,
+        ggml_tensor **            tile_out_ids) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    ggml_tensor * top_k = nullptr;
+    bool trim = false;                 // LLAMA_FN_LAST_ATTN_TRIM taken: queries for rows [q_first, n_tokens) only
+    ggml_tensor * q_pos = nullptr;
+    if (qsa) {
+        // the trim needs the maskless selection (the masked path reads the full-batch KQ mask) and one stream; the input
+        // set of this ratio was made by an earlier layer, and the dense shortcut is not taken for it
+        const auto it_inp = qsa_inps.find((uint32_t) hparams.dsv4_compress_ratios[il]);
+        if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() &&
+                it_inp->second->maskless && !it_inp->second->shortcut && q_first % qwen4exp_query_strip(n_tokens, 1) == 0) {
+            auto tile = std::make_unique<llm_graph_input_qwen4exp_tile>(q_first, n_tokens, n_outputs, hparams.n_pos_per_embd());
+            tile->pos     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (n_tokens - q_first) * hparams.n_pos_per_embd());
+            tile->out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+            ggml_set_input(tile->pos);
+            ggml_set_input(tile->out_ids);
+            q_pos         = tile->pos;
+            *tile_out_ids = tile->out_ids;
+            res->add_input(std::move(tile));
+            trim = true;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO("%s: LLAMA_FN_LAST_ATTN_TRIM: layer %d attention runs query rows [%" PRId64 ", %" PRId64 ") of %" PRId64 "\n",
+                        __func__, il, q_first, (int64_t) n_tokens, (int64_t) n_tokens);
+            }
+        }
+        top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos);
+    }
+    const int64_t n_q   = trim ? n_tokens - q_first : n_tokens;
+    ggml_tensor * cur_q = trim ? ggml_view_2d(ctx0, cur, cur->ne[0], n_q, cur->nb[1], q_first*cur->nb[1]) : cur;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur_q, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_q ]
     cb(Qcur_full, "Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_q,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
@@ -2066,18 +2232,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_q,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_q);
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     // Apply IMRoPE
     Qcur = ggml_rope_multi(
-            ctx0, Qcur, inp_pos, nullptr,
+            ctx0, Qcur, trim ? q_pos : inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );

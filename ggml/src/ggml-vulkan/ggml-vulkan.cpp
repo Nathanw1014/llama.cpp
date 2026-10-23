@@ -5990,6 +5990,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQP7,   tqp7)
 #undef CREATE_MM2_TRELLIS_D16
 #endif
+        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         // MUL_MAT_ID_SWIGLU: the same aligned medium REG_A == 3 pipeline with SWIGLU set (mul_mm.comp constantID 16)
         if (mmid_rega == 3 && device->mul_mat_id_m[GGML_TYPE_IQ3_XXS]) {
             std::vector<uint32_t> sw = mmid_m_aligned_spec(GGML_TYPE_IQ3_XXS, m_warptile_mmq);
@@ -23739,6 +23740,13 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     static const bool d16_kq = [] { const char * e = getenv("GGML_VK_MMID_D16_KQ"); return e == nullptr || atoi(e) != 0; }();
     if (!d16_kq && (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q5_K)) {
         ggml_vk_cpy16_reject(cgraph, node_idx, "weight type (GGML_VK_MMID_D16_KQ=0)"); return false;
+    }
+    // Q5_1 f16-output id pipeline (10-23): the UD-Q4_K_XL Flash-Next expert down projections are Q5_1 on 43 of 48 layers, which
+    // ran MUL_MAT_ID_MUL (7.2 ms) plus a separate CPY(2560,10,2048) to f16 (1.5 ms) per layer and 2048-token ubatch, about 181 ms
+    // of the 193 ms per-ubatch op-time gap to halo-box (box 2, perf logger). GGML_VK_MMID_D16_Q5_1=0 keeps Q5_1 unfused.
+    static const bool d16_q5_1 = [] { const char * e = getenv("GGML_VK_MMID_D16_Q5_1"); return e == nullptr || atoi(e) != 0; }();
+    if (!d16_q5_1 && src0->type == GGML_TYPE_Q5_1) {
+        ggml_vk_cpy16_reject(cgraph, node_idx, "weight type (GGML_VK_MMID_D16_Q5_1=0)"); return false;
     }
     if (!ggml_is_contiguous(src0) || mmid->type != GGML_TYPE_F32) { ggml_vk_cpy16_reject(cgraph, node_idx, "src0 layout / dst type"); return false; }
     if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_mmid_f16b_enabled()))) {
