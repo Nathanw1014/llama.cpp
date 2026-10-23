@@ -4432,6 +4432,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sum_f32, "sum_f32", sum_f32_len, sum_f32_data, "main", 2, sizeof(vk_op_sum_push_constants), {1, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32_wg512, "cross_entropy_loss_f32_wg512", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -15032,8 +15033,50 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
 }
 
 void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, ggml_nelements(src0));
-    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
+    const uint64_t n = ggml_nelements(src0);
+    // a dense source (contiguous, or a permutation of a contiguous tensor) is reduced flat by up to 512 workgroups, then one
+    // workgroup sums their partials. One workgroup for everything took 307 ms for 8192x8192 on gfx1151.
+    if (ggml_nbytes(src0) != n * sizeof(float) || n > UINT32_MAX) {
+        vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, n);
+        ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_sum_f32;
+    const uint32_t bs = 256;
+    uint32_t n_wg = (uint32_t) std::clamp<uint64_t>(CEIL_DIV(n, 16 * bs), 1, 512);
+    const uint32_t chunk = ROUNDUP_POW2((uint32_t) CEIL_DIV(n, n_wg), bs);
+    n_wg = std::max((uint32_t) CEIL_DIV(n, chunk), 1u);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_wg > 1 ? 2 : 1);
+
+    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    const uint32_t a_offset = get_misalign_bytes(ctx, src0) / sizeof(float);
+    const uint32_t d_offset = get_misalign_bytes(ctx, dst) / sizeof(float);
+
+    if (n_wg == 1) {
+        const vk_op_sum_push_constants pc = { (uint32_t) n, (uint32_t) n, a_offset, d_offset };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { 1, 1, 1 });
+        return;
+    }
+
+    const size_t tmp_size = (size_t) n_wg * sizeof(float);
+    if (ctx->prealloc_size_x < tmp_size) {
+        ctx->prealloc_size_x = tmp_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    vk_subbuffer tmp_buf = { ctx->prealloc_x, 0, tmp_size };
+
+    const vk_op_sum_push_constants pc1 = { (uint32_t) n, chunk, a_offset, 0 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, tmp_buf }, pc1, { n_wg, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk_op_sum_push_constants pc2 = { n_wg, n_wg, 0, d_offset };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { tmp_buf, dst_buf }, pc2, { 1, 1, 1 });
+    ctx->prealloc_x_need_sync = true;
 }
 
 void ggml_vk_sum_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
