@@ -1246,7 +1246,8 @@ static void launch_fattn_tile_case(
     bool use_q8_0_KV = false;
     fattn_kernel_t fattn_kernel;
 #ifdef GGML_USE_HIP
-    if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
+    // Native Q8 KV needs one query; the tile switch can only select these columns.
+    if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256) && (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1))) {
         use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
         fattn_kernel = use_q8_0_KV
             ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
