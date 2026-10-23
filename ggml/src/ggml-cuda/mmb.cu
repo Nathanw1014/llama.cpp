@@ -143,6 +143,13 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     constexpr int Q2R = Q20 ? (BM * 8) / MMB_NT : 1;
     uint32_t q20[Q2R];
 
+    // gfx1151/ROCm 10.1 clang 24: per-step staging clears seven saves/32 scratch bytes per lane in the 128x256 BF16 tile.
+    // Remove this when prefetching this exact tile is spill-free.
+#if defined(__gfx1151__)
+    constexpr bool DEFER_A = !TAIL && BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2;
+#else
+    constexpr bool DEFER_A = false;
+#endif
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -210,9 +217,10 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;   // whole fragments past the valid columns are never stored
     const int nks = K / MMB_BK;
-    load_regs(0); store_lds(); __syncthreads();
+    if constexpr (!DEFER_A) { load_regs(0); store_lds(); __syncthreads(); }
     for (int ks = 0; ks < nks; ++ks) {
-        if (ks + 1 < nks) load_regs(ks + 1);
+        if constexpr (DEFER_A) { load_regs(ks); store_lds(); __syncthreads(); }
+        else if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             // gfx1151/ROCm 10.1 clang 24: streaming B clears three dense spill names.
@@ -249,8 +257,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
             }
         }
         __syncthreads();
-        if (ks + 1 < nks) store_lds();
-        __syncthreads();
+        if constexpr (!DEFER_A) { if (ks + 1 < nks) store_lds(); __syncthreads(); }
     }
     // epilogue through LDS (per-wave 1 KB stage in the now-free A/B tile area); tiles are 16 rows, a_rows is a
     // multiple of 32 in this model, so whole tiles are either valid or beyond a_rows
@@ -439,6 +446,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     uint32_t lbg[LBR][2], lbu[LBR][2];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
     if constexpr (LB) { for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i); }
+    // gfx1151/ROCm 10.1 clang 24: direct activation staging clears 20 wide-GLU spill names without changing the 64x256 tile.
+    // Remove this when activation prefetch keeps these tiles spill-free.
+#if defined(__gfx1151__)
+    constexpr bool DEFER_B = BM == 64 && BN == 256 && WTM == 32 && WTN == 64;
+#else
+    constexpr bool DEFER_B = false;
+#endif
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -476,10 +490,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 } else { gm[i] = um[i] = g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); }
             }
         }
+        if constexpr (!DEFER_B) {
 #pragma unroll
-        for (int i = 0; i < B_ITEMS; ++i) {
-            const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
-            bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+            for (int i = 0; i < B_ITEMS; ++i) {
+                const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
+                bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+            }
         }
     };
     auto store_lds = [&]() {
@@ -512,8 +528,16 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 }
             }
         }
+        if constexpr (DEFER_B) {
+#pragma unroll 2
+            for (int i = 0; i < B_ITEMS; ++i) {
+                const int c = tid + i * MMB_NT, row = xrow(c >> 3);
+                *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = row >= 0 ? *(const uint4 *)(Xh + (size_t)row * K + weight_ks * MMB_BK + (c & 7) * 8) : make_uint4(0,0,0,0);
+            }
+        } else {
 #pragma unroll
-        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+            for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+        }
     };
     v8f accg[TM][TN], accu[TM][TN];
 #pragma unroll
@@ -551,13 +575,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
                             accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accg[i][j]); }
-                    }
+                        }
                     {
                         const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
                             accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accu[i][j]); }
-                    }
+                        }
                 }
             } else {
                 v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
