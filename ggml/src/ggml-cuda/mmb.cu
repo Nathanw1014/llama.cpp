@@ -1436,39 +1436,41 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     static const bool q4k_half = getenv("MMB_Q4K_HALF") ? atoi(getenv("MMB_Q4K_HALF")) != 0 : true;
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        if (BM_BIG == 128 && BN_sel != 256) {
-            const dim3 gbig((M + 127) / 128, nbig_max);
-            mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-        } else {
-            auto launch_big = [&](auto bn_tag) {
-                constexpr int BN = decltype(bn_tag)::value;
-                const dim3 gbig((M + 63) / 64, nbig_max);
-                if constexpr (WT == 32 + GGML_TYPE_Q4_K && BN == 128) {
-                    if (q4k_half) {
-                        mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        if constexpr (WT < 32 || mmb_quant_type_routed_supported(static_cast<ggml_type>(WT - 32))) {
+            if (BM_BIG == 128 && BN_sel != 256) {
+                const dim3 gbig((M + 127) / 128, nbig_max);
+                mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else {
+                auto launch_big = [&](auto bn_tag) {
+                    constexpr int BN = decltype(bn_tag)::value;
+                    const dim3 gbig((M + 63) / 64, nbig_max);
+                    if constexpr (WT == 32 + GGML_TYPE_Q4_K && BN == 128) {
+                        if (q4k_half) {
+                            mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                        } else {
+                            mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                        }
                     } else {
                         mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
                     }
-                } else {
-                    mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                }
-            };
-            if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
-            else               launch_big(std::integral_constant<int,128>{});
-        }
-        if (BM_SMALL == 128) {
-            const dim3 gsmall((M + 127) / 128, nsmall_max);
-            mmb_routed_glu_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
-        } else {
-            const dim3 gsmall((M + 63) / 64, nsmall_max);
-            if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
-                if (q4k_half) {
-                    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                };
+                if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
+                else               launch_big(std::integral_constant<int,128>{});
+            }
+            if (BM_SMALL == 128) {
+                const dim3 gsmall((M + 127) / 128, nsmall_max);
+                mmb_routed_glu_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+            } else {
+                const dim3 gsmall((M + 63) / 64, nsmall_max);
+                if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
+                    if (q4k_half) {
+                        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                    } else {
+                        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                    }
                 } else {
                     mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
                 }
-            } else {
-                mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
             }
         }
     });
