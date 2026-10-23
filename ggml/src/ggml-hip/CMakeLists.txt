@@ -82,10 +82,18 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
 endif()
 
+if (NOT GGML_EXL3)
+    list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX "/ggml-cuda/exl3\\.cu$")
+endif()
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+if (GGML_EXL3)
+    target_compile_definitions(ggml-hip PRIVATE GGML_USE_EXL3)
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

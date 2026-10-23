@@ -208,6 +208,10 @@ add_library(ggml-base
             ggml-quants.h
             gguf.cpp)
 
+if (GGML_EXL3)
+    target_sources(ggml-base PRIVATE ../exl3/exl3.c ../exl3/exl3.h)
+endif()
+
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
     SOVERSION ${GGML_VERSION_MAJOR}
