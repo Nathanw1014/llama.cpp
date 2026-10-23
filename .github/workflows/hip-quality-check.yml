@@ -43,7 +43,7 @@ env:
 jobs:
   ubuntu-22-hip-quality-check:
     runs-on: ubuntu-22.04
-    container: rocm/dev-ubuntu-22.04:10.1.0-full
+    container: rocm/dev-ubuntu-26.04:10.1.0-full
     steps:
       - name: Clone
         id: checkout
@@ -66,7 +66,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
         with:
-          key: hip-quality-check-ubuntu-22.04
+          key: hip-quality-check-ubuntu-26.04
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
@@ -103,7 +103,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
         with:
-          key: hip-quality-check-ubuntu-22.04
+          key: hip-quality-check-ubuntu-26.04
           folder: llama.cpp
           evict-old-files: 1d
           hf_bucket: ggml-org/cache
