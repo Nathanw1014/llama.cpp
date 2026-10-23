@@ -13623,6 +13623,19 @@ struct vk_fa_compact_state {
 // [2] the candidate count it came from, [3] the batch it came from. Host-visible is a
 // requirement rather than a preference here - the whole point is that the host can read it
 // without submitting.
+// Every compact-scratch region is bound from its start with ggml_vk_subbuffer, which clamps the range to
+// maxStorageBufferRange, and the FA reads its head / slot strides as uint32. A region past the limit would be
+// silently truncated (writes dropped, reads of zeros or wrapped offsets), so the compact paths decline instead.
+static bool ggml_vk_fa_compact_regions_fit(const ggml_backend_vk_context * ctx, std::initializer_list<uint64_t> regions) {
+    const uint64_t range = std::min<uint64_t>(ctx->device->properties.limits.maxStorageBufferRange, UINT32_MAX);
+    for (const uint64_t r : regions) {
+        if (r > range) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_vk_fa_union_stat_init(ggml_backend_vk_context * ctx) {
     if (ctx->fa_union_stat) {
         return ctx->fa_union_stat->ptr != nullptr;
@@ -14056,6 +14069,9 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
         const size_t   need   = ukc_sz + umc_sz + ul_sz;
+        if (!ggml_vk_fa_compact_regions_fit(ctx, { ukc_sz, umc_sz, ul_sz })) {
+            goto union_unavailable;
+        }
         if (ctx->prealloc_size_y < need) {
             ctx->prealloc_size_y = need;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -14137,6 +14153,9 @@ union_unavailable:;
     const size_t   vc_sz = separate_v ? (size_t) ns * n_head_kv * kv_c * v_row_by : 0;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
+    if (!ggml_vk_fa_compact_regions_fit(ctx, { kc_sz, vc_sz, mc_sz })) {
+        return false;
+    }
     if (ctx->prealloc_size_y < kc_sz + vc_sz + mc_sz) {
         ctx->prealloc_size_y = kc_sz + vc_sz + mc_sz;
         ggml_vk_preallocate_buffers(ctx, subctx);
@@ -14336,6 +14355,10 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     const uint32_t n_slot = slotted ? G : 1u;
     const size_t mc_sz    = (size_t) n_slot * TILE * kv_c_max * sizeof(ggml_fp16_t);
     const size_t need     = lists_sz + (size_t) n_slot * (kc_sz + vc_sz) + mc_sz;
+    // the slotted FA binds all slots as one range and steps them with uint32 strides
+    if (!ggml_vk_fa_compact_regions_fit(ctx, { lists_sz, (uint64_t) n_slot * kc_sz, (uint64_t) n_slot * vc_sz, mc_sz })) {
+        return false;
+    }
     if (ctx->prealloc_size_y < need) {
         const size_t step = size_t{ 256 } << 20;   // grow in steps: a grow drains the device
         ctx->prealloc_size_y = ((need + step - 1) / step) * step;
@@ -15022,7 +15045,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         v_type_eff == GGML_TYPE_F16 && (!fa_compact.active || fa_compact.separate_v) && neq1 >= 64 && nev3 == 1 &&
                         (KV % 64) == 0 && (HSV % 64) == 0 && ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
                         (use_dequant_kv || fa_compact.active || ((nbv1 % sizeof(ggml_fp16_t)) == 0 && (nbv2 % sizeof(ggml_fp16_t)) == 0)) &&
-                        (uint64_t)HSV * (KV + 128) * nev2 * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange;
+                        // slotted: one V^T region per slot, all bound as one range
+                        (uint64_t)HSV * (KV + 128) * nev2 * (fa_compact.slotted ? fa_compact.n_slots : 1) * sizeof(ggml_fp16_t) <=
+                            ctx->device->properties.limits.maxStorageBufferRange &&
+                        // the transpose packs KV_pad = KV + 128 into 20 bits and the head count into 12 (see the
+                        // dispatch below): fall back past those instead of asserting at the end of a ~1M-token prompt
+                        (uint64_t)KV + 128 < (1u << 20) &&
+                        (uint64_t)nev2 * (fa_compact.slotted ? fa_compact.n_slots : 1) < 4096;
     // O in registers (GGML_VK_FA_OREG, default on with V^T): the per-query rescale of the accumulator
     // fragments assumes the gfx11 wave64 coopmat accumulator layout (RADV RDNA3 only, Br == 16, f32 O)
     static const char * fa_oreg_env = getenv("GGML_VK_FA_OREG");
@@ -15396,6 +15425,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k | split_pmajor_bit };
 
+    // bit 31 of gqa_ratio (gather and slotted paths) flags the mask stride; the ratio is the low 16 bits
+    const uint32_t gqa_ratio_rows = gqa_ratio & 0xffffu;
+
     if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
 
@@ -15406,7 +15438,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // We reuse workgroups_x to mean the number of splits, so we need to
         // cancel out the divide by wg_denoms[0].
         uint32_t dispatch_x;
-        if (gqa_ratio > 1) {
+        if (gqa_ratio_rows > 1) {
             workgroups_x *= pipeline->wg_denoms[0];
             dispatch_x = split_k * workgroups_x;
         } else {
@@ -15425,7 +15457,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
     } else {
-        if (gqa_ratio > 1) {
+        if (gqa_ratio_rows > 1) {
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
@@ -16506,6 +16538,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { (uint32_t)CEIL_DIV((uint64_t)ne01 * ne02 * ne03, rows_per_wg), 1, 1 };
         } else {
             elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
         }
         break;
 
@@ -18407,6 +18441,8 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         std::array<uint32_t, 3> elements;
         elements = { (uint32_t)rms->src[0]->ne[1], (uint32_t)rms->src[0]->ne[2], (uint32_t)rms->src[0]->ne[3] };
+        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
         static_assert(max_tensors == 7);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -23090,6 +23126,12 @@ static bool ggml_vk_fuse_qsa_score_enabled() {
     return ggml_vk_qsa_score_mode() != 0;
 }
 
+// longest chain a variable-length fusion matcher may return (nodes, the first included), and the size of the
+// per-node fusion bookkeeping in ggml_backend_vk_graph_compute
+static constexpr int VK_MAX_FUSED_CHAIN = 16;
+static constexpr int VK_MAX_FUSED_NODES = 32;
+static_assert(VK_MAX_FUSED_CHAIN <= VK_MAX_FUSED_NODES, "fusion chain cap exceeds the bookkeeping arrays");
+
 static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
     *bias_out = nullptr;
     if (ggml_vk_qsa_score_mode() != 1 || !ctx->device->coopmat_support || ctx->device->coopmat2 ||
@@ -23119,8 +23161,8 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
     const ggml_tensor * cur     = nullptr;   // the running head sum
     int heads = 0;                          // heads summed into cur
     int last  = 0;
-    int idxs[16];
-    ggml_op ops[16];
+    int idxs[VK_MAX_FUSED_CHAIN];
+    ggml_op ops[VK_MAX_FUSED_CHAIN];
     int count = 0;
     idxs[count] = node_idx; ops[count++] = mm->op;
     // the view of head h of relu: [M, nt, ns] at offset h*nb[1]
@@ -23132,7 +23174,7 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
     auto is_sum = [&](const ggml_tensor * t) {
         return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == M && t->ne[1] == nt && t->ne[2] == ns && t->ne[3] == 1;
     };
-    for (int j = node_idx + 1; j < std::min(node_idx + 24, cgraph->n_nodes) && count < 16; ++j) {
+    for (int j = node_idx + 1; j < std::min(node_idx + 24, cgraph->n_nodes) && count < VK_MAX_FUSED_CHAIN; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         bool take = false;
         if (!reshape) {
@@ -23211,6 +23253,13 @@ static bool ggml_vk_can_fuse_mul_add(const ggml_backend_vk_context * ctx, const 
     if (b->ne[0] != 1 || a->ne[0] == 1 || !ggml_are_same_shape(a, mul) || !ggml_are_same_shape(x, add) ||
         !ggml_are_same_shape(mul, add) || !ggml_can_repeat(b, a)) {
         return false;
+    }
+    // multi_add.comp broadcasts by a zero stride, with no modulo: a dim of b must be 1 or the full size
+    // (ggml_can_repeat also admits a proper divisor, which would keep b's stride and read past it)
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (b->ne[d] != 1 && b->ne[d] != a->ne[d]) {
+            return false;
+        }
     }
     if (!ggml_is_contiguous(add) || a->nb[0] != sizeof(float) || x->nb[0] != sizeof(float) ||
         ggml_nelements(add) > (int64_t) UINT32_MAX) {
@@ -23513,8 +23562,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
-        // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        // The array is sized to handle the largest fusion (asserted later). The variable-length matchers
+        // (QSA_SCORE, HC_UP_MIX) fill it before that assert, so they cap their chains at VK_MAX_FUSED_CHAIN nodes.
+        bool op_srcs_fused_elementwise[VK_MAX_FUSED_NODES];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;

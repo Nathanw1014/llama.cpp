@@ -18,8 +18,9 @@
 #define TQK_QS_WORDS (2u*TQK_K)
 
 // Stream bit at which step t's 16-bit window starts. C: off = (31 - t)*k
+// t is masked to 0..31 so an out-of-range step stays inside the block instead of wrapping.
 uint tqk_off(uint t) {
-    return (31u - t) * TQK_K;
+    return (31u - (t & 31u)) * TQK_K;
 }
 
 // i + 1 or i + 2 modulo the stream length, for i < TQK_QS_BYTES (TQK_QS_WORDS).

@@ -113,7 +113,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
                                             ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
         }
         for (uint32_t il : ple_layers) {
-            GGML_ASSERT(il < hparams.n_layer_all);
+            if (il >= hparams.n_layer_all) {
+                throw std::runtime_error(format("PLE layer %u is out of range", il));
+            }
             hparams.is_ple_impl.set(il);
         }
 
@@ -127,10 +129,18 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,             hparams.ple_conv_kernel);
         qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
 
-        hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+        // range-check both factors and multiply in uint64: a uint32 product wraps (n-gram size 3 with
+        // 0x80000001 heads per n-gram gives 2) and the hash loops then run heads_per_ngram times
+        if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
+            throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
+        }
+        const uint64_t ple_n_heads = (uint64_t) (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+        if (hparams.ple_heads_per_ngram == 0 || ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+            throw std::runtime_error(format("PLE head count %" PRIu64 " (%u per n-gram) is out of range",
+                                            ple_n_heads, hparams.ple_heads_per_ngram));
+        }
+        hparams.ple_n_heads  = (uint32_t) ple_n_heads;
         hparams.ple_head_dim = hparams.n_embd_per_layer;
-        GGML_ASSERT(hparams.ple_ngram_size >= 2 && hparams.ple_ngram_size <= LLAMA_MAX_PLE_NGRAM);
-        GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
 
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
@@ -145,8 +155,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
         ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            GGML_ASSERT(head_offsets[h] + head_vocab_sizes[h] <= INT32_MAX &&
-                        "PLE head range does not fit the int32 row index");
+            // check each value before the sum so a wrapped uint64 cannot pass, and reject an empty head
+            // (the hash takes the row modulo the head's vocab size)
+            if (head_vocab_sizes[h] == 0 ||
+                head_offsets[h]     > INT32_MAX ||
+                head_vocab_sizes[h] > INT32_MAX ||
+                head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+            }
             hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
             hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
         }
@@ -159,6 +175,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+        }
+    }
+
+    // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+        if (hparams.is_ple(i) && !hparams.is_recr(i)) {
+            throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
         }
     }
 
@@ -203,6 +226,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         if (ple_w != nullptr) {
+            // the head ranges are what the gather indexes, so they set the minimum row count
+            int64_t ple_rows_min = 0;
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                ple_rows_min = std::max(ple_rows_min, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+            }
+            if (ple_w->tensor->ne[1] < ple_rows_min) {
+                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows_min));
+            }
             const int64_t ple_rows = ple_w->tensor->ne[1];
             // the PLE/engram table is gathered 16 random rows per token and never read densely, so
             // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
