@@ -1016,6 +1016,7 @@ struct vk_device_struct {
     // is set; empty otherwise.
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_COUNT];   // f16 output (MUL_MAT_ID(+MUL)+CPY(f16) fusion)
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b_d16_glu[GGML_TYPE_COUNT];   // the same with the SwiGLU in the store (trellis)
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -2801,6 +2802,7 @@ struct ggml_backend_vk_context {
     bool fused_rms_norm_sig {};     // RMS_NORM+MUL+SIGMOID+MUL+CPY(f16) (the GDN output norm, f16 only)
     bool fused_rms_norm_silu {};    // with fused_rms_norm_sig: the gate is SILU(z), not SIGMOID(z) (qwen35moe)
     bool fused_mmid_swiglu {};      // MUL_MAT_ID+CPY+MUL_MAT_ID+CPY+GLU (gate/up/swiglu in one REG_A dispatch)
+    bool fused_mmid_glu {};         // MUL_MAT_ID+CPY(f16)+SWIGLU (the trellis GLU store)
     bool fused_mul_add {};          // MUL+ADD with a broadcast multiplier (MUL_ADD)
     bool fused_hc_post_gate {};     // SCALE -> SIGMOID -> SCALE folded into DSV4_HC_POST(+NORM) as the post weights (HC_POST_GATE)
     bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue
@@ -5904,6 +5906,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+#ifdef GGML_USE_TRELLIS
+        // the trellis expert GEMMs (Gyro-M TQ2_T): f16 output (MUL_MAT_ID(+MUL)+CPY(f16)) and the SwiGLU store
+        // (MUL_MAT_ID+CPY(f16)+SWIGLU, binding 5 = the other projection)
+#define CREATE_MM2_TRELLIS_D16(TYPE, tstr) \
+        CREATE_MM2(TYPE, pipeline_dequant_mul_mat_mat_id_f16b_d16[TYPE], matmul_id_subgroup_ ## tstr ## _f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id); \
+        CREATE_MM2(TYPE, pipeline_dequant_mul_mat_mat_id_f16b_d16_glu[TYPE], matmul_id_subgroup_ ## tstr ## _f16_d16_glu, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_PTQ1_0, ptq1_0)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQ2_T,  tq2_t)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQK6,   tqk6)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQK7,   tqk7)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQP5,   tqp5)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQP6,   tqp6)
+        CREATE_MM2_TRELLIS_D16(GGML_TYPE_TQP7,   tqp7)
+#undef CREATE_MM2_TRELLIS_D16
+#endif
         // MUL_MAT_ID_SWIGLU: the same aligned medium REG_A == 3 pipeline with SWIGLU set (mul_mm.comp constantID 16)
         if (mmid_rega == 3 && device->mul_mat_id_m[GGML_TYPE_IQ3_XXS]) {
             std::vector<uint32_t> sw = mmid_m_aligned_spec(GGML_TYPE_IQ3_XXS, m_warptile_mmq);
@@ -9638,7 +9655,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
 }
 
-static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool d16 = false) {
+static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool d16 = false, bool glu = false) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_id_pipeline()");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
         return ctx->device->pipeline_matmul_id_f32;
@@ -9719,7 +9736,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     if (d16 && (src1_type != GGML_TYPE_F16 || ctx->device->coopmat2)) {
         return nullptr;
     }
-    vk_matmul_pipeline2& mmp = d16 ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16[src0_type]
+    GGML_ASSERT(!glu || d16);
+    vk_matmul_pipeline2& mmp = glu ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16_glu[src0_type]
+        : d16 ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16[src0_type]
         : (src1_type == GGML_TYPE_F16 && !ctx->device->coopmat2)
         ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0_type]
         : ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
@@ -12215,7 +12234,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 // src0_up (MUL_MAT_ID_SWIGLU): src0 is the gate, src0_up the up weights, fused_dst the GLU destination. Decided before
 // any work is recorded: when the REG_A swiglu pipeline cannot take it, *swiglu_done = false and nothing is dispatched.
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr,
-        const ggml_tensor * src0_up = nullptr, bool * swiglu_done = nullptr) {
+        const ggml_tensor * src0_up = nullptr, bool * swiglu_done = nullptr, const ggml_tensor * glu_other = nullptr, bool glu_acc_gate = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -12342,9 +12361,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], d16);
+        mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], d16, glu_other != nullptr);
         quantize_y = false;
     }
+    // MUL_MAT_ID+CPY(f16)+SWIGLU: out_dst is the GLU (f16, the shape of dst), glu_other the other projection's f16 cast;
+    // ggml_vk_can_fuse_mmid_glu admitted only types with the GLU-store pipeline and no router weight
+    GGML_ASSERT(!glu_other || (d16 && mmp != nullptr && !x_non_contig && !fused_scale && !src0_up &&
+                               glu_other->type == GGML_TYPE_F16 && ggml_is_contiguous(glu_other) && ggml_are_same_shape(glu_other, dst)));
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
@@ -12752,8 +12775,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_x, stride_batch_y, (uint32_t) (out_dst->ne[0] * out_dst->ne[1]),
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n,
         use_row_lists ? 1u : 0u,
-        fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
-        fused_scale ? 1u : 0u,
+        glu_other ? ggml_vk_tensor_subbuffer(ctx, glu_other) : fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
+        glu_other ? (glu_acc_gate ? 1u : 0u) : fused_scale ? 1u : 0u,   // GLU store: 1 = this GEMM is the gate projection
         swiglu_boff, src0_up ? m_disp : 0u,
         use_indirect ? &indirect_args : nullptr,
         use_tile_list ? tile_off : 0u
@@ -13053,6 +13076,15 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
+    if (ctx->fused_mmid_glu) {
+        // MUL_MAT_ID+CPY(f16)+SWIGLU: the GLU is written with silu(gate) * up, this GEMM being the gate or the up operand
+        ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+        ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+        GGML_ASSERT(ctx->num_additional_fused_ops == 2 && cpy->op == GGML_OP_CPY && glu->op == GGML_OP_GLU && !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx));
+        const bool acc_gate = glu->src[0] == cpy;
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, nullptr, glu, nullptr, nullptr, acc_gate ? glu->src[1] : glu->src[0], acc_gate);
+        return;
+    }
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -23149,6 +23181,38 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     return true;
 }
 
+// MUL_MAT_ID + CPY(f16) + SWIGLU (split): the trellis expert gate or up projection with the SwiGLU in its f16 store (the
+// _f16_d16_glu id pipelines); the other projection's f16 cast, computed earlier, is read by the store and the SWIGLU's
+// destination is written, so neither this projection's cast nor the GLU pass touches memory. GGML_VK_MMID_GLU_STORE=0 disables
+// (MUL_MAT_ID_CPY16 and the separate GLU remain).
+static bool ggml_vk_can_fuse_mmid_glu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_MMID_GLU_STORE"); return e == nullptr || atoi(e) != 0; }();
+    if (!on || node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+    if (mmid->op != GGML_OP_MUL_MAT_ID || cpy->op != GGML_OP_CPY || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    const vk_matmul_pipeline2 & pg = ctx->device->pipeline_dequant_mul_mat_mat_id_f16b_d16_glu[mmid->src[0]->type];
+    if ((pg.f16acc->is_empty() && pg.f32acc->is_empty()) || !ggml_vk_can_fuse_mmid_cpy16(ctx, cgraph, node_idx, false)) {
+        return false;
+    }
+    // the cast is used by the SWIGLU only (ggml_vk_interior_cast_uses: plus its src[1] self-reference)
+    if ((glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_vk_interior_cast_uses(cgraph, node_idx + 1, 1)) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr ||
+        (glu->src[0] == cpy) == (glu->src[1] == cpy)) {
+        return false;
+    }
+    const ggml_tensor * other = glu->src[0] == cpy ? glu->src[1] : glu->src[0];
+    return other->type == GGML_TYPE_F16 && ggml_is_contiguous(other) && ggml_are_same_shape(other, mmid) &&
+           glu->type == GGML_TYPE_F16 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu, mmid) && glu->view_src == nullptr;
+}
+
 
 // qwen4exp QSA indexer scorer (build_qsa_top_k), H = 4 indexer heads:
 //   score = MUL_MAT(pooled keys F32 [K, M, ns], q F32 [K, 4*nt, ns])     [M, 4*nt, ns]
@@ -23618,6 +23682,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_rms_norm_sig = false;
         ctx->fused_rms_norm_silu = false;
         ctx->fused_mmid_swiglu = false;
+        ctx->fused_mmid_glu = false;
         ctx->fused_mul_add = false;
         ctx->fused_qsa_score = false;
         ctx->fused_hc_post_gate = false;
@@ -23736,6 +23801,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mmid_glu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mmid_glu = true;
+                fusion_string = "MUL_MAT_ID_CPY16_SWIGLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;    // the CPY's src[1] is its own destination
+                op_srcs_fused_elementwise[2] = true;    // the store reads the other projection at the index it writes
             } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, cgraph, i, true)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_MUL_CPY16";
@@ -24200,6 +24272,9 @@ static void ggml_vk_graph_add_alloc_deps(ggml_backend_vk_context * ctx, const st
         } else if (ggml_vk_can_fuse_mmid_swiglu_merged(ctx, graph, i)) {
             n_fused = (int) mmid_swiglu_merged_pattern.size() - 1;
             what = "MUL_MAT_ID_SWIGLU_MERGED";
+        } else if (ggml_vk_can_fuse_mmid_glu(ctx, graph, i)) {
+            n_fused = 2;
+            what = "MUL_MAT_ID_CPY16_SWIGLU";
         } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, graph, i, true)) {
             n_fused = 2;
             what = "MUL_MAT_ID_MUL_CPY16";
