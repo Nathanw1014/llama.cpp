@@ -215,17 +215,38 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
-            v16s a[TM], b[TN]; const int r = lane & 15;
+            // gfx1151/ROCm 10.1 clang 24: streaming B clears three dense spill names.
+            // Remove this when the full fragment bank is spill-free.
+#if defined(__gfx1151__)
+            constexpr bool STREAM = !TAIL && ((BM == 128 && BN == 128 && WTM == 32 && WTN == 64 && (WTYPE == 0 || WTYPE == 176 || WTYPE == 181)) || (BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2));
+#else
+            constexpr bool STREAM = false;
+#endif
+            if constexpr (STREAM) {
+                v16s a[TM]; const int r = lane & 15;
 #pragma unroll
-            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+                for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    a[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+                for (int j = 0; j < TN; ++j) {
+                    const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const v16s b = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)});
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+                    for (int i = 0; i < TM; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a[i], acc[i][j]);
+                }
+            } else {
+                v16s a[TM], b[TN]; const int r = lane & 15;
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+                for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+            }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
@@ -510,22 +531,52 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
-            v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+            // gfx1151/ROCm 10.1 clang 24: streaming gate/up fragments clears 20 GLU spill names.
+            // Remove this when both fragment banks are spill-free.
+#if defined(__gfx1151__)
+            constexpr bool STREAM = (BM == 128 && BN == 128 && WTM == 64 && WTN == 32) || (BM == 64 && BN == 256 && WTM == 32 && WTN == 64);
+#else
+            constexpr bool STREAM = false;
+#endif
+            if constexpr (STREAM) {
+                v16s b[TN]; const int r = lane & 15;
 #pragma unroll
-            for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
-                au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
-                b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+                for (int i = 0; i < TM; ++i) {
+                    const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    {
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                            accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accg[i][j]); }
+                    }
+                    {
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
 #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    if constexpr (TAIL) { if (!jact[j]) continue; }
-                    accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
-                    accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                            accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accu[i][j]); }
+                    }
                 }
+            } else {
+                v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+#pragma unroll
+                for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                    au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        if constexpr (TAIL) { if (!jact[j]) continue; }
+                        accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
+                        accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                    }
+            }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
