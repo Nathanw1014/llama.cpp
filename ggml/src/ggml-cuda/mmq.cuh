@@ -1079,6 +1079,13 @@ static __global__ void mul_mat_q(
         const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
+#if defined(__HIP_PLATFORM_AMD__)
+    // Q4 activations require Blackwell; the HIP precision selector always uses Q8.
+    if constexpr (type == GGML_TYPE_MXFP4 && J == 32 && prec_src1 == GGML_PREC_Q4) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // defined(__HIP_PLATFORM_AMD__)
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT) {
         NO_DEVICE_CODE;
         return;
