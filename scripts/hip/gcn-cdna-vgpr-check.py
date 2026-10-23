@@ -13,7 +13,7 @@ def parse_log_file(filepath):
         with open(filepath, 'r') as f:
             for line in f:
                 # Match function name lines
-                func_match = re.search(r'remark: ([^:]+):(\d+):\d+: Function Name: (\S+)', line)
+                func_match = re.search(r'(?:remark: )?([^:]+):(\d+):\d+: Function Name: (\S+)', line)
                 if func_match:
                     location = func_match.group(1) + ':' + func_match.group(2)
                     func_name = func_match.group(3)
@@ -26,7 +26,7 @@ def parse_log_file(filepath):
                     continue
 
                 # Match VGPR usage lines (only if we have functions in stack)
-                vgpr_match = re.search(r'remark: ([^:]+):(\d+):\d+:\s+VGPRs: (\d+)', line)
+                vgpr_match = re.search(r'(?:remark: )?([^:]+):(\d+):\d+:\s+VGPRs: (\d+)', line)
                 if vgpr_match:
                     location = vgpr_match.group(1) + ':' + vgpr_match.group(2)
                     # Find the most recent function with matching location
@@ -36,7 +36,7 @@ def parse_log_file(filepath):
                             break
                     continue
 
-                spill_match = re.search(r'remark: ([^:]+):(\d+):\d+:\s+VGPRs Spill: (\d+)', line)
+                spill_match = re.search(r'(?:remark: )?([^:]+):(\d+):\d+:\s+VGPRs Spill: (\d+)', line)
                 if spill_match:
                     location = spill_match.group(1) + ':' + spill_match.group(2)
                     # Find the most recent function with matching location
@@ -87,6 +87,10 @@ def main():
     }
 
     functions = parse_log_file(log_file)
+    if not functions:
+        print("Error: no kernel resource metrics found", file=sys.stderr)  # noqa: NP100
+        sys.exit(1)
+    print(f"Parsed {len(functions)} kernels from resource metrics.")  # noqa: NP100
     found_issues = False
 
     # First print all ignored functions (deduplicated)
