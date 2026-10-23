@@ -898,6 +898,13 @@ static __global__ void flash_attn_tile(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #ifdef FLASH_ATTN_AVAILABLE
+#if defined(__gfx1151__) && !defined(GGML_CUDA_FATTN_VGPR192)
+    // The gfx1151 launcher replaces this copy with the dedicated factory.
+    if constexpr (DKQ == 256 && DV == 256 && ncols1 == 4 && ncols2 == 8 && !use_logit_softcap && !q8_0_KV) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // defined(__gfx1151__) && !defined(GGML_CUDA_FATTN_VGPR192)
 #if defined(GGML_USE_HIP) && !defined(RDNA3_5)
     if constexpr (q8_0_KV) {
         NO_DEVICE_CODE;
