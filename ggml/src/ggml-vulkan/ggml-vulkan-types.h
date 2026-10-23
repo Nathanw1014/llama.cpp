@@ -244,6 +244,9 @@ struct vk_pipeline_struct {
     std::atomic<bool> compiled {};
     // number of registers used, extracted from pipeline executable properties
     uint32_t register_count {};
+    // spilled SGPRs + VGPRs and scratch bytes per subgroup, from the same statistics (RADV reports them)
+    uint32_t spilled_regs {};
+    uint32_t scratch_size {};
 
 #if defined(VK_EXT_shader_64bit_indexing)
     bool is_64b_indexing {};
