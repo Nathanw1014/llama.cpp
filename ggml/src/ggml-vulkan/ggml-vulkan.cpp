@@ -22118,7 +22118,12 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
 
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    // Place tensors at least 256 B apart. RADV's minStorageBufferOffsetAlignment is 4, so ggml-alloc packed compute tensors
+    // at 4 B and every tensor after an odd-sized one started off a cache line (27B: all of them at 8 mod 256; +3.0% pp2048
+    // with 256). GGML_VK_BUFFER_ALIGN=N (a power of two, >= the device minimum) overrides.
+    static const size_t align_env = [] { const char * e = getenv("GGML_VK_BUFFER_ALIGN"); return e ? (size_t) atoll(e) : (size_t) 256; }();
+    const size_t dev = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return align_env > dev && (align_env & (align_env - 1)) == 0 ? align_env : dev;
 }
 
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
