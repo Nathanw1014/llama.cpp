@@ -227,8 +227,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) {
             selected_key_attn = atoi(e) != 0;
         }
-        LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
-            "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");
+        // the probe uses F16 K/V whatever the cache type, but the graph takes the maskless path only for an
+        // f16 K and V cache (qwen4exp_use_block_selection), so say which path a quantized cache gets
+        const bool kv_f16 = type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
+        if (!selected_key_attn) {
+            LLAMA_LOG_INFO("%s: QSA attention: masked top-k (no selected-key kernels on this backend)\n", __func__);
+        } else if (!kv_f16) {
+            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels, masked top-k (K/V cache %s/%s, not f16)\n", __func__,
+                ggml_type_name(type_k), ggml_type_name(type_v));
+        } else {
+            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels (maskless block selection)\n", __func__);
+        }
     }
 }
 
