@@ -19,6 +19,7 @@ layout (binding = 1) writeonly buffer D {int       data_d[];};   // [k, ...]
 layout (binding = 2) readonly buffer CB {int       cell_blk[];}; // QSA: cell->block map [n_kv, n_stream]
 layout (binding = 3) readonly buffer M  {float16_t mask[];};     // QSA: raw f16 kq_mask [n_kv, n_tps, n_stream]
 layout (binding = 4) buffer S           {float     scratch[];};  // QSA: [nrows, n_kv] gathered inputs
+layout (binding = 5) readonly buffer R  {int       mask_rows[];}; // QSA, mask_rows != 0: the mask row of query t
 
 layout (push_constant) uniform parameter {
     uint ncols;
@@ -30,6 +31,7 @@ layout (push_constant) uniform parameter {
     uint a_st_t;   // QSA only: block-score strides over (token, block, stream), in elements
     uint a_st_b;
     uint a_st_s;
+    uint mask_rows; // QSA only
 } p;
 
 #define RADIX_BITS 8
@@ -132,7 +134,8 @@ float gather(uint row, uint i) {
     const uint s = row / p.n_tps;
     const uint block = uint(cell_blk[s * p.ncols + i]);
     const float a = data_a[s * p.a_st_s + block * p.a_st_b + t * p.a_st_t];
-    const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+    const uint mrow = p.mask_rows != 0 ? uint(mask_rows[t]) : s * p.n_tps + t;
+    const float m = float(mask[mrow * p.ncols + i]);
     return a + m;
 }
 

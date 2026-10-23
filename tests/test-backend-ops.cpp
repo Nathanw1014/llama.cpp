@@ -7226,6 +7226,7 @@ struct test_topk_qsa : public test_case {
     const int64_t n_tps;
     const int64_t n_stream;
     const int     width;
+    const int64_t mask_rows; // > 0: a row tile, the mask holds mask_rows rows and the tile gathers n_tps of them
     ggml_tensor * out {};
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7234,11 +7235,12 @@ struct test_topk_qsa : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width);
+        return VARS_TO_STR6(n_blocks, n_kv, n_tps, n_stream, width, mask_rows);
     }
 
-    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500,
+            int64_t mask_rows = 0)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), mask_rows(mask_rows) {}
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -7248,13 +7250,20 @@ struct test_topk_qsa : public test_case {
         ggml_set_name(score, "score");
         ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
         ggml_set_name(cell_blk, "cell_blk");
-        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tps, n_stream);
+        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, mask_rows > 0 ? mask_rows : n_tps, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
+        ggml_tensor * rows = nullptr;
+        if (mask_rows > 0) {
+            GGML_ASSERT(n_stream == 1 && mask_rows >= n_tps);
+            rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tps);
+            // a leaf, so no node lands inside the chain (build_qsa_top_k expands its row list ahead of it)
+            ggml_set_name(rows, "rows");
+        }
 
         ggml_tensor * a = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
         ggml_tensor * e = ggml_get_rows(ctx, a, cell_blk);
         e = ggml_cont(ctx, ggml_permute(ctx, e, 1, 0, 2, 3));
-        ggml_tensor * m = ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
+        ggml_tensor * m = rows ? ggml_get_rows(ctx, kq_mask, rows) : ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
         e = ggml_add(ctx, e, ggml_reshape_3d(ctx, m, n_kv, n_tps, n_stream));
         out = ggml_top_k(ctx, e, width);
         ggml_set_name(out, "out");
@@ -7269,15 +7278,21 @@ struct test_topk_qsa : public test_case {
             if (t->op != GGML_OP_NONE) {
                 continue;
             }
-            if (t->type == GGML_TYPE_I32) {
+            if (t->type == GGML_TYPE_I32 && strcmp(t->name, "rows") == 0) {
+                // a tile from the middle of the mask: rows mask_rows - n_tps - 1 .. mask_rows - 2
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < n_tps; i++) { data[i] = (int32_t) (mask_rows - n_tps - 1 + i); }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (auto & v : data) { v = rand() % n_blocks; }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else if (t->type == GGML_TYPE_F16) {
+                // a row tile gets a different ramp per row (a rotation), so reading the wrong row changes the set
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     for (int64_t i = 0; i < n_kv; i++) {
-                        data[r * n_kv + i] = ggml_fp32_to_fp16((float) i);
+                        data[r * n_kv + i] = ggml_fp32_to_fp16((float) (mask_rows > 0 ? (i + 131*r) % n_kv : i));
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
@@ -11478,6 +11493,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    // row tiles gather their mask rows (GET_ROWS form)
+    test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500, 7));
+    test_cases.emplace_back(new test_topk_qsa(512,  2048, 64, 1, 2000, 200));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
