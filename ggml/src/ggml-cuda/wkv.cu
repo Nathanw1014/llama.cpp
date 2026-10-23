@@ -2,6 +2,7 @@
 #include "wkv.cuh"
 
 template <int block_size>
+__launch_bounds__(block_size)
 static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const int H, const float * k, const float * v, const float * r, const float * tf, const float * td, const float * s, float * dst) {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
