@@ -39,7 +39,15 @@ static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const
             const float4& r = (float4&)(_r[j]);
             const float4& tf = (float4&)(_tf[j]);
             const float4& td = (float4&)(_td[j]);
+            // gfx1151/ROCm 10.1 clang 24: native state vectors remove 10 saves/44 scratch bytes per lane.
+            // Remove this when float4 state updates compile without copies or spills.
+#if defined(__gfx1151__)
+            typedef float v4f __attribute__((ext_vector_type(4)));
+            using state4 = typename std::conditional<block_size == 128, v4f, float4>::type;
+            state4& s = (state4&)(state[j]);
+#else
             float4& s = (float4&)(state[j]);
+#endif
             float4 kv;
 
             kv.x = k.x * _v;
