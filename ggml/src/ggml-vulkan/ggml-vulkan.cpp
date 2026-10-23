@@ -24684,6 +24684,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_sig = false;
                 ctx->fused_rms_norm_silu = false;
                 ctx->fused_mmid_swiglu = false;
+                ctx->fused_mmid_glu = false;
                 ctx->fused_mul_add = false;
                 ctx->fused_qsa_score = false;
                 ctx->fused_hc_post_gate = false;
