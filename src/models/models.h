@@ -2409,7 +2409,9 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,       // LLAMA_FN_LAST_ATTN_TRIM: queries for rows [q_first, n_tokens) only;
+                    ggml_tensor ** tile_out_ids = nullptr);  // then *tile_out_ids = the output rows relative to q_first
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -2440,13 +2442,17 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<int64_t, ggml_tensor *> hc_comb_by_nt;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, maskless selection only): the selection for query rows [q_first, n_tokens)
+        // only, with q_pos their positions; the indexer keys of every row are stored as before
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor * q_pos = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
