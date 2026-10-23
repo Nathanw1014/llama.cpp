@@ -1831,6 +1831,13 @@ static __global__ void flash_attn_ext_f16(
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
+#if defined(__gfx1151__)
+    // The WMMA selector excludes D192 and requires more than 16 columns for D256.
+    if constexpr (DKQ == 192 || (DKQ == 256 && ncols1*ncols2 == 16)) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // defined(__gfx1151__)
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
         NO_DEVICE_CODE;
         return;
