@@ -7723,8 +7723,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // GGML_CUDA_OVL: reorder the concurrency regions first, so every later pass (marks, fusions) sees the final order
     ggml_cuda_ovl_plan(cuda_ctx, cgraph, params);
 
-    {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store
-        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+    {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store. Only the fused
+        // kernels write those copies, so nothing is marked with GGML_CUDA_DISABLE_FUSION (the unfused readers need F32).
+        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && !ggml_cuda_fusion_disabled()) {
             const int ws = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
             // normalized stream xn: read only by MMB GEMMs (which take the BF16 copy) and by a stream mix that the fused
