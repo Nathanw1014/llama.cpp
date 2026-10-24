@@ -4391,7 +4391,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-vocab-dynamic"}, "N",
-        string_format("smaller draft LM head: score only the lowest token ids plus the N others that a low-rank projection ranks best for each draft token (0 = full LM head, default: %d)", params.speculative.draft.vocab_dynamic),
+        string_format("smaller draft LM head (off by default): score only the lowest token ids plus the N others that a low-rank projection ranks best for each draft token (0 = full LM head, default: %d)", params.speculative.draft.vocab_dynamic),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
