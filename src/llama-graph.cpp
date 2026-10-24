@@ -1694,7 +1694,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             const int64_t n_vocab   = w->ne[1];
             const int64_t n_base    = vsub->n_base;
             const int64_t n_dyn     = vsub->n_dynamic;
-            const int64_t n_outputs = cur->ne[1];
+            const int64_t n_outputs = 1;
 
             // same precision as the full head, the policy is keyed on w and not on the views of it
             const auto set_prec = [&](ggml_tensor * t) {
@@ -1710,32 +1710,22 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             set_prec(logits);
             logits = ggml_concat(ctx0, logits, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab - n_base, n_outputs), -INFINITY), 0);
 
-            if (n_outputs > 0) {
-                // score the other ids in vocab order so top_k returns token ids, end-of-generation ids always win
-                ggml_tensor * scores = ggml_mul_mat(ctx0, head.scorer, ggml_mul_mat(ctx0, head.basis, cur));
-                scores = ggml_concat(ctx0, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_base, n_outputs), -INFINITY), scores, 0);
-                if (vsub->eog != nullptr) {
-                    const int64_t n_eog = vsub->eog->ne[0];
-                    scores = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_vocab, n_outputs),
-                            ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_eog, n_outputs), INFINITY),
-                            ggml_reshape_3d(ctx0, vsub->eog, n_eog, 1, 1));
-                }
-
-                // one output per op: CUDA's multi-row top_k is slow and its multi-column MUL_MAT_ID reads 2 rows per expert
-                ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab);
-                ggml_tensor * ids    = nullptr;
-                ggml_tensor * picked = nullptr;
-                for (int64_t i = 0; i < n_outputs; ++i) {
-                    ggml_tensor * ids_i = ggml_top_k(ctx0, ggml_view_1d(ctx0, scores, n_vocab, i*n_vocab*ggml_element_size(scores)), n_dyn);
-                    ggml_tensor * cur_i = ggml_view_3d(ctx0, cur, n_embd, 1, 1, cur->nb[1], cur->nb[1], i*cur->nb[1]);
-                    ggml_tensor * p_i   = ggml_mul_mat_id(ctx0, as, cur_i, ggml_reshape_2d(ctx0, ids_i, n_dyn, 1));
-                    set_prec(p_i);
-                    ids    = ids    == nullptr ? ids_i : ggml_concat(ctx0, ids,    ids_i, 1);
-                    picked = picked == nullptr ? p_i   : ggml_concat(ctx0, picked, p_i,   2);
-                }
-
-                logits = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_vocab, n_outputs), picked, ggml_reshape_2d(ctx0, ids, n_dyn, n_outputs));
+            // score the other ids in vocab order so top_k returns token ids, end-of-generation ids always win
+            ggml_tensor * scores = ggml_mul_mat(ctx0, head.scorer, ggml_mul_mat(ctx0, head.basis, cur));
+            scores = ggml_concat(ctx0, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_base, n_outputs), -INFINITY), scores, 0);
+            if (vsub->eog != nullptr) {
+                const int64_t n_eog = vsub->eog->ne[0];
+                scores = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_vocab, n_outputs),
+                        ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_eog, n_outputs), INFINITY),
+                        ggml_reshape_3d(ctx0, vsub->eog, n_eog, 1, 1));
             }
+
+            ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab);
+            ggml_tensor * ids    = ggml_top_k(ctx0, ggml_view_1d(ctx0, scores, n_vocab, 0), n_dyn);
+            ggml_tensor * cur_i  = ggml_view_3d(ctx0, cur, n_embd, 1, 1, cur->nb[1], cur->nb[1], 0);
+            ggml_tensor * picked = ggml_mul_mat_id(ctx0, as, cur_i, ggml_reshape_2d(ctx0, ids, n_dyn, 1));
+            set_prec(picked);
+            logits = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_vocab, n_outputs), picked, ggml_reshape_2d(ctx0, ids, n_dyn, n_outputs));
 
             logits = ggml_reshape_2d(ctx0, logits, n_vocab, n_outputs);
             if (w_s) {
