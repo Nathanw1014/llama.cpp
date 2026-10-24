@@ -485,10 +485,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h = inp->h;
     res->add_input(std::move(inp));
 
-    // With no requested output, only the K/V and indexer cache writes survive catch-up.
-    // gfx1151 HIP, 2026-10-22: b4096/ub512 catch-up at 60127 tokens aborts in k_set_rows with this pruning; full-graph catch-up matches upstream logits and state.
-    // Cache-only is qualified at b/ub4096. Keep narrow or split catch-up on the full graph until it passes the same comparison.
-    const bool cache_only = cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
+    // gfx1151 HIP, 2026-10-22: cache-only matched upstream logits and state at b/ub4096 with one sequence.
+    // Narrow, split and multi-sequence catch-up stay on the full graph; pruned b4096/ub512 aborts in k_set_rows.
+    // Widen only after the same 60127-token logits/state comparison passes.
+    const bool cache_only = cparams.n_seq_max == 1 && cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
             (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
             cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.nextn_layer_offset == 0;
 
