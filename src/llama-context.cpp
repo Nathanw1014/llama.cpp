@@ -1271,6 +1271,10 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 }
 
 bool llama_context::nextn_resident_enable(llama_context & draft) {
+    const char * resident = getenv("LLAMA_MTP_RESIDENT");
+    if (resident && strcmp(resident, "0") == 0) {
+        return false;
+    }
     if (model.arch != LLM_ARCH_QWEN4EXP || draft.model.arch != LLM_ARCH_QWEN4EXP ||
             cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || draft.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
             draft.model.hparams.n_layer_nextn != 1 || model.devices.size() != 1 || draft.model.devices.size() != 1 ||
