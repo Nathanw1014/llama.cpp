@@ -1274,7 +1274,7 @@ bool llama_context::nextn_resident_enable(llama_context & draft) {
     if (model.arch != LLM_ARCH_QWEN4EXP || draft.model.arch != LLM_ARCH_QWEN4EXP ||
             cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || draft.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
             draft.model.hparams.n_layer_nextn != 1 || model.devices.size() != 1 || draft.model.devices.size() != 1 ||
-            model.n_gpu_layers() <= (int) model.hparams.n_layer_all || draft.model.n_gpu_layers() <= (int) draft.model.hparams.n_layer_all ||
+            model.n_gpu_layers() <= model.hparams.n_layer_all || draft.model.n_gpu_layers() <= draft.model.hparams.n_layer_all ||
             cparams.n_seq_max != 1 || draft.cparams.n_seq_max != 1 ||
             !cparams.embeddings_nextn || cparams.embeddings_nextn_masked || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
         return false;
