@@ -128,7 +128,7 @@ class TestVgprCheck(unittest.TestCase):
     def test_empty_budgets_coverage_shortfall_fails(self):
         self.baseline['kernels'] = {}
         self.kernels['_Z6kernelv']['spill_stores'] = 0
-        self.baseline['translation_units']['sample'] = 2
+        self.baseline['translation_units'] = {'sample': 2}
         self.assertTrue(any('coverage 1 < 2' in e for e in self.check()))
 
     def test_empty_budgets_empty_input_fails(self):
@@ -141,7 +141,7 @@ class TestVgprCheck(unittest.TestCase):
     def test_empty_budgets_total_kernel_shortfall_fails(self):
         self.baseline['kernels'] = {}
         self.kernels['_Z6kernelv']['spill_stores'] = 0
-        self.baseline['translation_units']['other'] = 1
+        self.baseline['translation_units'] = {'sample': 1, 'other': 1}
         self.units['other'] = 1
         self.baseline['minimum_kernel_count'] = 2
         self.assertTrue(any('total kernel coverage 1 < 2' in e for e in self.check()))
