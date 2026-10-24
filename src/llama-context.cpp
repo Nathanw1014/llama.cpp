@@ -1285,6 +1285,7 @@ bool llama_context::nextn_resident_enable(llama_context & draft) {
     }
     ggml_backend_t producer = nullptr;
     ggml_backend_t consumer = nullptr;
+    // Only ROCm passed model-level verification; widen after logits, state and rollback match byte for byte on another backend.
     for (auto & backend : backends) {
         if (strncmp(ggml_backend_name(backend.get()), "ROCm", 4) == 0) {
             producer = backend.get();
