@@ -767,8 +767,8 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
-// GGML_CUDA_ATTN_GATE_V4 (default 1): the gated attention output sigmoid(gate) * attn in float4 lanes with 32-bit
-// indexing (the scalar kernel spends a 64-bit division per element); same expression per element, so bit-identical.
+// The gated attention output sigmoid(gate) * attn in float4 lanes with 32-bit indexing (the scalar kernel, kept for
+// unaligned or oversized buffers, spends a 64-bit division per element); same expression per element, so bit-identical.
 // With store_f32 == false only the 16-bit copy for the MMB GEMM is written (the F32 output has no other reader).
 template <bool F32>
 static __global__ void cont_sigmoid_mul_v4_kernel(const float * __restrict__ gate, const float * __restrict__ x, float * __restrict__ dst,
@@ -797,11 +797,6 @@ static __global__ void cont_sigmoid_mul_v4_kernel(const float * __restrict__ gat
     }
 }
 
-bool ggml_cuda_attn_gate_v4() {
-    static const bool v = getenv("GGML_CUDA_ATTN_GATE_V4") ? atoi(getenv("GGML_CUDA_ATTN_GATE_V4")) != 0 : true;
-    return v;
-}
-
 void ggml_cuda_op_cont_sigmoid_mul(
         ggml_backend_cuda_context & ctx, ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16,
         bool dst16_f16, bool store_f32) {
@@ -820,7 +815,7 @@ void ggml_cuda_op_cont_sigmoid_mul(
     if (!store_f32) {
         GGML_ASSERT(dst16 != nullptr);
     }
-    if (ggml_cuda_attn_gate_v4() && n % 4 == 0 && gs % 4 == 0 && k / 4 < INT32_MAX && (k / n) * gs < INT32_MAX &&
+    if (n % 4 == 0 && gs % 4 == 0 && k / 4 < INT32_MAX && (k / n) * gs < INT32_MAX &&
             ((uintptr_t) gate->data % 16) == 0 && ((uintptr_t) other->data % 16) == 0 && ((uintptr_t) mul_node->data % 16) == 0 &&
             ((uintptr_t) dst16 % 8) == 0) {
         const int k4 = (int) (k / 4);

@@ -236,8 +236,8 @@ struct qsa3_layout {
 };
 
 // WPE > 0 asks the compiler for that many waves per SIMD (fewer VGPRs per wave): more CTAs in flight to cover the
-// two barriers per 16 keys. 8 (192 VGPRs, no spill) is 4.5% faster than 7 on gfx1151 pp4096; GGML_QSA6_WPE=0 restores
-// the plain kernel. Same arithmetic either way.
+// two barriers per 16 keys. 8 (192 VGPRs, no spill) is 4.5% faster than 7 on gfx1151 pp4096 and is what the launches
+// use. Same arithmetic either way.
 template<bool DIRECT, int WPE = 0, bool DIRECT_V = DIRECT> __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
 void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
@@ -509,7 +509,7 @@ void qsa3_attn_kernel(
             const int row = 16*i + rr, qi = row / 12, h = row - 12*qi;
             const int query = QSA3_G * g + qi;
             if (query < s.n_q) {
-                // gated output (GGML_CUDA_FA_GATE): sigmoid(gate) * O with op_sigmoid's expression, as cont_sigmoid_mul_v4
+                // gated output: sigmoid(gate) * O with op_sigmoid's expression, as cont_sigmoid_mul_v4
                 const int hq = kvh * s.gqa + h;
                 float4 v = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
                 if (gate) {
@@ -625,17 +625,16 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                        (int) q->ne[2], gate ? (int) (gate->nb[1] / sizeof(float)) : 0};
     const float * gp = gate ? (const float *) gate->data : nullptr;
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
-    static const bool qsa3_wpe8 = !getenv("GGML_QSA6_WPE") || atoi(getenv("GGML_QSA6_WPE")) != 0;
     if (qsa_kdirect && !qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<true, 8, false> : qsa3_attn_kernel<true, 0, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else if (qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<true, 8> : qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else {
-        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<false, 8> : qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<false, 8>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     }

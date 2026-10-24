@@ -951,15 +951,10 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
 }
 
 
-// ===== GGML_CUDA_NORM_ROPE_MULTI =====
+// ===== fused RMS_NORM -> MUL -> ROPE (multi) =====
 // The per-head q/k norm of qwen4exp attention (RMS_NORM -> MUL(w), rms_rows_f32 math: one wave per row, the same
 // reduction tree) followed by its multi-section RoPE (rope_multi math), in one pass: the normalized row stays in
 // registers. NeoX pairing (p, p + n_dims/2) with n_dims % 64 == 0 keeps both elements of a pair in the same lane.
-bool ggml_cuda_norm_rope_multi_enabled() {
-    static const bool v = getenv("GGML_CUDA_NORM_ROPE_MULTI") ? atoi(getenv("GGML_CUDA_NORM_ROPE_MULTI")) != 0 : true;
-    return v;
-}
-
 static __device__ __forceinline__ float nrm_xor_tree(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor_sync(0xffffffff, v, off, 32); }
@@ -1058,7 +1053,6 @@ static __global__ void __launch_bounds__(256) rms_norm_mul_rope_multi_rows(const
 }
 
 bool ggml_cuda_norm_rope_multi_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope) {
-    if (!ggml_cuda_norm_rope_multi_enabled()) return false;
     if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE || rope->src[0] != mul) return false;
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);

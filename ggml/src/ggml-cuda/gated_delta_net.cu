@@ -1016,7 +1016,7 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
 // ---------------------------------------------------------------------------------------------
 // GDN chunked prefill v2 (verified against an fp64 reference):
 // prep2 (q/k only) + scan2 VROW (v conv + SiLU inside the scan, no Vh round trip). Used when the conv, q/k L2 norm
-// and gated output norm (bf16 out only) are all fused; GGML_GDN_V2=0 restores prep + scan.
+// and gated output norm (bf16 out only) are all fused; otherwise the chunked path runs prep + scan.
 #if defined(GDNC_ENABLED)
 #define S2_BAR() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
 
@@ -1216,7 +1216,7 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
     static_assert(CL == 32, "scan2: CL 32");
     static_assert(!(ZBF16 && NPF > 0), "scan2: the MALL prefetcher reads z as XT");
     const XT * __restrict__ on_z = (const XT *) on_z_;
-    constexpr int ZB = ZBF16 ? 2 : (int) sizeof(XT);   // bytes per z value (ZBF16: BF16 z written by the z GEMM, GGML_GDN_Z16)
+    constexpr int ZB = ZBF16 ? 2 : (int) sizeof(XT);   // bytes per z value (ZBF16: BF16 z written by the z GEMM, ggml_cuda_gdn_z16_ok)
     constexpr int NT  = CL / 16;
     constexpr int SQ  = 136;
     constexpr int ST  = CL + 8;
@@ -1349,7 +1349,6 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
         }
     };
     auto prefetch_z = [&](const int ch) {
-        if constexpr ((MODE & 512) != 0) return;   // late gate: sigmoid(z) is applied by gdn_gate_kernel after the scan
         const int t = (MODE & 256) ? nr : min(ch * CL + nr, n_tokens - 1);
         const int zb = (t * z_ts + h * z_hs + n16 * 16) * ZB;
         typedef unsigned v4u __attribute__((ext_vector_type(4)));
@@ -1500,10 +1499,7 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
             ss += gdn_dpp_row_xmask<1>(ss); ss += gdn_dpp_row_xmask<2>(ss); ss += gdn_dpp_row_xmask<4>(ss);
             const float sc = rsqrtf(ss * (1.0f / 128.0f) + on_eps);
             float zz[16];
-            if constexpr ((MODE & 512) != 0) {
-#pragma unroll
-                for (int c = 0; c < 16; ++c) zz[c] = 0.0f;
-            } else if constexpr (ZBF16) {
+            if constexpr (ZBF16) {
                 uint32_t zw[8];
                 __builtin_memcpy(zw, pz, 32);
 #pragma unroll
@@ -1522,14 +1518,9 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
             uint32_t pk2[8];
 #pragma unroll
             for (int c = 0; c < 16; c += 2) {
-                if constexpr ((MODE & 512) != 0) {   // un-gated y = rmsnorm(o) * w as F16 (the gate kernel converts in place)
-                    const float v0 = sc * o[c] * wn[c], v1 = sc * o[c + 1] * wn[c + 1];
-                    pk2[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, true) | ((uint32_t) ggml_cuda_f32_to_act16(v1, true) << 16);
-                } else {
-                    const float v0 = (sc * o[c] * wn[c]) * s2_sigm(zz[c]);
-                    const float v1 = (sc * o[c + 1] * wn[c + 1]) * s2_sigm(zz[c + 1]);
-                    pk2[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, OUT_F16) | ((uint32_t) ggml_cuda_f32_to_act16(v1, OUT_F16) << 16);
-                }
+                const float v0 = (sc * o[c] * wn[c]) * s2_sigm(zz[c]);
+                const float v1 = (sc * o[c + 1] * wn[c + 1]) * s2_sigm(zz[c + 1]);
+                pk2[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, OUT_F16) | ((uint32_t) ggml_cuda_f32_to_act16(v1, OUT_F16) << 16);
             }
             // unconditional buffer store: rows t >= n_tokens fall outside num_records and are dropped by the hardware
             // (a guard branch makes the compiler sink the z prefetch into it and drain every load with vmcnt(0))
@@ -1554,38 +1545,6 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
 #endif
 }
 
-// GGML_GDN_LATEJOIN: out16 (F16 y = rmsnorm(o) * w from scan2 MODE 512) *= sigmoid(z) in place, 8 values per thread
-template <bool OUT_F16, bool ZBF16>
-__global__ void __launch_bounds__(256)
-gdn_gate_kernel(uint16_t * __restrict__ out16, const void * __restrict__ z, const int64_t n8) {
-    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
-    if (i >= n8) return;
-    const uint4 y = ((const uint4 *) out16)[i];
-    float zz[8];
-    if constexpr (ZBF16) {
-        const uint4 zb = ((const uint4 *) z)[i];
-        const uint32_t zw[4] = { zb.x, zb.y, zb.z, zb.w };
-#pragma unroll
-        for (int c = 0; c < 4; ++c) { zz[2 * c] = __uint_as_float(zw[c] << 16); zz[2 * c + 1] = __uint_as_float(zw[c] & 0xffff0000u); }
-    } else {
-        const float4 z0 = ((const float4 *) z)[2 * i], z1 = ((const float4 *) z)[2 * i + 1];
-        zz[0] = z0.x; zz[1] = z0.y; zz[2] = z0.z; zz[3] = z0.w; zz[4] = z1.x; zz[5] = z1.y; zz[6] = z1.z; zz[7] = z1.w;
-    }
-    _Float16 yh[8];
-    __builtin_memcpy(yh, &y, 16);
-    uint32_t o[4];
-#pragma unroll
-    for (int c = 0; c < 8; c += 2) {
-        const float v0 = (float) yh[c] / (1.0f + __expf(-zz[c]));
-        const float v1 = (float) yh[c + 1] / (1.0f + __expf(-zz[c + 1]));
-        o[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, OUT_F16) | ((uint32_t) ggml_cuda_f32_to_act16(v1, OUT_F16) << 16);
-    }
-    ((uint4 *) out16)[i] = make_uint4(o[0], o[1], o[2], o[3]);
-}
-
-#ifndef GDN_V2_DEFAULT
-#define GDN_V2_DEFAULT 1   // pp2048 1683 -> 1702 t/s; logits KLD vs the v1 chunk path at the KV-bf16 noise level
-#endif
 static bool gdn_chunk_enabled() {
     static const int v = getenv("GGML_GDN_CHUNK") ? atoi(getenv("GGML_GDN_CHUNK")) : 1;
     return v != 0;
@@ -1658,7 +1617,7 @@ struct gdn_out_norm_ovr {
     uint16_t *    out16;
     float         eps;
     bool          out16_f16;
-    bool          z_bf16;     // z holds BF16 (its GEMM skipped the F32 store, GGML_GDN_Z16): only the v2 scan reads that
+    bool          z_bf16;     // z holds BF16 (its GEMM skipped the F32 store, ggml_cuda_gdn_z16_ok): only the v2 scan reads that
 };
 static std::unordered_map<const ggml_tensor *, gdn_out_norm_ovr> g_gdn_on;
 
@@ -1668,19 +1627,13 @@ void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const 
     g_gdn_on[gdn] = { w, z, out, out16, eps, out16_f16, z_bf16 };
 }
 
-static bool gdn_v2_enabled() {
-    static const bool v = getenv("GGML_GDN_V2") ? atoi(getenv("GGML_GDN_V2")) != 0 : GDN_V2_DEFAULT;
-    return v;
-}
-
-// GGML_GDN_Z16 (default 1): the z GEMM of a GDN layer that takes the v2 chunked path stores BF16 only (no F32 z), read by
-// the scan2 output-norm epilogue. Graph-time predicate (shapes / env only); the op aborts if the v2 scan is not taken after all.
+// the z GEMM of a GDN layer that takes the v2 chunked path stores BF16 only (no F32 z), read by the scan2 output-norm
+// epilogue. Graph-time predicate (shapes / env only); the op aborts if the v2 scan is not taken after all.
 bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
 #if defined(GGML_USE_HIP)
-    static const bool env = getenv("GGML_GDN_Z16") ? atoi(getenv("GGML_GDN_Z16")) != 0 : true;
     static const bool nofuse = getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") != nullptr ||
         (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
-    if (!env || nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET || !gdn_v2_enabled() || !gdn_chunk_enabled()) return false;
+    if (nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET || !gdn_chunk_enabled()) return false;
     const ggml_tensor * v = gdn->src[2];
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
@@ -1955,11 +1908,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
         if (eligible) {
             const gdnc_in in0 = { q_d, k_d, v_d, sq1, sq2, sv1, sv2, cv_ovr.x, cv_ovr.st, cv_ovr.cw, cv_ovr.C, cv_ovr.qc, cv_ovr.kc, cv_ovr.vc };
-            const bool gdn_v2 = gdn_v2_enabled();
-            const bool use_v2 = gdn_v2 && cv_ovr.x && qk_ovr.q && on_ovr.z && on_ovr.out16 && !on_ovr.out && sv1 == 128 &&
+            // pp2048 1683 -> 1702 t/s over prep + scan; logits KLD vs the v1 chunk path at the KV-bf16 noise level
+            const bool use_v2 = cv_ovr.x && qk_ovr.q && on_ovr.z && on_ovr.out16 && !on_ovr.out && sv1 == 128 &&
                 ((uintptr_t) cv_ovr.x) % 16 == 0 && (cv_ovr.C % 4) == 0 && (cv_ovr.vc % 4) == 0 &&
                 (int64_t) n_tokens * cv_ovr.C * 4 < INT32_MAX && (int64_t) n_tokens * H * 128 * 2 < INT32_MAX;
-            // z stored BF16-only (GGML_GDN_Z16, a graph-time choice) is read natively only by the v2 epilogue: when the
+            // z stored BF16-only (ggml_cuda_gdn_z16_ok, a graph-time choice) is read natively only by the v2 epilogue: when the
             // run-time checks above still refuse v2, the chunked scan below reads an F32 copy instead
             const bool z_widen = on_ovr.z_bf16 && !use_v2;
             auto run = [&](auto CLc, const int64_t is) {
@@ -1988,23 +1941,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                     gdn_prep2_kernel<CL, float><<<dim3(neqk1, nch), 256, 0, stream>>>(in, cx, gs, bs,
                         Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), (int) H, (int) neqk1, (int) n_tokens, nch,
                         sb1, sb2, scale, qk_eps, qk_mul);
-                    // GGML_GDN_LATEJOIN=1: the scan runs without z, concurrently with the z GEMM (GGML_CUDA_OVL side stream);
-                    // sigmoid(z) is applied afterwards by gdn_gate_kernel
-                    static const bool late = getenv("GGML_GDN_LATEJOIN") ? atoi(getenv("GGML_GDN_LATEJOIN")) != 0 : false;
-                    if (late) {
-                        gdn_scan2_kernel<CL, 512, float, 0, 3, true, true><<<dim3(H), 256, 0, stream>>>(nullptr, nullptr, Qh.get(), Kh.get(),
-                            cx, cst, cv_ovr.cw, (int) cv_ovr.C, (int) cv_ovr.vc, s0, so,
-                            Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
-                            on_ovr.w, zs, o16s, on_ovr.eps, 128, (int) cv_ovr.vc, (int) (H * 128), 128);
-                        ggml_cuda_ovl_join(ctx);
-                        const int64_t n8 = (int64_t) n_tokens * H * 128 / 8;
-                        auto gk = on_ovr.z_bf16 ? (on_ovr.out16_f16 ? gdn_gate_kernel<true, true> : gdn_gate_kernel<false, true>)
-                                                : (on_ovr.out16_f16 ? gdn_gate_kernel<true, false> : gdn_gate_kernel<false, false>);
-                        gk<<<(n8 + 255) / 256, 256, 0, stream>>>(o16s, zs, n8);
-                        CUDA_CHECK(cudaGetLastError());
-                        return;
-                    }
-                    ggml_cuda_ovl_join(ctx);   // GGML_CUDA_OVL: z (read by the output-norm epilogue) ran on the side stream
+                    ggml_cuda_ovl_join(ctx);   // z (read by the output-norm epilogue) ran on the side stream
                     // MMB_DENSE_F16: the F16 out16 copy is a template flag (no runtime select in the epilogue)
                     (on_ovr.z_bf16 ? (on_ovr.out16_f16 ? gdn_scan2_kernel<CL, 0, float, 0, 3, true, true, true> : gdn_scan2_kernel<CL, 0, float, 0, 3, true, false, true>)
                                    : (on_ovr.out16_f16 ? gdn_scan2_kernel<CL, 0, float, 0, 3, true, true> : gdn_scan2_kernel<CL, 0, float, 0, 3, true, false>))

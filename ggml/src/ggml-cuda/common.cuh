@@ -445,12 +445,6 @@ static __device__ void no_device_code(
 #define NO_DEVICE_CODE //GGML_ABORT("NO_DEVICE_CODE not valid in host code.")
 #endif // __CUDA_ARCH__
 
-// MMB_SHAPE_LOG=1|2 (debug): log the kernel shapes the mmb / hyperconn paths pick (2: every call)
-static inline int ggml_cuda_mmb_shape_log() {
-    static const int v = getenv("MMB_SHAPE_LOG") ? std::max(atoi(getenv("MMB_SHAPE_LOG")), 1) : 0;
-    return v;
-}
-
 // The compiler is always able to unroll loops if they contain continue expressions.
 // In such cases loop unrolling can still be achieved via recursion:
 template <int n>
@@ -1566,11 +1560,11 @@ struct ggml_cuda_stream_context {
 
 struct ggml_cuda_mmb_context;
 
-// GGML_CUDA_OVL: intra-graph concurrency. graph_optimize reorders a region of the graph into [S nodes][M nodes] (no data
+// Intra-graph concurrency (RDNA3.5): graph_optimize reorders a region of the graph into [S nodes][M nodes] (no data
 // dependency between the two sets) and records it; graph_compute runs S on a side stream while M runs on the main
 // stream and joins before `end` (the first node that may read S). Every tensor touched in the region is kept allocated
 // through `end` (add_alloc_dep), so no buffer is reused while both streams run.
-#define GGML_CUDA_OVL_SIDE 1
+#define GGML_CUDA_SIDE_STREAM 1
 struct ggml_cuda_ovl_region {
     const ggml_tensor * s_first = nullptr;   // first S node (side stream)
     const ggml_tensor * m_first = nullptr;   // first M node (main stream); S occupies [s_first, m_first)
@@ -1591,7 +1585,7 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // GGML_CUDA_OVL state (see ggml_cuda_ovl_region)
+    // intra-graph concurrency state (see ggml_cuda_ovl_region)
     std::unordered_map<const ggml_tensor *, ggml_cuda_ovl_region> ovl_regions;   // keyed by s_first
     bool     ovl_open      = false;   // side stream forked and not yet joined
     int      ovl_side      = 1;       // stream index of the open side stream
@@ -1715,7 +1709,7 @@ struct ggml_backend_cuda_context {
     }
 };
 
-// join the open GGML_CUDA_OVL side stream into the main stream (no-op when none is open)
+// join the open intra-graph concurrency side stream into the main stream (no-op when none is open)
 static inline void ggml_cuda_ovl_join(ggml_backend_cuda_context & ctx) {
     if (!ctx.ovl_open) {
         return;

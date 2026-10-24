@@ -306,7 +306,7 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
 #endif
 }
 
-// ===== Tile-repacked Q8_0 dense GEMM (MMB_DENSE_R2; ported from team/alt-dense-isa k7/k8, bf16 path) =====
+// ===== Tile-repacked Q8_0 dense GEMM (dense R2; ported from team/alt-dense-isa k7/k8, bf16 path) =====
 // The weight is rewritten IN PLACE (same bytes, see ggml_cuda_mmb_dense_r2_prepare) to the layout: per (128-row tile, 64-K step) chunk of 8704 B: qs[128][64] int8 then d[128][2] f16 (same 34 B
 // per 32 weights as ggml Q8_0). Every weight load is a coalesced b128 per lane; buffer loads with scalar step offsets;
 // barrier without gl0_inv. PF=1: k7 schedule (one register stage); PF=2: k8 schedule (global prefetch distance 2,
@@ -325,7 +325,7 @@ __device__ __forceinline__ void mmb_tq8_dq16(const uint32_t dw, const uint4 q, u
         out[p] = mmb_pack2(fmaf(u0, d, md), fmaf(u1, d, md));
     }
 }
-// MMB_DENSE_F16: f16 dequant (team/alt-dense-isa dq16<true>): byte b -> f16 bits 0x64bb = 1024 + (q + 128), minus
+// dense F16: f16 dequant (team/alt-dense-isa dq16<true>): byte b -> f16 bits 0x64bb = 1024 + (q + 128), minus
 // 1152 = q exactly, times d: RN_f16(q * d) with one rounding (0.91 VALU per WMMA vs 2.41 for the fp32 fma + bf16 pack).
 typedef _Float16 tq8_h2  __attribute__((ext_vector_type(2)));
 typedef _Float16 tq8_v16h __attribute__((ext_vector_type(16)));
@@ -340,7 +340,7 @@ __device__ __forceinline__ void mmb_tq8_dq16h(const uint32_t dw, const uint4 q, 
         out[p] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(tq8_h2, hv) - bias) * d2);
     }
 }
-// F32 -> F16 (RNE), saturated to +-65504: the MMB_DENSE_F16 activation format (NaN stays NaN)
+// F32 -> F16 (RNE), saturated to +-65504: the dense F16 activation format (NaN stays NaN)
 __device__ __forceinline__ uint16_t mmb_f2h_sat(const float f) {
     const float c = f != f ? f : fminf(fmaxf(f, -65504.0f), 65504.0f);
     return __builtin_bit_cast(uint16_t, (_Float16) c);
@@ -619,7 +619,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
             const float o = scale * s + bias;
             if (store_f32) Out[(size_t)t * E + ch] = o;
             if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
-            if (OutF) OutF[(size_t)t * E + ch] = mmb_f2h_sat(o);   // MMB_DENSE_F16 copy
+            if (OutF) OutF[(size_t)t * E + ch] = mmb_f2h_sat(o);   // dense F16 copy
         }
     }
 #endif
@@ -1098,7 +1098,7 @@ __global__ void mmb_quantize_q8_act_kernel(const uint16_t * __restrict__ X, uint
     if (t >= T) return;
     const int base = kb * 32;
     float v[32]; float amax = 0.0f;
-    // MMB_Q8ACT_VEC (default 1): 16-byte loads / stores (the scalar 16-bit loads and byte stores ran at ~60 GB/s); same values
+    // vec: 16-byte loads / stores (the scalar 16-bit loads and byte stores ran at ~60 GB/s); same values
     static_assert(sizeof(uint4) == 16, "uint4");
     const bool vec = allow_vec && (((uintptr_t) X | (uintptr_t) Xq8) & 15) == 0 && (K & 7) == 0;
     if (vec) {
@@ -1139,8 +1139,6 @@ __global__ void mmb_quantize_q8_act_kernel(const uint16_t * __restrict__ X, uint
     }
     Xs[(size_t) kb * T + t] = d;
 }
-
-static bool mmb_q8act_vec() { static const bool v = getenv("MMB_Q8ACT_VEC") ? atoi(getenv("MMB_Q8ACT_VEC")) != 0 : true; return v; }
 
 // HC down W8A8 GEMM: BM rows x BN tokens per block, BK 32-K blocks per stage, WM x WN waves. The iu8 result
 // layout is c[l] = (row 2l + (lane>>4), col lane&15), i.e. (weight, token) with the operands (W, X); the
@@ -1378,17 +1376,15 @@ struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; 
 struct ggml_cuda_mmb_context {
     struct workspace {
         std::vector<mmb_cache_entry> cache;
-        mmb_cache_entry slots[5] = {};   // 4: F16 copy of the gate-mix output (MMB_DENSE_F16)
+        mmb_cache_entry slots[5] = {};   // 4: F16 copy of the gate-mix output (dense F16)
         size_t slot_cap[5] = {};
     };
     workspace streams[GGML_CUDA_MAX_STREAMS];
     std::unordered_set<const ggml_tensor *> bf16_only;
-    std::unordered_map<const ggml_tensor *, int> f16_marks;   // MMB_DENSE_F16 reader marks (MMB_F16_WANT / MMB_F16_ONLY)
+    std::unordered_map<const ggml_tensor *, int> f16_marks;   // dense F16 reader marks (MMB_F16_WANT / MMB_F16_ONLY)
     std::unordered_map<const void *, uint16_t *> shadow;
-    std::unordered_map<const void *, uint8_t *> q8shadow;
     std::map<std::pair<const void *, const void *>, uint16_t *> shadow_pair;
     size_t shadow_bytes = 0;
-    size_t q8shadow_bytes = 0;
     // int8 copy of the normalized streams (W8A8 HC down): written by the combine that produces xn, read by the
     // next HCD GEMM; keyed by the xn tensor data pointer
     void *   xn_q8 = nullptr;
@@ -1396,7 +1392,7 @@ struct ggml_cuda_mmb_context {
     size_t   xn_q8_cap = 0;
     size_t   xn_q8_scale_cap = 0;
     const void * xn_q8_for = nullptr;
-    int      xn_q8_gs = -1;   // q8 layout: -1 = [kb][t][32] / [kb][t]; g >= 0: token groups of 1<<g ([t/G][kb][G][32]), HC_COMBINE_V2
+    int      xn_q8_gs = -1;   // q8 layout: -1 = [kb][t][32] / [kb][t]; g >= 0: token groups of 1<<g ([t/G][kb][G][32]), hc_combine_norm_inject_v2
 };
 
 namespace {
@@ -1420,7 +1416,6 @@ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_t
     mmb_workspace(ctx).cache.push_back({mmb_root(t), t->data, n, f16, buf});
     return buf->get();
 }
-static bool g_mmb_act_miss = false;
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     const ggml_tensor * root = mmb_root(src1);
     // Slot producers have graph dependencies; temporary conversions belong to their stream.
@@ -1429,7 +1424,6 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
         for (int k = 0; k < (int) std::size(work.slots); ++k) { auto & e = work.slots[k]; if (e.buf && !e.f16 && e.root == root && e.data == src1->data && e.n == n) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return e.buf->get(); } }
     }
     for (auto & e : mmb_workspace(ctx).cache) if (!e.f16 && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
-    g_mmb_act_miss = true;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
@@ -1449,7 +1443,7 @@ static const uint16_t * mmb_f16_activation(ggml_backend_cuda_context & ctx, cons
     mmb_f32_to_f16_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, nb);
     return buf;
 }
-// cached 16-bit copy of src1 written by its producer (f16: the MMB_DENSE_F16 copy), nullptr if none: no conversion
+// cached 16-bit copy of src1 written by its producer (f16: the dense F16 copy), nullptr if none: no conversion
 static const uint16_t * mmb_act_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, const bool f16) {
     const ggml_tensor * root = mmb_root(src1);
     for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {
@@ -1549,21 +1543,15 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 // RDNA3.5 (gfx1151) only, tuned for qwen4exp shapes. On gfx1151 (ROCm 7.2.1) it lost to MMQ on other archs: dense qwen35 prefill 3.4-3.9x slower, MoE 14-28% (PR #75).
 // llama now opts in every backend context it creates, limited to the weight types in mmb_quant_type_dense() / mmb_quant_type_routed(); only the 32-row small-batch gate (mmb_min_t) depends on the arch.
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
-    static const bool off = getenv("MMB_OFF") && atoi(getenv("MMB_OFF"));
-    return !off && ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
+    return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
 // Smallest GEMM row count for the MMB consumers: 32 in a context with the small-batch opt-in (qwen4exp), else 512. The QSA indexer score keeps 512, see below.
 // gfx1151 / ROCm 10, Qwen3.8-Flash-Next UD-Q4_K_XL and UD-IQ4_XS prefill: MMB is about 5% slower than MMQ at 16 tokens, 11-14% faster at 32.
 // Retest when the MMQ or MMB tiles or the mmb_quant_type_*() gates change.
 int  mmb_min_t(const ggml_backend_cuda_context & ctx) { return ctx.mmb_small_batch ? 32 : 512; }
 int  mmb_f32split_mode(){ return 2; }
-bool mmb_f32split() { static const bool v = !getenv("MMB_F32SPLIT_OFF"); return v; }
-bool mmb_bf16w()    { static const bool v = !getenv("MMB_BF16W_OFF"); return v; }
-bool mmb_hc16()    { static const bool v = !getenv("MMB_HC16_OFF"); return v; }
 int  mmb_tall_mode(){ return 2; }
 bool mmb_tall()    { return mmb_tall_mode() != 0; }
-bool mmb_gatemix_flag() { static const bool v = !getenv("MMB_GATEMIX_OFF"); return v; }
-bool mmb_down16_flag() { static const bool v = !getenv("MMB_DOWN16_OFF"); return v; }
 bool mmb_glu()     { static const bool v = getenv("MMB_GLU") ? atoi(getenv("MMB_GLU")) != 0 : true; return v; }
 
 } // namespace
@@ -1683,11 +1671,9 @@ static int64_t mmb_min_t_for(const ggml_backend_cuda_context & ctx, ggml_type ty
 
 bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    static const bool dense_off = getenv("MMB_DENSE_OFF") != nullptr;
-    if (dense_off) return false;
     const bool quant = mmb_quant_type_dense(src0->type);
-    const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
-    const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
+    const bool bf16w = src0->type == GGML_TYPE_BF16;
+    const bool f32w  = src0->type == GGML_TYPE_F32;
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
     if ((!quant && !bf16w && !f32w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
@@ -1724,8 +1710,6 @@ static bool mmb_act_from_fused_gateup(const ggml_tensor * act, const int n_ff, c
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    static const bool routed_off = getenv("MMB_ROUTED_OFF") != nullptr;
-    if (routed_off) return false;
     // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
     // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
     // models 0.002-0.065, 97-99%); pp4096 +0.9%. Keep on MMQ; Q8_0 / IQ4_NL already eligible, so exempt.
@@ -1797,46 +1781,27 @@ void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor 
     CUDA_CHECK(cudaGetLastError());
 }
 
-static void mmb_q8_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
-static const uint8_t * mmb_q8_shadow_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
-// MMB_DENSE_R2: Q8_0 dense weights with a k7/k8-winning shape are repacked IN PLACE at graph_optimize to the
+// Dense R2: Q8_0 dense weights with a k7/k8-winning shape are repacked IN PLACE at graph_optimize to the
 // tile layout of mmb_tq8_dense_kernel (no extra memory). Every reader of a repacked tensor must understand that layout:
 // the MMB GEMM (any T, ggml_cuda_mul_mat_dq), the RDNA3.5 fused-quantize matvecs (decode, mmvq.cu: x_pk) and the
 // grouped matvec. ggml-cuda.cu routes every MUL_MAT on a repacked weight there; the MMVQ/MMQ fusions stay off it.
 //   K=2560, M>=8192 (M=10240, 12288): k7 128x256 (8 waves 64x64), PF=1
 //   M=6144 K=2560 and K=6144 M=2560: k8 128x128 (waves 64x32), PF=2
-#ifndef MMB_DENSE_R2_DEFAULT
-#define MMB_DENSE_R2_DEFAULT 1
-#endif
-static bool mmb_dense_r2_on() { static const bool v = getenv("MMB_DENSE_R2") ? atoi(getenv("MMB_DENSE_R2")) != 0 : MMB_DENSE_R2_DEFAULT; return v; }
-// MMB_DENSE_R2_SHAPES (bit mask, default 7): 1 = k7 class (K<=4096, M>=8192), 2 = K<=4096 M>=6144, 4 = K>4096
-static int mmb_dense_r2_shapes() { static const int v = getenv("MMB_DENSE_R2_SHAPES") ? atoi(getenv("MMB_DENSE_R2_SHAPES")) : 7; return v; }
-// MMB_DENSE_R2_SMALL=1: also repack the small dense Q8_0 shapes (shared expert gate/up [2560 -> 640], down [640 -> 2560],
-// attention K/V [2560 -> 512]) to the k8 tile, so they run on mmb_tq8_dense_kernel (F16) instead of mmb_dense_kernel<128,128>.
-static bool mmb_dense_r2_small() { static const bool v = getenv("MMB_DENSE_R2_SMALL") ? atoi(getenv("MMB_DENSE_R2_SMALL")) != 0 : true; return v; }
+// The small dense Q8_0 shapes (shared expert gate/up [2560 -> 640], down [640 -> 2560], attention K/V [2560 -> 512])
+// are repacked to the k8 tile too, so they run on mmb_tq8_dense_kernel (F16) instead of mmb_dense_kernel<128,128>.
 static bool mmb_tq8_shape(const int64_t M, const int64_t K) {
     if (M % 128 != 0 || K % 64 != 0 || M > 65536 || K > 16384) return false;
-    if (mmb_dense_r2_small() && M >= 512 && K >= 512 && (M < 2560 || K < 2560)) return (K / 64) % 2 == 0;   // k8 only
+    if (M >= 512 && K >= 512 && (M < 2560 || K < 2560)) return (K / 64) % 2 == 0;   // k8 only
     if (M < 2560 || K < 2560) return false;   // not vocab-sized (tied embeddings)
-    const int mask = mmb_dense_r2_shapes();
-    if (K <= 4096 && M >= 8192) return (mask & 1) != 0;              // k7
+    if (K <= 4096 && M >= 8192) return true;                          // k7
     if ((K / 64) % 2 != 0) return false;                              // k8: nks even
-    if (K <= 4096 && M >= 6144) return (mask & 2) != 0;
-    return K > 4096 && (mask & 4) != 0;
+    return M >= 6144 || K > 4096;
 }
 static bool mmb_tq8_k7(const int M, const int K) { return K <= 4096 && M >= 8192; }
-// MMB_DENSE_F16: the k7/k8 kernels read F16 activations (f16 dequant + f16 WMMA) instead of BF16. The producers of
+// Dense F16: the k7/k8 kernels read F16 activations (f16 dequant + f16 WMMA) instead of BF16. The producers of
 // these GEMM inputs (HC gate mix, GDN gated output norm, gated attention output) write the F16 copy themselves
 // (saturating RNE) when the graph marks say a reader wants it; any other input is converted here (F32 -> F16), or
 // the BF16 kernel runs on a producer's BF16 copy.
-#ifndef MMB_DENSE_F16_DEFAULT
-#define MMB_DENSE_F16_DEFAULT 1
-#endif
-static bool mmb_dense_f16_on() { static const bool v = getenv("MMB_DENSE_F16") ? atoi(getenv("MMB_DENSE_F16")) != 0 : MMB_DENSE_F16_DEFAULT; return v; }
-// MMB_DENSE_F16_ROUTER=1: a gate-mix output that also feeds the f16hi F32-weight GEMM (MoE router) gets the F16 copy
-// too, so the router skips its own F32 -> F16 conversion (same RNE value unless |x| > 65504). Off by default: gfx1151
-// pp2048 the router conversions saved (47 x ~160 us) are eaten by the second 16-bit store in those gate mixes (no net gain).
-static bool mmb_dense_f16_router() { static const bool v = getenv("MMB_DENSE_F16_ROUTER") ? atoi(getenv("MMB_DENSE_F16_ROUTER")) != 0 : false; return v; }
 static const uint16_t * mmb_f16sat_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     uint16_t * buf = mmb_cache_insert(ctx, src1, n, true);
     mmb_cvt_f32_f16_sat<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
@@ -1871,17 +1836,14 @@ static void mmb_tq8_launch(const uint8_t * wt, const uint16_t * xhp, float * D, 
         const int M, const int K, const int T, const bool k7, const bool f16, cudaStream_t stream) {
     GGML_ASSERT(M % 128 == 0 && K % 64 == 0 && (k7 || (K / 64) % 2 == 0));
     // raster: GM row tiles per group (1 << 20 = plain M-fastest). gfx1151 pp2048, median us per call, M-fastest vs GM=1 /
-    // GM=8: [K=6144, M=2560] 1770 vs 2157 / 1934, [K=2560, M=10240] 2661 vs - / 2861. MMB_DENSE_R2_GM overrides.
-    static const int gm_env = getenv("MMB_DENSE_R2_GM") ? atoi(getenv("MMB_DENSE_R2_GM")) : 0;
-    const int GM = gm_env > 0 ? gm_env : 1 << 20;
+    // GM=8: [K=6144, M=2560] 1770 vs 2157 / 1934, [K=2560, M=10240] 2661 vs - / 2861.
+    const int GM = 1 << 20;
     if (f16) {
         if (k7) mmb_tq8_dense_kernel<128, 256, 64, 64, 1, 72, true><<<(M / 128) * ((T + 255) / 256), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
         else {
-            // MMB_TQ8_BN64_T (default 1024): 128x64 tiles when the 128x128 grid has fewer than MMB_TQ8_BN64_CTAS (160) blocks,
+            // up to 1024 tokens: 128x64 tiles when the 128x128 grid has fewer than 160 blocks,
             // e.g. M=2560 at T=512 (80 blocks): +1.3% pp512 on gfx1151; 320 is worse at ub1024. Same per-output sums.
-            static const int bn64_t = getenv("MMB_TQ8_BN64_T") ? atoi(getenv("MMB_TQ8_BN64_T")) : 1024;
-            static const int bn64_c = getenv("MMB_TQ8_BN64_CTAS") ? atoi(getenv("MMB_TQ8_BN64_CTAS")) : 160;
-            if (T <= bn64_t && (M / 128) * ((T + 127) / 128) < bn64_c)
+            if (T <= 1024 && (M / 128) * ((T + 127) / 128) < 160)
                 mmb_tq8_dense_kernel<128, 64, 64, 16, 2, 72, true><<<(M / 128) * ((T + 63) / 64), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
             else
                 mmb_tq8_dense_kernel<128, 128, 64, 32, 2, 72, true><<<(M / 128) * ((T + 127) / 128), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
@@ -1893,7 +1855,7 @@ static void mmb_tq8_launch(const uint8_t * wt, const uint16_t * xhp, float * D, 
     CUDA_CHECK(cudaGetLastError());
 }
 // Any-T GEMM on a repacked weight outside the MMB batch range (2..mmb_min_t-1 rows, or MMB off for this context):
-// private bf16 (MMB_DENSE_F16: f16) activation copy, F32 output, k8 tile (one token tile up to 128 rows: the weight is streamed once).
+// private f16 activation copy, F32 output, k8 tile (one token tile up to 128 rows: the weight is streamed once).
 void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_mmb_dq_packed(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && src1->ne[0] == src0->ne[0] && dst->ne[0] == src0->ne[1]);
@@ -1904,22 +1866,16 @@ void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     cudaStream_t stream = ctx.stream();
     const size_t n = (size_t) T * K;
     ggml_cuda_pool_alloc<uint16_t> xh(ctx.pool(), n);
-    const bool f16 = mmb_dense_f16_on();
-    if (f16) mmb_cvt_f32_f16_sat<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, xh.get(), n);
-    else     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, xh.get(), n);
-    mmb_tq8_launch((const uint8_t *) src0->data, xh.get(), (float *) dst->data, nullptr, true, M, K, T, false, f16, stream);
-    if (ggml_cuda_mmb_shape_log() == 2) fprintf(stderr, "mmb_shape: dense-r2-small K=%d M=%d T=%d\n", K, M, T);
+    mmb_cvt_f32_f16_sat<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, xh.get(), n);
+    mmb_tq8_launch((const uint8_t *) src0->data, xh.get(), (float *) dst->data, nullptr, true, M, K, T, false, true, stream);
 }
 int ggml_cuda_mmb_f16_reader(ggml_backend_cuda_context & ctx, const ggml_tensor * n) {
-    if (!mmb_dense_f16_on() || !n || n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1]) return 0;
+    if (!n || n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1]) return 0;
     const ggml_tensor * w = n->src[0], * x = n->src[1];
     if (x->view_src && x->view_offs != 0) return 0;   // the copies are keyed by root + data pointer
     if (ggml_cuda_mmb_dq_packed(w)) return ggml_cuda_mmb_supported_mm(ctx, w, x, n) ? 1 : 0;
-    if (w->type == GGML_TYPE_F32 && mmb_dense_f16_router() && ggml_cuda_mmb_supported_mm(ctx, w, x, n)) {   // the f16hi gate below
-        static const bool f16hi = getenv("MMB_F16HI") ? atoi(getenv("MMB_F16HI")) != 0 : true;
-        const int64_t K = w->ne[0], M = w->ne[1], T = x->ne[1] * x->ne[2] * x->ne[3];
-        if (f16hi && M > 64 && M <= 1024 && K % 64 == 0 && T >= 512 && mmb_shadow_lookup(ctx, w)) return 2;
-    }
+    // the f16hi F32-weight GEMM (MoE router) converts its own F32 -> F16 copy: gfx1151 pp2048, the router conversions a
+    // gate-mix F16 copy would save (47 x ~160 us) are eaten by the second 16-bit store in those gate mixes (no net gain)
     return 0;
 }
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -1940,31 +1896,20 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         static const int FS = getenv("MMB_F32_SMALL") ? atoi(getenv("MMB_F32_SMALL")) : 2;
         // f16-hi route: a shadow holds (f16)W and an f16 copy of X holds (f16)X, so the WMMA f16 GEMM replays the
         // split kernel's hi*hi accumulation bit for bit (same K order) without the per-tile F32 split or the F32
-        // re-reads. MMB_F16HI=0 keeps the split kernel. Geometry <64,128,32,32>: 8 waves, TM=2, TN=2.
-        static const bool f16hi = getenv("MMB_F16HI") ? atoi(getenv("MMB_F16HI")) != 0 : true;
-        const uint16_t * w16 = (f16hi && M > 64 && M <= 1024 && K % 64 == 0 && T >= 512) ? mmb_shadow_lookup(ctx, src0) : nullptr;
+        // re-reads. Geometry <64,128,32,32>: 8 waves, TM=2, TN=2.
+        const uint16_t * w16 = (M > 64 && M <= 1024 && K % 64 == 0 && T >= 512) ? mmb_shadow_lookup(ctx, src0) : nullptr;
         if (w16) {
             const uint16_t * x16 = mmb_f16_activation(ctx, src1, (size_t) T * K, stream);
-            // MMB_F16HI_TILE (after asf0 fc94088ee's taller F32 router tile): 0 = 64x128, 1 = 256x64, 2 = 128x64,
-            // 3 = 128x128. Same per-output K order for every tile (bit-identical). Default: 3 for M >= 256. gfx1151,
-            // qwen3.8-flash-next router (M=512, K=2560), us per GEMM 64x128 -> 128x128: T=512 70 -> 63, T=1024 130 -> 97,
-            // T=2048 270 -> 207 (256x64: 218, 128x64: 233).
-            static const int HT_env = getenv("MMB_F16HI_TILE") ? atoi(getenv("MMB_F16HI_TILE")) : -1;
-            const int HT = HT_env >= 0 ? HT_env : (M >= 256 ? 3 : 0);
-            if (HT == 1) {
-                dim3 g((M + 255) / 256, (T + 63) / 64);
-                mmb_dense_kernel<256, 64, 64, 32, 2, true><<<g, MMB_NT, 0, stream>>>((const uint8_t *) w16, x16, D, (uint16_t *) nullptr, true, M, K, T);
-            } else if (HT == 2) {
-                dim3 g((M + 127) / 128, (T + 63) / 64);
-                mmb_dense_kernel<128, 64, 32, 32, 2, true><<<g, MMB_NT, 0, stream>>>((const uint8_t *) w16, x16, D, (uint16_t *) nullptr, true, M, K, T);
-            } else if (HT == 3) {
+            // 128x128 tile for M >= 256, else 64x128 (after asf0 fc94088ee's taller F32 router tile). Same per-output K
+            // order for every tile (bit-identical). gfx1151, qwen3.8-flash-next router (M=512, K=2560), us per GEMM
+            // 64x128 -> 128x128: T=512 70 -> 63, T=1024 130 -> 97, T=2048 270 -> 207 (256x64: 218, 128x64: 233).
+            if (M >= 256) {
                 dim3 g((M + 127) / 128, (T + 127) / 128);
                 mmb_dense_kernel<128, 128, 32, 64, 2, true><<<g, MMB_NT, 0, stream>>>((const uint8_t *) w16, x16, D, (uint16_t *) nullptr, true, M, K, T);
             } else {
             dim3 grid((M + 63) / 64, (T + 127) / 128);
             mmb_dense_kernel<64, 128, 32, 32, 2, true><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w16, x16, D, (uint16_t *) nullptr, true, M, K, T);
             }
-            if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: f16hi K=%d M=%d T=%d\n", K, M, T);
             CUDA_CHECK(cudaGetLastError()); return;
         }
         if (M <= 64 && FS == 2) {
@@ -1981,21 +1926,19 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         else if (FT == 5)   { dim3 g((M + 31) / 32,  (T + 63) / 64);   mmb_f32split_kernel< 32,  64, 16, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
         else if (FT == 6)   { dim3 g((M + 63) / 64,  (T + 63) / 64);   mmb_f32split_kernel< 64,  64, 32, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
         // 7/8: from asf0/strix-llama.cpp fc94088ee (256x64: a block holds up to 256 experts, the activations are read once
-        // per 256 rows). Only reached with MMB_F16HI=0 or outside the f16hi gate.
+        // per 256 rows). Only reached outside the f16hi gate.
         else if (FT == 7)   { dim3 g((M + 255) / 256,(T + 63) / 64);   mmb_f32split_kernel<256,  64, 64, 32, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
         else if (FT == 8)   { dim3 g((M + 127) / 128,(T + 63) / 64);   mmb_f32split_kernel<128,  64, 32, 32, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
         else                { dim3 g((M + 127) / 128,(T + 127) / 128); mmb_f32split_kernel<128, 128, 32, 64, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
         }
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: f32 K=%d M=%d T=%d\n", K, M, T);
         CUDA_CHECK(cudaGetLastError()); return;
     }
-    g_mmb_act_miss = false;
-    // MMB_DENSE_F16 on a repacked weight: the producer's F16 copy, else its BF16 copy (BF16 kernel), else convert to F16
+    // dense F16 on a repacked weight: the producer's F16 copy, else its BF16 copy (BF16 kernel), else convert to F16
     const uint16_t * xf16 = nullptr;
-    if (mmb_dense_f16_on() && ggml_cuda_mmb_dq_packed(src0)) {
+    if (ggml_cuda_mmb_dq_packed(src0)) {
         const size_t n = (size_t) T * K;
         xf16 = mmb_act_lookup(ctx, src1, n, true);
-        if (!xf16 && !mmb_act_lookup(ctx, src1, n, false)) { g_mmb_act_miss = true; xf16 = mmb_f16sat_activation(ctx, src1, n, stream); }
+        if (!xf16 && !mmb_act_lookup(ctx, src1, n, false)) xf16 = mmb_f16sat_activation(ctx, src1, n, stream);
     }
     const uint16_t * xhp = xf16 ? xf16 : mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
@@ -2015,9 +1958,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         const bool hbf = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0;
         uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
         // W8A8 int8 route: Q8_0 weights read as int8, activations quantized per 32-K block into the [kb][t][32]
-        // layout; int8 WMMA with the per-block scale in the f32 accumulator. MMB_HCD_W8A8=0 keeps the bf16 tiles.
-        static const bool w8a8 = getenv("MMB_HCD_W8A8") ? atoi(getenv("MMB_HCD_W8A8")) != 0 : true;
-        if (w8a8 && (M % 64) == 0 && (K % 128) == 0 && (T % 128) == 0) {
+        // layout; int8 WMMA with the per-block scale in the f32 accumulator. Other shapes take the bf16 tiles.
+        if ((M % 64) == 0 && (K % 128) == 0 && (T % 128) == 0) {
             const float * xsc = nullptr;
             int xtm = -1;
             const uint8_t * xq = ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1)->data, &xsc, &xtm);
@@ -2029,23 +1971,18 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
                 xq_buf.alloc((size_t) nkb * T * 32);
                 xsc_buf.alloc((size_t) nkb * T);
                 dim3 gq((T + 255) / 256, nkb);
-                mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq_buf.get(), xsc_buf.get(), K, T, mmb_q8act_vec());
+                mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq_buf.get(), xsc_buf.get(), K, T, true);
                 xq = xq_buf.get(); xsc = xsc_buf.get();
             }
-            dim3 g8(T / 128, M / 64);
-            // MMB_HCD_ROWMAJOR (default 1): row blocks fastest, so the M/64 blocks of an activation tile share it in L2
-            static const bool hcd_rm = getenv("MMB_HCD_ROWMAJOR") ? atoi(getenv("MMB_HCD_ROWMAJOR")) != 0 : true;
-            // MMB_HCD_BM (default 32) row tile up to MMB_HCD_BM_T tokens (default 1024): M=320 at T=512 gives only 20
-            // blocks of 64 rows for 40 CUs; 32-row blocks are 0.4-0.7% faster end to end at ub 512/1024 (same sums)
-            static const int hcd_bm = getenv("MMB_HCD_BM") ? atoi(getenv("MMB_HCD_BM")) : 32;
-            static const int hcd_bm_t = getenv("MMB_HCD_BM_T") ? atoi(getenv("MMB_HCD_BM_T")) : 1024;
-            if (hcd_bm == 32 && T <= hcd_bm_t && M % 32 == 0) {
+            // row blocks fastest, so the row blocks of an activation tile share it in L2.
+            // 32-row tile up to 1024 tokens: M=320 at T=512 gives only 20 blocks of 64 rows for 40 CUs; 32-row blocks
+            // are 0.4-0.7% faster end to end at ub 512/1024 (same sums)
+            if (T <= 1024 && M % 32 == 0) {
                 mmb_hcd_w8a8_kernel<32, 128, 4, 2, 4><<<dim3(M / 32, T / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
                     mmb_tok_identity{T}, fused ? xtm : -1, true);
             } else
-            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2><<<hcd_rm ? dim3(M / 64, T / 128) : g8, MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
-                mmb_tok_identity{T}, fused ? xtm : -1, hcd_rm);
-            if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: hcd-w8a8 K=%d M=%d T=%d fused=%d\n", K, M, T, (int) fused);
+            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2><<<dim3(M / 64, T / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
+                mmb_tok_identity{T}, fused ? xtm : -1, true);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -2065,48 +2002,23 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         };
         if (hc_shadow) go(std::integral_constant<int, 2>{}, (const uint8_t *) hc_shadow);
         else           go(std::integral_constant<int, 1>{}, W);
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: hcd type=%d K=%d M=%d T=%d hcd=%d shadow=%d\n", src0->type, K, M, T, HCD, hc_shadow != nullptr);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(ctx, src0) : nullptr;
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
-    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+    uint16_t * Dh = (K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
-    if (ggml_cuda_mmb_dq_packed(src0)) {   // MMB_DENSE_R2 in-place tile layout: only mmb_tq8_dense_kernel reads it here
-        static const int k7_env = getenv("MMB_DENSE_R2_K7") ? atoi(getenv("MMB_DENSE_R2_K7")) : -1;   // -1 auto, 0 force k8, 1 k7 where legal
-        const bool k7 = k7_env < 0 ? mmb_tq8_k7(M, K) : (k7_env == 1);
-        mmb_tq8_launch(W, xhp, D, Dh, store_f32, M, K, T, k7, xf16 != nullptr, stream);
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: dense-r2 K=%d M=%d T=%d k7=%d f16=%d src1=%s op=%s w=%s converted=%d\n", K, M, T, (int) k7,
-            (int) (xf16 != nullptr), src1->name, ggml_op_desc(src1), src0->name, (int) g_mmb_act_miss);
+    if (ggml_cuda_mmb_dq_packed(src0)) {   // dense R2 in-place tile layout: only mmb_tq8_dense_kernel reads it here
+        mmb_tq8_launch(W, xhp, D, Dh, store_f32, M, K, T, mmb_tq8_k7(M, K), xf16 != nullptr, stream);
         return;
     }
     dim3 grid((M + 63) / 64, big ? (T + 127) / 128 : (T + 127) / 128);
     // MMB_DENSE_TILE narrows the shared-expert / dense GEMM tiles for more blocks per ubatch chunk.
-    // MMB_DENSE_BIG_TILE: 0 keeps the 128x256 big tile (LDS 54 KB, VGPR 256, one CTA/SM); 1 launches
-    // <64,128,32,32> (about 2x the blocks, 2 CTAs/SM: gfx1151 GDN in_proj [2560->6144] at pp2048 was
-    // 202 ms/pass on the wide tile).
-    // MMB_DENSE_PARSHAPE: per-shape tile routing. The [K=6144, M=2560] GDN out_proj (and friends with K>=4096)
-    // fits M/128 = 20 row blocks whose per-CTA W tile is 128*6144*2 = 1.57 MB - just above what the 2 MB L2 can
-    // hold while the 16 token tiles stream; <64,128,32,32> halves the weight tile (0.78 MB) and fits 2 CTAs/SM.
-    static const int DP_ = getenv("MMB_DENSE_PARSHAPE") ? atoi(getenv("MMB_DENSE_PARSHAPE")) : 0;
-    if (DP_ && !big && K >= 4096 && M >= 2100 && T >= 512) {
-        // DP_=1: half-size row tile (1 CTA-per-2, was rejected); DP_=2: the 128x256 big tile (more K per pass, wider
-        // token tile): test whether the K=6144 out_proj prefers the shape that wins on [K=2560, M>=6144].
-        if (DP_ == 2) {
-            dim3 gd((M + 127) / 128, (T + 255) / 256);
-            mmb_dense_kernel<128, 256, 64, 64, 2><<<gd, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-        } else {
-            dim3 gd((M + 63) / 64, (T + 127) / 128);
-            mmb_dense_kernel<64, 128, 32, 32, 2><<<gd, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-        }
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: dense-parshape K=%d M=%d T=%d\n", K, M, T);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
+    // The big shapes take the 128x256 tile (LDS 54 KB, VGPR 256, one CTA/SM).
 #define MMB_SMALL_DENSE(WT, WP) do { \
     static const int DT_ = getenv("MMB_DENSE_TILE") ? atoi(getenv("MMB_DENSE_TILE")) : 0; \
     if (DT_ == 1) { dim3 gd((M + 63) / 64, (T + 127) / 128); mmb_dense_kernel<64, 128, 32, 32, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
@@ -2115,43 +2027,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     else { dim3 gd((M + 127) / 128, (T + 127) / 128); mmb_dense_kernel<128, 128, 32, 64, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
 } while (0)
 #define MMB_BIG_DENSE(WT, WP) do { \
-    static const int DB_ = getenv("MMB_DENSE_BIG_TILE") ? atoi(getenv("MMB_DENSE_BIG_TILE")) : 0; \
-    if (DB_ == 1) { dim3 gd((M + 63) / 64, (T + 127) / 128); mmb_dense_kernel<64, 128, 32, 32, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
-    else { dim3 gd((M + 127) / 128, (T + 255) / 256); mmb_dense_kernel<128, 256, 64, 64, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
+    dim3 gd((M + 127) / 128, (T + 255) / 256); mmb_dense_kernel<128, 256, 64, 64, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); \
 } while (0)
 
     const uint16_t * shadow = shadow_pre;
-    // MMB_DENSE_W8A8: dense bf16 weights through the per-row Q8_0 shadow + mmb_hcd_w8a8_kernel (int8 WMMA,
-    // per-32-K-block scales, act pre-quantized or fused from the combine's xn buffer).
-    // Same shape family as the HCD route (BM=64 x BN=128, 8 waves). -p2048 d0 on gfx1151: the 128x256 bf16 tile
-    // ran at 1 CTA/SM (LDS 54 KB, VGPR 256): 198 ms/pass on the [K=2560, M=10240] family alone.
-    static const int DW = getenv("MMB_DENSE_W8A8") ? atoi(getenv("MMB_DENSE_W8A8")) : 0;
-    if (DW && src0->type == GGML_TYPE_BF16 && (K % 128) == 0 && (M % 64) == 0 && T % 128 == 0 && T >= 512 && (M >= 2560)) {
-        const uint8_t * wq = mmb_q8_shadow_lookup(ctx, src0);
-        if (wq) {
-            const bool hbf = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0;
-            uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
-            const float * xsc = nullptr;
-            int xtm = -1;
-            const uint8_t * xq = ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1)->data, &xsc, &xtm);
-            bool fused = xq != nullptr;
-            ggml_cuda_pool_alloc<uint8_t> xq_buf(ctx.pool());
-            ggml_cuda_pool_alloc<float> xsc_buf(ctx.pool());
-            if (!fused) {
-                const int nkb = K / 32;
-                xq_buf.alloc((size_t) nkb * T * 32);
-                xsc_buf.alloc((size_t) nkb * T);
-                dim3 gq((T + 255) / 256, nkb);
-                mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq_buf.get(), xsc_buf.get(), K, T, mmb_q8act_vec());
-                xq = xq_buf.get(); xsc = xsc_buf.get();
-            }
-            dim3 g8(T / 128, M / 64);
-            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2><<<g8, MMB_NT, 0, stream>>>(wq, xq, xsc, D, Dh2, sf, M, K, T, mmb_tok_identity{T}, fused ? xtm : -1);
-            if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: dense-w8a8 K=%d M=%d T=%d fused=%d bf=%d\n", K, M, T, (int) fused, (int) hbf);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-    }
     if (shadow) {
         if (big) MMB_BIG_DENSE(2, (const uint8_t *) shadow);
         else     { MMB_SMALL_DENSE(2, (const uint8_t *) shadow); }
@@ -2171,7 +2050,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if (big) MMB_BIG_DENSE(2, W);
         else     { MMB_SMALL_DENSE(2, W); }
     }
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: dense type=%d K=%d M=%d T=%d big=%d shadow=%d\n", src0->type, K, M, T, (int) big, shadow != nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2193,12 +2071,12 @@ bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context & ctx, const ggml_tensor *
     return true;
 }
 
-bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
-bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
+bool ggml_cuda_mmb_gatemix() { return true; }
+bool ggml_cuda_mmb_down16() { return true; }
 bool ggml_cuda_mmb_blk16() { return true; }
 bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
-    if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     return !(K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t(ctx));
@@ -2211,33 +2089,23 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!xn16) return false;
     cudaStream_t stream = ctx.stream();
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
-    // MMB_DENSE_F16: an F16 copy (slot 4) for the dense-r2 / f16hi readers; the BF16 copy is skipped when only
+    // dense F16: an F16 copy (slot 4) for the dense-r2 readers; the BF16 copy is skipped when only
     // dense-r2 GEMMs read the output
     const int fm = ggml_cuda_mmb_f16_marks(ctx, dst);
     uint16_t * outf = (fm & MMB_F16_WANT) ? ggml_cuda_mmb_slot_reserve(ctx, 4, dst, (size_t) T * E, true) : nullptr;
     uint16_t * outh = (outf && (fm & MMB_F16_ONLY)) ? nullptr : ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
     const bool store_f32 = !((outh || outf) && ggml_cuda_mmb_is_bf16_only(ctx, dst));
-    // MMB_GATEMIX_CH: 32 (32 channels x 128 tokens per CTA) or 64 (64 x 64). gfx1151 pp2048 b/ub 4096: CH=64 cuts
-    // the Xn over-fetch but halves the token tile (twice the weight re-reads per channel block): 1671 -> 1649 t/s.
-    static const int GCH = getenv("MMB_GATEMIX_CH") ? atoi(getenv("MMB_GATEMIX_CH")) : 32;
-    const bool ch64 = GCH == 64 && E % 64 == 0;
-    const dim3 grid = ch64 ? dim3(E / 64, (T + 63) / 64) : dim3(E / 32, (T + 127) / 128);
+    // 32 channels x 128 tokens per CTA. gfx1151 pp2048 b/ub 4096: 64 x 64 cuts the Xn over-fetch but halves the token
+    // tile (twice the weight re-reads per channel block): 1671 -> 1649 t/s.
+    const dim3 grid(E / 32, (T + 127) / 128);
     const uint16_t * hc_shadow = mmb_is_hc_q8(w) ? mmb_shadow_lookup(ctx, w) : nullptr;
-    // MMB_GATEMIX_TOKW=64: 256-token tile (each wave 16 channels x 64 tokens): half the weight re-reads per token
-    static const int GTW = getenv("MMB_GATEMIX_TOKW") ? atoi(getenv("MMB_GATEMIX_TOKW")) : 32;
-    if (hc_shadow && !ch64 && GTW == 64) {
-        hc_gate_mix_kernel<4, 2, 32, 64><<<dim3(E / 32, (T + 255) / 256), MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
-    } else if (hc_shadow) {
-        if (ch64) hc_gate_mix_kernel<4, 2, 64><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
-        else      hc_gate_mix_kernel<4, 2, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
+    if (hc_shadow) {
+        hc_gate_mix_kernel<4, 2, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
     } else
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        if (ch64) hc_gate_mix_kernel<4, WT, 64><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
-        else      hc_gate_mix_kernel<4, WT, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
+        hc_gate_mix_kernel<4, WT, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
     });
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: gatemix type=%d K=%d E=%d T=%d shadow=%d f32=%d bf16=%d f16=%d\n", w->type, K, E, T, hc_shadow != nullptr,
-        (int) store_f32, outh != nullptr, outf != nullptr);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -2762,17 +2630,16 @@ template <int WTYPE, int BN, bool PAIR = true> __global__ void __launch_bounds__
   }
 }
 
-// MMB_TIER_STREAMS: the routed small tier (hundreds of experts under THRESH rows: weight-streaming bound, ~360 GB/s
+// Tier streams: the routed small tier (hundreds of experts under THRESH rows: weight-streaming bound, ~360 GB/s
 // from DRAM+MALL) runs on a side stream concurrently with the big tier (a hundred experts holding ~85% of the rows:
 // WMMA bound), so the weight stream hides behind the big tier's compute. The tiers write disjoint output rows and
 // read only the desc/ids built before the fork. Prefill runs under HIP graph capture here, so the fork/join is
-// captured as graph edges (event record + wait, the side stream rejoins before the op returns); MMB_TIER_CAPTURE=0
-// keeps captured graphs single-stream. Declare after the pool allocations the tiers read: the destructor joins the
-// side stream before they are freed.
-// MMB_XJOIN (default 1; 0 restores the per-op join): the GLU op leaves its small tier running on the side stream (no join);
+// captured as graph edges (event record + wait, the side stream rejoins before the op returns). Declare after the
+// pool allocations the tiers read: the destructor joins the side stream before they are freed.
+// Cross-op join: the GLU op leaves its small tier running on the side stream (no join);
 // the following routed-down op builds its ids/desc on the side stream (after small GLU), main waits only for that,
 // then big down (main, after big GLU) and small down (side, after small GLU) overlap; join at the end of down.
-static bool mmb_xjoin() { static const bool v = getenv("MMB_XJOIN") ? atoi(getenv("MMB_XJOIN")) != 0 : true; return v; }   // default on: pp2048 1675 -> 1684 t/s, PPL unchanged
+// pp2048 1675 -> 1684 t/s vs a per-op join, PPL unchanged.
 static bool g_side_pending[GGML_CUDA_MAX_DEVICES] = {};
 static std::vector<std::function<void()>> g_glu_hold;   // GLU pool buffers kept alive while its side tier is pending
 template <typename T> static ggml_cuda_pool_alloc<T> & mmb_hold_alloc(ggml_backend_cuda_context & ctx, size_t n) {
@@ -2780,31 +2647,24 @@ template <typename T> static ggml_cuda_pool_alloc<T> & mmb_hold_alloc(ggml_backe
     g_glu_hold.push_back([a]() { delete a; });
     return *a;
 }
-// MMB_IDS_REUSE (default 1): the routed down reuses the routing maps of the GLU before it (same ids tensor). For the GLU
+// The routed down reuses the routing maps of the GLU before it (same ids tensor). For the GLU
 // (src1 [K, 1, T]) the helper writes ids_dst = token*n_used + slot, which is exactly the down's ids_src1 (src1 [K, n_used, T])
 // and ids_dst; the bounds are the same. The GLU maps are held (mmb_hold_alloc) until the down releases them.
-static bool mmb_ids_reuse() { static const bool v = getenv("MMB_IDS_REUSE") ? atoi(getenv("MMB_IDS_REUSE")) != 0 : true; return v; }
 struct mmb_ids_record { const void * ids = nullptr; int T = 0, n_used = 0, E = 0, si1 = 0; const int32_t * ids_dst = nullptr; const int32_t * bounds = nullptr; };
 static mmb_ids_record g_ids_rec[GGML_CUDA_MAX_DEVICES];
 static void mmb_hold_release() {
     for (auto it = g_glu_hold.rbegin(); it != g_glu_hold.rend(); ++it) (*it)(); g_glu_hold.clear();
     for (auto & r : g_ids_rec) r = mmb_ids_record{};
 }
-struct mmb_hold_guard { ~mmb_hold_guard() { if (!mmb_xjoin()) mmb_hold_release(); } };
 struct mmb_tier_fork {
     cudaStream_t main = nullptr, side = nullptr;
     cudaEvent_t join = nullptr;
     bool nojoin = false;
     // mode 0: normal fork/join; 1: fork, leave side pending (no join); 2: continue a pending side (no entry wait), join
     explicit mmb_tier_fork(ggml_backend_cuda_context & ctx, int mode = 0) {
-        static const bool on = getenv("MMB_TIER_STREAMS") ? atoi(getenv("MMB_TIER_STREAMS")) != 0 : true;
-        static const bool in_capture = getenv("MMB_TIER_CAPTURE") ? atoi(getenv("MMB_TIER_CAPTURE")) != 0 : true;
         constexpr int SIDE = GGML_CUDA_MAX_STREAMS - 1;
         main = ctx.stream();
-        if (!on || ctx.curr_stream_no == SIDE) return;
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        CUDA_CHECK(cudaStreamIsCapturing(main, &cs));
-        if (cs != cudaStreamCaptureStatusNone && !in_capture) return;
+        if (ctx.curr_stream_no == SIDE) return;
         static cudaEvent_t ev[GGML_CUDA_MAX_DEVICES][2] = {};
         cudaEvent_t * e = ev[ctx.device];
         if (e[0] == nullptr) {
@@ -2830,11 +2690,8 @@ struct mmb_tier_fork {
     }
 };
 
-#ifndef MMB_DOWN_R2_DEFAULT
-#define MMB_DOWN_R2_DEFAULT 1
-#endif
 // ---------------------------------------------------------------------------------------------------------------------
-// MMB_DOWN_R2: routed MoE down projection (Q5_1, K=640) on a repacked shadow of the expert weights (team/moe-down md4,
+// Down R2: routed MoE down projection (Q5_1, K=640) on a repacked shadow of the expert weights (team/moe-down md4,
 // variant "L2 256x64 KC128 interleaved", MODE 0 + the existing weighted reduction).
 // Shadow layout R2, same 24 B per 32 weights as Q5_1: [expert][M/16 row tile][K/32 block][16 rows][24 B]
 //   D0..D4 (20 B): pair P = 3j+k (P<15) holds q[2P] at bits [5k,5k+5) and q[2P+1] at [16+5k,21+5k) of D_j;
@@ -3160,7 +3017,7 @@ mmb_r2_gemv_kernel(const uint8_t * __restrict__ R, const size_t eb, const char *
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// MMB_GLU_R2: routed MoE gate/up + SwiGLU (Q4_K experts) on an in-place repacked layout ("G2"), one launch over a
+// GLU R2: routed MoE gate/up + SwiGLU (Q4_K experts) on an in-place repacked layout ("G2"), one launch over a
 // device-built tile list (big and small experts interleaved), A (weights) straight from global into registers.
 // G2 layout, per tensor, same 144 B per (row, 256-K superblock) as Q4_K: [expert][M/16 row tile][K/256 sb][2304 B]
 //   bytes    0..255 : [16 rows][16 B] the row's Q4_K header (d, dmin, scales[12]), unchanged
@@ -3434,7 +3291,7 @@ mmb_g2_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ 
 // Full tiles (>= BN/2 tokens) and partial tiles are interleaved proportionally (the md4 order) so the weight-streaming
 // partial tiles run alongside the WMMA-bound full tiles. Unused entries get cnt = 0. One block of 1024, E <= 1024.
 __global__ void __launch_bounds__(1024) mmb_g2_build_desc(const int32_t * __restrict__ bounds, uint4 * __restrict__ desc, const int E,
-        const int n_cb, const int BN, const int n_max, const int mode) {
+        const int n_cb, const int BN, const int n_max) {
     __shared__ uint32_t key[1024];
     __shared__ int pf[1024], ps[1024];
     const int t = threadIdx.x;
@@ -3477,9 +3334,8 @@ __global__ void __launch_bounds__(1024) mmb_g2_build_desc(const int32_t * __rest
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (pf[mid] > p) hi = mid; else lo = mid + 1; }
         int nf, np, e, c; ntiles(lo, nf, np, e, c);
         const int local = p - (lo ? pf[lo - 1] : 0), cb = local / nf, jt = local % nf;
-        int pos = p;
-        if (mode == 0) { const int before = nB > 0 ? (int) (((long long) p * nS + nB - 1) / nB) : 0; pos = p + min(before, nS); }
-        else if (mode == 2) pos = p + nS;
+        const int before = nB > 0 ? (int) (((long long) p * nS + nB - 1) / nB) : 0;
+        const int pos = p + min(before, nS);
         desc[pos] = make_uint4((uint32_t) e, (uint32_t) cb, (uint32_t) (bounds[e] + jt * BN), (uint32_t) min(BN, c - jt * BN));
     }
     for (int q = t; q < nS; q += 1024) {
@@ -3487,9 +3343,8 @@ __global__ void __launch_bounds__(1024) mmb_g2_build_desc(const int32_t * __rest
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (ps[mid] > q) hi = mid; else lo = mid + 1; }
         int nf, np, e, c; ntiles(lo, nf, np, e, c);
         const int cb = q - (lo ? ps[lo - 1] : 0), jt = nf;   // the partial tile is the expert's last
-        int pos = q + nB;
-        if (mode == 0) { const int before = nS > 0 ? (int) ((long long) q * nB / nS) + 1 : 0; pos = q + min(before, nB); }
-        else if (mode == 2) pos = q;
+        const int before = nS > 0 ? (int) ((long long) q * nB / nS) + 1 : 0;
+        const int pos = q + min(before, nB);
         desc[pos] = make_uint4((uint32_t) e, (uint32_t) cb, (uint32_t) (bounds[e] + jt * BN), (uint32_t) (c - jt * BN));
     }
     for (int p = nB + nS + t; p < n_max; p += 1024) desc[p] = make_uint4(0, 0, 0, 0);
@@ -3553,7 +3408,6 @@ mmb_g2_gemv_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__
     }
 }
 
-static bool mmb_down_r2() { static const bool v = getenv("MMB_DOWN_R2") ? atoi(getenv("MMB_DOWN_R2")) != 0 : MMB_DOWN_R2_DEFAULT; return v; }
 static bool mmb_r2_eligible(const ggml_tensor * w) {
     return w && w->type == GGML_TYPE_Q5_1 && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data && w->buffer &&
            ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_is_contiguous(w) && w->ne[3] == 1 &&
@@ -3565,11 +3419,7 @@ static bool mmb_r2_eligible(const ggml_tensor * w) {
 static std::mutex g_r2_mutex;
 static std::map<const char *, size_t> g_r2_packed;
 static std::set<const char *> g_r2_failed;
-#ifndef MMB_GLU_R2_DEFAULT
-#define MMB_GLU_R2_DEFAULT 1
-#endif
-static bool mmb_glu_r2() { static const bool v = getenv("MMB_GLU_R2") ? atoi(getenv("MMB_GLU_R2")) != 0 : MMB_GLU_R2_DEFAULT; return v; }
-// MMB_GLU_R2 layout record (same lifetime rules as g_r2_packed): Q4_K gate/up expert tensors rewritten in place to G2
+// GLU R2 layout record (same lifetime rules as g_r2_packed): Q4_K gate/up expert tensors rewritten in place to G2
 static std::map<const char *, size_t> g_g2_packed;
 static std::set<const char *> g_g2_failed;
 static bool mmb_g2_eligible(const ggml_tensor * w) {
@@ -3594,7 +3444,7 @@ bool ggml_cuda_mmb_g2_packed(const ggml_tensor * w) {
 }
 
 void ggml_cuda_mmb_r2_forget(const void * base, const size_t size) {
-    mmb_dq_forget(base, size);   // MMB_DENSE_R2 records share the buffer hooks
+    mmb_dq_forget(base, size);   // dense R2 records share the buffer hooks
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     const char * lo = (const char *) base, * hi = lo + size;
     for (auto * packed : {&g_r2_packed, &g_g2_packed}) {
@@ -3622,7 +3472,7 @@ bool ggml_cuda_mmb_r2_overlaps(const void * base, const size_t size) {
 // the whole tensor first (a tensor with any d*2^19 outside f16 stays Q5_1), then experts are copied in chunks to a
 // small temporary buffer and repacked from it back into the tensor's own memory.
 void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!mmb_down_r2() || !mmb_enabled(ctx) || !mmb_r2_eligible(w)) return;
+    if (!mmb_enabled(ctx) || !mmb_r2_eligible(w)) return;
     const char * key = (const char *) w->data;
     {
         std::lock_guard<std::mutex> lock(g_r2_mutex);
@@ -3639,7 +3489,7 @@ void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_t
     CUDA_CHECK(cudaMemcpyAsync(&hbad, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (hbad) {
-        GGML_LOG_WARN("MMB_DOWN_R2: %s has a Q5_1 scale outside the f16 d*2^19 range; it keeps the Q5_1 layout\n", w->name);
+        GGML_LOG_WARN("mmb_down_r2: %s has a Q5_1 scale outside the f16 d*2^19 range; it keeps the Q5_1 layout\n", w->name);
         std::lock_guard<std::mutex> lock(g_r2_mutex);
         g_r2_failed.insert(key);
         return;
@@ -3659,7 +3509,6 @@ void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_t
     }
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     g_r2_packed[key] = bytes;
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_down_r2: repacked in place %s (%.1f MB, %zu tensors)\n", w->name, bytes / 1048576.0, g_r2_packed.size());
 }
 
 // R2 routed down (MMB path). Returns false (nothing launched) only for a tensor that is not repacked.
@@ -3695,13 +3544,12 @@ void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_r2_gemv_kernel<640><<<grid, 128, 0, ctx.stream()>>>((const uint8_t *) src0->data, (size_t) src0->nb[2], (const char *) src1->data,
         src1->nb[1], src1->nb[2], (int) src1->ne[1], (const char *) ids->data, ids->nb[0], ids->nb[1], (char *) dst->data, dst->nb[1], dst->nb[2], M, E);
     CUDA_CHECK(cudaGetLastError());
-    if (ggml_cuda_mmb_shape_log() == 2) fprintf(stderr, "mmb_shape: routed-down-r2-gemv M=%d E=%d T=%d n_used=%d\n", M, E, T, n_used);
 }
 
-// MMB_GLU_R2: in-place repack of a routed Q4_K gate/up pair [K, M, E] to the G2 layout (same size, no extra memory
+// GLU R2: in-place repack of a routed Q4_K gate/up pair [K, M, E] to the G2 layout (same size, no extra memory
 // beyond a 16-expert temporary). Both tensors pass the scale check or neither is repacked.
 void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw) {
-    if (!mmb_glu_r2() || !mmb_enabled(ctx)) return;
+    if (!mmb_enabled(ctx)) return;
     if (!mmb_g2_eligible(gw) || !mmb_g2_eligible(uw) || gw->data == uw->data || !ggml_are_same_shape(gw, uw) || gw->nb[2] != uw->nb[2]) return;
     {
         std::lock_guard<std::mutex> lock(g_r2_mutex);
@@ -3723,8 +3571,7 @@ void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaMemcpyAsync(&hbad, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (hbad) {
-        GGML_LOG_WARN("MMB_GLU_R2: %s / %s have a Q4_K sub-block scale d*sc >= 0.25; they keep the Q4_K layout\n", gw->name, uw->name);
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_glu_r2: %s / %s keep the Q4_K layout (scale check)\n", gw->name, uw->name);
+        GGML_LOG_WARN("mmb_glu_r2: %s / %s have a Q4_K sub-block scale d*sc >= 0.25; they keep the Q4_K layout\n", gw->name, uw->name);
         std::lock_guard<std::mutex> lock(g_r2_mutex);
         g_g2_failed.insert((const char *) gw->data); g_g2_failed.insert((const char *) uw->data);
         return;
@@ -3747,7 +3594,6 @@ void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     g_g2_packed[(const char *) gw->data] = bytes;
     g_g2_packed[(const char *) uw->data] = bytes;
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_glu_r2: repacked in place %s + %s (2 x %.1f MB, %zu tensors)\n", gw->name, uw->name, bytes / 1048576.0, g_g2_packed.size());
 }
 
 // G2 routed gate/up + SwiGLU (MMB path): one launch over the device-built tile list, any T.
@@ -3755,12 +3601,11 @@ static void mmb_glu_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
         uint16_t * Dh, float * D, const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * bounds, const int E, const int M,
         const int K, const int n_rows, cudaStream_t stream) {
     GGML_ASSERT(K % 256 == 0 && M % G2_BM == 0 && E <= 1024 && (Dh || D));
-    static const int mode = getenv("MMB_GLU_R2_ORDER") ? atoi(getenv("MMB_GLU_R2_ORDER")) : 0;   // 0 interleaved, 1 full first, 2 partial first
     constexpr int TN = 4;
     const int BN = 16 * TN, n_cb = M / G2_BM;
     const int n_max = n_cb * (n_rows / BN + E + 1);
     ggml_cuda_pool_alloc<uint4> desc(ctx.pool(), n_max);
-    mmb_g2_build_desc<<<1, 1024, 0, stream>>>(bounds, desc.get(), E, n_cb, BN, n_max, mode);
+    mmb_g2_build_desc<<<1, 1024, 0, stream>>>(bounds, desc.get(), E, n_cb, BN, n_max);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data;
     const size_t eb = gw->nb[2];
     auto launch = [&](auto kt) {
@@ -3770,7 +3615,7 @@ static void mmb_glu_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (K == 2560) launch(std::integral_constant<int, 2560>{});
     else if (K == 2048) launch(std::integral_constant<int, 2048>{});
     else if (K == 4096) launch(std::integral_constant<int, 4096>{});
-    else GGML_ABORT("MMB_GLU_R2: unsupported K=%d", K);
+    else GGML_ABORT("mmb_glu_r2: unsupported K=%d", K);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3791,7 +3636,6 @@ static void mmb_g2_gemv_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
         (const char *) src1->data, src1->nb[1], src1->nb[2], (int) src1->ne[1], (const char *) ids->data, ids->nb[0], ids->nb[1],
         (char *) dst->data, dst->nb[1], dst->nb[2], M, E, K);
     CUDA_CHECK(cudaGetLastError());
-    if (ggml_cuda_mmb_shape_log() == 2) fprintf(stderr, "mmb_shape: routed-glu-r2-gemv glu=%d M=%d E=%d T=%d n_used=%d\n", uw != nullptr, M, E, T, n_used);
 }
 
 void ggml_cuda_mul_mat_id_g2_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
@@ -3815,7 +3659,7 @@ void ggml_cuda_mul_mat_id_g2_gemv_glu(ggml_backend_cuda_context & ctx, const ggm
 }
 
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    const bool xp = mmb_xjoin() && g_side_pending[ctx.device];
+    const bool xp = g_side_pending[ctx.device];
     cudaStream_t stream = xp ? ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1) : ctx.stream();   // prep stream
     const int K = (int) src0->ne[0], M = (int) src0->ne[1], E = (int) src0->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
@@ -3827,7 +3671,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     const mmb_ids_record & rec = g_ids_rec[ctx.device];
-    const bool reuse = mmb_ids_reuse() && !xp && rec.ids == ids->data && rec.T == T && rec.n_used == n_used && rec.E == E &&
+    const bool reuse = !xp && rec.ids == ids->data && rec.T == T && rec.n_used == n_used && rec.E == E &&
         rec.si1 == si1 && ne11 == n_used && sis1 == n_used && ggml_cuda_mmb_r2_packed(src0);
     ggml_cuda_pool_alloc<int32_t> ids_src1_a(ctx.pool()), ids_dst_a(ctx.pool()), bounds_a(ctx.pool());
     const int32_t * ids_src1_p, * ids_dst_p, * bounds_p;
@@ -3842,8 +3686,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
         ids_src1_p = ids_src1_a.get(); ids_dst_p = ids_dst_a.get(); bounds_p = bounds_a.get();
     }
-    {   // MMB_DOWN_R2: Q5_1 down experts with a repacked shadow -> one interleaved launch (no big/small tier split)
-        uint16_t * Dh_r2 = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
+    {   // down R2: Q5_1 down experts with a repacked shadow -> one interleaved launch (no big/small tier split)
+        uint16_t * Dh_r2 = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
         if (mmb_down_r2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp)) {
             if (g_side_pending[ctx.device]) {   // the pending side (small GLU tier) must be joined before the reduction
                 g_side_pending[ctx.device] = false;
@@ -3853,7 +3697,6 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
                 CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ej[ctx.device], 0));
             }
             mmb_hold_release();
-            if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: routed-down-r2 K=%d M=%d E=%d T=%d n_used=%d\n", K, M, E, T, n_used);
             return;
         }
     }
@@ -3874,24 +3717,14 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int BN_rt = (RT == 2 || RT == 3) ? 64 : BN;
     // RT 1/2/3 launch only the big+small tiers, so the desc must be 2-tier: mmb_build_desc3's mid tier would
     // hold experts no launched kernel consumes, silently dropping them from the down projection (empty output).
-    // Only the RT=0 else-branch launches the mid tier. MMB_DOWN_MID=1 restores the old (broken at RT!=0) behavior.
-    static const bool dmid_env = getenv("MMB_DOWN_MID") ? atoi(getenv("MMB_DOWN_MID")) != 0 : true;
-    const bool dmid = dmid_env && RT != 1 && RT != 2 && RT != 3;
-    // gluk single-matrix (down) mode: one weight per expert, plain output; desc2 at
-    // THRESH=32 / BN_rt=64 (RT=2 semantics, matches the RT=2 legacy tile width).
-    static const bool down_gk = getenv("MMB_DOWN_GK") ? atoi(getenv("MMB_DOWN_GK")) != 0 : false;
-    const bool glk_down = down_gk && T >= 128;
+    // Only the RT=0 else-branch launches the mid tier.
+    const bool dmid = RT != 1 && RT != 2 && RT != 3;
     const int nbig_max   = n_rows / 64 + E + 2;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), dmid ? nbig_max : n_rows / BN_rt + E + 1);
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
-    // gluk-down builds no mid desc: leave desc_mid empty (pool garbage = faults, see the glu caller comment)
-    ggml_cuda_pool_alloc<uint32_t> desc_mid(ctx.pool(), glk_down || !dmid ? 1 : E + 1);
-    // MMB_DOWN_GK_BN: big-tier token tile of the gluk down kernel (64 or 128); the desc is built at the same width
-    static const int dgk_bn = getenv("MMB_DOWN_GK_BN") ? atoi(getenv("MMB_DOWN_GK_BN")) : 64;
-    if (glk_down)
-        mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds_p, desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, /*BN_rt=*/dgk_bn == 128 ? 128 : 64, BN_SMALL, THRESH);
-    else if (dmid)
+    ggml_cuda_pool_alloc<uint32_t> desc_mid(ctx.pool(), !dmid ? 1 : E + 1);
+    if (dmid)
         mmb_build_desc3<<<1, 1024, 0, stream>>>(bounds_p, desc_small.get(), desc_mid.get(), desc_big.get(), E, nsmall_max, E + 1, nbig_max, BN_rt, BN_SMALL);
     else
         mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds_p, desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN_rt, BN_SMALL, THRESH);
@@ -3904,45 +3737,13 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         stream = ctx.stream();
     }
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
-    uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
+    uint16_t * Dh = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
     // small tile mapped WAVES_M=8 x WAVES_N=1 (<128,32,16,32>), not 4 x 2 (<128,32,32,16>): a <=16-token tile (the
     // common small-expert case) leaves 4 waves WMMA-idle under the old shape. Bit-identical: same (m,n), same K order.
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        // mmb_dispatch_quant tags Q8_0 as the dense tag 1; the gluk kernel keys on 32+t.
-        // mmb_row_bytes<1> == mmb_row_bytes<32+Q8_0> == (k/32)*34, so the remap is layout-neutral.
-        constexpr int WGT = WT == 1 ? 32 + GGML_TYPE_Q8_0 : WT;
-        if (glk_down && (WGT == 32 + GGML_TYPE_Q5_1 || WGT == 32 + GGML_TYPE_Q8_0)) {
-            // !kPair: kRows = BM = 128 rows per block -> grid.x must be (M+127)/128.
-            const dim3 gb((M + 127) / 128, nbig_max);   // desc2 tiles are BN_rt=64 tokens wide
-            mmb_tier_fork fork(ctx, 2);
-            if (dgk_bn == 128)
-                mmb_routed_gluk_kernel<WGT, 128, false><<<gb, MMB_NT, 0, stream>>>(
-                    W, /*w_u = W (aliased, unused)*/ W, xhp, D, Dh, store_f32,
-                    ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), eb, (size_t) M, (size_t) K);
-            else
-                mmb_routed_gluk_kernel<WGT, 64, false><<<gb, MMB_NT, 0, stream>>>(
-                    W, /*w_u = W (aliased, unused)*/ W, xhp, D, Dh, store_f32,
-                    ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), eb, (size_t) M, (size_t) K);
-            // MMB_DOWN_GK_MIX: gluk big + legacy small (mode 1). The gluk BN=32 small tier measures
-            // ~65 ms/pass vs legacy 2.4 ms (ilot диагноз from the dgk trace) - the big tier is par.
-            // mipodes 0=gluk both, 1=gluk big only (legacy small on desc_small), 2=legacy both.
-            static const int dmix = getenv("MMB_DOWN_GK_MIX") ? atoi(getenv("MMB_DOWN_GK_MIX")) : 1;
-            if (dmix != 1) {
-                const dim3 gs((M + 127) / 128, nsmall_max);
-                mmb_routed_gluk_kernel<WGT, 32, false><<<gs, MMB_NT, 0, fork.small()>>>(
-                    W, W, xhp, D, Dh, store_f32,
-                    ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), eb, (size_t) M, (size_t) K);
-            } else {
-                const dim3 gs((M + 127) / 128, nsmall_max);
-                mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gs, MMB_NT, 0, fork.small()>>>(
-                    W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), M, K);
-            }
-            CUDA_CHECK(cudaGetLastError());
-            return;                                     // legacy RT/dmid launches must not also run
-        }
     if (RT == 1) {
         const dim3 gb((M + 63) / 64, nbig_max), gs((M + 63) / 64, nsmall_max);
         mmb_routed_kernel<64, BN, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), M, K);
@@ -3970,7 +3771,6 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ej[ctx.device], 0));
     }
     mmb_hold_release();
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: routed-down type=%d K=%d M=%d E=%d T=%d n_used=%d\n", src0->type, K, M, E, T, n_used);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3988,19 +3788,17 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
 
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
     mmb_hold_release();   // stale holds (should be empty)
-    mmb_hold_guard hold_guard;
     cudaStream_t stream = ctx.stream();
     const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
     static const int BN_sel = getenv("MMB_BN") ? atoi(getenv("MMB_BN")) : 128;
     // gluk mode: gufo-style raw-code kPair GEMM for the routed GLU; desc built
-    // at BN=48 so the [32..) experts map to gufo-width token tiles.
+    // at BN=128 token tiles for the big tier.
     // Gated at T>=128: it wins the prefill (pp2048 +40) but costs decode-width
     // rows (T=1..8) through tile padding (tg128 -0.7).
-    static const bool gluk_on = getenv("MMB_GLU_GK") ? atoi(getenv("MMB_GLU_GK")) != 0 : true;
-    static int BN_gluk = getenv("MMB_GLU_BN") ? atoi(getenv("MMB_GLU_BN")) : 128;
-    const bool glk_this = gluk_on && T >= 128;
+    constexpr int BN_gluk = 128;
+    const bool glk_this = T >= 128;
     const int BN_rt = glk_this ? BN_gluk : BN_sel;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     auto & ids_src1 = mmb_hold_alloc<int32_t>(ctx, n_rows);
@@ -4013,14 +3811,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    if (mmb_ids_reuse() && mmb_xjoin() && ne11 == 1 && sis1 == 1) {
+    if (ne11 == 1 && sis1 == 1) {
         g_ids_rec[ctx.device] = mmb_ids_record{ids->data, T, n_used, E, si1, ids_dst.get(), bounds.get()};
     }
-    if (ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw)) {   // MMB_GLU_R2: one launch, no tier split / side stream
+    if (ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw)) {   // GLU R2: one launch, no tier split / side stream
         uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
         const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
         mmb_glu_r2_launch(ctx, gw, uw, xhp, Dh, store_f32 ? (float *) glu->data : nullptr, ids_src1.get(), ids_dst.get(), bounds.get(), E, M, K, n_rows, stream);
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: routed-glu-r2 K=%d M=%d E=%d T=%d n_used=%d\n", K, M, E, T, n_used);
         return;
     }
     constexpr int BN_SMALL = 32;
@@ -4029,34 +3826,16 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // +3.6% d0, +4.7% d12k, +4.0% d32k, +1.9% d64k vs THRESH=128; byte-identical
     // output, test-backend-ops 29643/29643. Env MMB_THRESH overrides.
     static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
-    if (ggml_cuda_mmb_shape_log()) {
-        // MMB_SHAPE_LOG=2: every call (synchronizes the stream - profiling only)
-        static bool once = false;
-        if (!once || ggml_cuda_mmb_shape_log() == 2) { once = true;
-            std::vector<int32_t> b(E + 1);
-            CUDA_CHECK(cudaMemcpyAsync(b.data(), bounds.get(), (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));   // the ctx stream is non-blocking: a null-stream copy reads stale bounds
-            int hist[8] = {0}, zero = 0, rows_big = 0;
-            for (int e = 0; e < E; ++e) { const int c = b[e + 1] - b[e];
-                zero += c == 0; if (c >= THRESH) rows_big += c;
-                hist[c < 32 ? 0 : c < 64 ? 1 : c < 128 ? 2 : c < 256 ? 3 : c < 512 ? 4 : c < 1024 ? 5 : 6]++; }
-            fprintf(stderr, "mmb_experts: E=%d rows=%d zero=%d rows>=thresh=%d  cnt<32:%d 32-63:%d 64-127:%d 128-255:%d 256-511:%d 512-1023:%d >=1024:%d\n",
-                E, n_rows, zero, rows_big, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6]);
-        }
-    }
-    static const bool gmid = getenv("MMB_GLU_MID") ? atoi(getenv("MMB_GLU_MID")) != 0 : true;
-    const int nbig_cap   = glk_this ? n_rows / BN_gluk + E + 2 : (gmid ? n_rows / 64 + E + 2 : n_rows / BN_rt + E + 1);
+    const int nbig_cap   = glk_this ? n_rows / BN_gluk + E + 2 : n_rows / 64 + E + 2;
     const int nbig_max   = nbig_cap;   // legacy name used by the non-gluk branches
     const int nsmall_max = E + 1;
     auto & desc_big = mmb_hold_alloc<uint32_t>(ctx, nbig_cap);
     auto & desc_small = mmb_hold_alloc<uint32_t>(ctx, nsmall_max);
-    auto & desc_mid = mmb_hold_alloc<uint32_t>(ctx, glk_this || !gmid ? 1 : E + 1);
+    auto & desc_mid = mmb_hold_alloc<uint32_t>(ctx, glk_this ? 1 : E + 1);
     if (glk_this)
         mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_cap, nsmall_max, BN_rt, BN_SMALL, THRESH);
-    else if (gmid)
-        mmb_build_desc3<<<1, 1024, 0, stream>>>(bounds.get(), desc_small.get(), desc_mid.get(), desc_big.get(), E, nsmall_max, E + 1, nbig_cap, BN_rt, BN_SMALL);
     else
-        mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_cap, nsmall_max, BN_rt, BN_SMALL, THRESH);
+        mmb_build_desc3<<<1, 1024, 0, stream>>>(bounds.get(), desc_small.get(), desc_mid.get(), desc_big.get(), E, nsmall_max, E + 1, nbig_cap, BN_rt, BN_SMALL);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
@@ -4074,24 +3853,14 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
         if (glk_this) {
-            static const int glk_mode = getenv("MMB_GLU_GK_MODE") ? atoi(getenv("MMB_GLU_GK_MODE")) : 3;
-            auto gluk_big = [&](auto bn_tag) {
-                constexpr int BN_ = decltype(bn_tag)::value;
-                const dim3 gb((M + 63) / 64, nbig_cap);
-                mmb_routed_gluk_kernel<WT, BN_><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
-            };
-            mmb_tier_fork fork(ctx, mmb_xjoin() ? 1 : 0);
-            if (glk_mode & 2) {
+            mmb_tier_fork fork(ctx, 1);
+            {
                 const dim3 gs((M + 63) / 64, nsmall_max);
                 mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
             }
-            if (glk_mode & 1) {
-                if      (BN_gluk == 32) gluk_big(std::integral_constant<int, 32>{});
-                else if (BN_gluk == 64) gluk_big(std::integral_constant<int, 64>{});
-                else if (BN_gluk == 80) gluk_big(std::integral_constant<int, 80>{});
-                else if (BN_gluk == 96) gluk_big(std::integral_constant<int, 96>{});
-                else if (BN_gluk == 128) gluk_big(std::integral_constant<int, 128>{});
-                else                    gluk_big(std::integral_constant<int, 48>{});
+            {
+                const dim3 gb((M + 63) / 64, nbig_cap);
+                mmb_routed_gluk_kernel<WT, BN_gluk><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
             }
             CUDA_CHECK(cudaGetLastError());
             return;
@@ -4120,7 +3889,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             else if (BN_sel == 64) launch_big(std::integral_constant<int,64>{});
             else               launch_big(std::integral_constant<int,128>{});
         }
-        if (gmid && !glk_this) mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<dim3((M + 63) / 64, E + 1), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_mid.get(), M, K);
+        if (!glk_this) mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<dim3((M + 63) / 64, E + 1), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_mid.get(), M, K);
         if (glk_this) return;
         if (BM_SMALL == 128) {
             const dim3 gsmall((M + 127) / 128, nsmall_max);
@@ -4138,67 +3907,12 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             }
         }
     });
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: routed-glu type=%d K=%d M=%d E=%d T=%d n_used=%d\n", gw->type, K, M, E, T, n_used);
     CUDA_CHECK(cudaGetLastError());
-}
-
-// bf16 weights -> per-row Q8_0 (d f16 + 32 int8 codes, ggml block_q8_0 layout, 34 B per K-block).
-// one thread = one (row, k-block): read 32 bf16, absmax/127 scale, round-to-nearest codes.
-__global__ void mmb_quantize_q8_dense_kernel(const uint16_t * __restrict__ w, uint8_t * __restrict__ out, const int K, const int M) {
-    const int nkb = K / 32, tid = threadIdx.x, lane = threadIdx.x & 31, warpi = (blockDim.x & -1), x = 0;
-    (void) x; (void) warpi;
-    const int m = blockIdx.x;
-    if (m >= M) return;
-    for (int kb = tid; kb < nkb; kb += blockDim.x) {
-        const uint16_t * r = w + (size_t) m * K + (size_t) kb * 32;
-        float vals[32]; float amax = 0.0f;
-#pragma unroll 8
-        for (int i = 0; i < 32; ++i) { const float v = __uint_as_float(((uint32_t) r[i]) << 16); vals[i] = v; amax = fmaxf(amax, fabsf(v)); }
-        const float d = fmaxf(amax, 1e-30f) / 127.0f;
-        const uint16_t dfc = mmb_f2bf(d);
-        uint8_t * o = out + (size_t) m * (nkb * 34) + kb * 34;
-        *(uint16_t *) o = dfc;
-        const float dil = mmb_h2f(dfc);     // same low-precision scale the GEMM will use
-#pragma unroll 8
-        for (int i = 0; i < 32; ++i) {
-            int q = (int) lrintf(vals[i] / dil);
-            q = q < -127 ? -127 : (q > 127 ? 127 : q);
-            o[2 + i] = (uint8_t) q;
-        }
-    }
-    (void) lane;
-}
-
-// Q8_0 shadow of a dense bf16 weight (per-row 34-byte blocks) for the W8A8 dense route.
-static const uint8_t * mmb_q8_shadow_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    auto it = mmb_state(ctx).q8shadow.find(w->data);
-    return it == mmb_state(ctx).q8shadow.end() ? nullptr : it->second;
-}
-static void mmb_q8_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!w || w->type != GGML_TYPE_BF16 || w->op != GGML_OP_NONE || !w->data || !w->buffer || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w)) return;
-    const int K = (int) w->ne[0], M = (int) w->ne[1], nkb = K / 32;
-    const size_t bytes = (size_t) M * nkb * 34;
-    if (mmb_state(ctx).q8shadow_bytes + bytes > mmb_shadow_cap()) return;
-    uint8_t * buf = nullptr;
-    if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_Q8SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-    mmb_quantize_q8_dense_kernel<<<M, 128, 0, ctx.stream()>>>((const uint16_t *) w->data, buf, K, M);
-    CUDA_CHECK(cudaGetLastError());
-    mmb_state(ctx).q8shadow[w->data] = buf; mmb_state(ctx).q8shadow_bytes += bytes;
 }
 
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
-// BF16 dense (the GDN in/out projections and the shared gate/up) -> per-row Q8_0 int8 shadow for the
-// dense-w8a8 route; prepared outside stream capture like the f16 shadows. Idempotent via q8shadow.
-static void mmb_q8_dense_shadow_hook(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!w || w->type != GGML_TYPE_BF16 || w->op != GGML_OP_NONE || !w->data || !w->buffer || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w)) return;
-    if (w->ne[0] % 128 != 0 || w->ne[1] % 64 != 0 || w->ne[0] < 2560 || w->ne[1] < 2560) return;
-    if (mmb_state(ctx).q8shadow.count(w->data)) return;
-    mmb_q8_shadow_prepare(ctx, w);
-}
-
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
-    mmb_q8_dense_shadow_hook(ctx, w);
     if (mmb_is_f16hi_f32(w)) {
         if (mmb_state(ctx).shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1];
@@ -4255,11 +3969,11 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_state(ctx).shadow_bytes += bytes;
 }
 
-// MMB_DENSE_R2: in-place repack of a dense Q8_0 weight to the tile layout of mmb_tq8_dense_kernel. Each 128-row tile
+// Dense R2: in-place repack of a dense Q8_0 weight to the tile layout of mmb_tq8_dense_kernel. Each 128-row tile
 // occupies the same bytes in both layouts, so tiles are staged through a small temporary buffer and rewritten in
 // place. Only weights whose every reader in the graph is a MUL_MAT src0 are passed here (ggml-cuda.cu graph_optimize).
 void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!mmb_dense_r2_on() || !mmb_enabled(ctx)) return;
+    if (!mmb_enabled(ctx)) return;
     if (!w || w->type != GGML_TYPE_Q8_0 || w->op != GGML_OP_NONE || w->view_src != nullptr || !w->data || !w->buffer ||
             ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w) ||
             w->ne[2] != 1 || w->ne[3] != 1 || !mmb_tq8_shape(w->ne[1], w->ne[0])) return;
@@ -4285,5 +3999,4 @@ void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_
     std::lock_guard<std::mutex> lock(g_dq_mutex);
     g_dq_packed[key] = bytes;
     g_dq_count.store((int) g_dq_packed.size());
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_dense_r2: repacked in place %s K=%d M=%d (%.1f MB, %zu tensors)\n", w->name, K, M, bytes / 1048576.0, g_dq_packed.size());
 }

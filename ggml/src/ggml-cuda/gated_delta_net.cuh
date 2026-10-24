@@ -21,7 +21,7 @@ void ggml_cuda_gdn_set_qk_norm(const ggml_tensor * gdn, const ggml_tensor * q_ra
 // z_bf16: z holds BF16 (the z GEMM stored only the BF16 copy, see ggml_cuda_gdn_z16_ok)
 void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps,
         bool out16_f16 = false, bool z_bf16 = false);
-// graph-time predicate: the z GEMM feeding the gated output norm of this GDN node may store BF16 only (GGML_GDN_Z16)
+// graph-time predicate: the z GEMM feeding the gated output norm of this GDN node may store BF16 only
 bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn);
 // chunked prefill: the causal conv + SiLU producing q/k/v is computed by the chunk kernels from the raw conv input
 // x [T, C] (row stride C floats), history st [C, 3] and taps cw [C, 4]; qc/kc/vc = channel of element 0 of each view

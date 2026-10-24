@@ -505,174 +505,6 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
     }
 }
 
-// One block output element from the routed experts: the same expressions and order as moe_weighted_reduction_sgma_v4
-// (sum starts at (e0*scale0)*w0, then += (e*scale)*w per expert, then the shared-expert merge with the explicitly
-// rounded mul/add), so the fused combine is bit-identical to the reduction kernel.
-template <bool EIN16>
-static __device__ __forceinline__ float hc_moe_sum(const void * __restrict__ experts, const float * __restrict__ expert_scale,
-        const float * __restrict__ weights, const float * __restrict__ shexp, const float g,
-        const int64_t t, const int n_used, const int64_t n_embd, const int64_t i) {
-    const uint64_t first_row = (uint64_t) t * n_used;
-    const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    const float w0 = weights[first_row];
-    float sum;
-    if constexpr (EIN16) sum = (hc_bf2f32(((const uint16_t *) experts)[first_row * n_embd + i]) * first_scale) * w0;
-    else                 sum = (((const float *) experts)[first_row * n_embd + i] * first_scale) * w0;
-    for (int expert = 1; expert < n_used; ++expert) {
-        const uint64_t row = first_row + expert;
-        const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
-        const float w = weights[row];
-        if constexpr (EIN16) sum += (hc_bf2f32(((const uint16_t *) experts)[row * n_embd + i]) * scale) * w;
-        else                 sum += (((const float *) experts)[row * n_embd + i] * scale) * w;
-    }
-    return hc_add_rn(sum, hc_mul_rn(shexp[t * n_embd + i], g));
-}
-
-// Fused MoE reduction + HC combine + grouped norm + inject: the block output is formed in registers from the
-// experts (hc_moe_sum) instead of being read from memory, so the reduction and its sigmoid/mul/add tail are
-// skipped and block_out never round-trips memory. All combine expressions (hc_add_rn/hc_mul_rn, the per-thread
-// partial order, block_reduce, rsqrtf, the gamma multiply and the inject accumulation) are the row function's.
-template <bool EIN16>
-static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_moe_f32_b256(
-        const float * __restrict__ inject, const float * __restrict__ residual,
-        const void * __restrict__ experts, const float * __restrict__ expert_scale,
-        const float * __restrict__ moe_weights, const float * __restrict__ moe_gate, const float * __restrict__ shexp,
-        const float * __restrict__ gamma,
-        float * __restrict__ out_res, float * __restrict__ out_xn, uint16_t * __restrict__ out_xn_bf16, const bool store_xn_f32,
-        const uint16_t * __restrict__ res_in_bf16, uint16_t * __restrict__ res_out_bf16,
-        const int n_embd, const int n_used,
-        const float s1, const float b1, const float s2, const float b2, const float eps,
-        const float * __restrict__ w_inject, float * __restrict__ out_inj,
-        uint8_t * __restrict__ out_xn_q8, float * __restrict__ out_xn_scale, const int q8_blocks, const int n_tokens) {
-    __shared__ float s_sum[HC_INJ_HC][32];
-    __shared__ float s_inj[HC_INJ_HC][HC_CN_BLOCK2 / WARP_SIZE];
-    const int t = blockIdx.x;
-    const int tid = threadIdx.x;
-    const float g = 1.0f / (1.0f + expf(-moe_gate[t]));
-    float w[HC_INJ_HC];
-#pragma unroll
-    for (int c = 0; c < HC_INJ_HC; ++c) {
-        const float x1 = s1 * inject[(int64_t) t * HC_INJ_HC + c] + b1;
-        const float x2 = hc_sigmoid(x1);
-        w[c] = s2 * x2 + b2;
-    }
-    constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
-    float xs[HC_INJ_HC][2 * KP];
-    float tmp[HC_INJ_HC];
-#pragma unroll
-    for (int c = 0; c < HC_INJ_HC; ++c) tmp[c] = 0.0f;
-#pragma unroll
-    for (int k = 0; k < KP; ++k) {
-        const int col = (tid + k * HC_CN_BLOCK2) * 2;
-        float m0 = 0.0f, m1 = 0.0f;
-        if (col + 1 < n_embd) {
-            m0 = hc_moe_sum<EIN16>(experts, expert_scale, moe_weights, shexp, g, t, n_used, n_embd, col);
-            m1 = hc_moe_sum<EIN16>(experts, expert_scale, moe_weights, shexp, g, t, n_used, n_embd, col + 1);
-        } else if (col < n_embd) {
-            m0 = hc_moe_sum<EIN16>(experts, expert_scale, moe_weights, shexp, g, t, n_used, n_embd, col);
-        }
-#pragma unroll
-        for (int c = 0; c < HC_INJ_HC; ++c) {
-            const int64_t row = (int64_t) t * HC_INJ_HC + c;
-            const float *    res   = residual + row * n_embd;
-            const uint16_t * res16 = res_in_bf16  ? res_in_bf16  + row * n_embd : nullptr;
-            float *          dst   = out_res      + row * n_embd;
-            uint16_t *       dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
-            xs[c][2 * k] = 0.0f; xs[c][2 * k + 1] = 0.0f;
-            if (col + 1 < n_embd) {
-                float r0, r1;
-                if (res16) { const uint32_t u = *(const uint32_t *)(res16 + col); r0 = hc_lo(u); r1 = hc_hi(u); }
-                else       { const float2   v = *(const float2 *)(res + col);     r0 = v.x;      r1 = v.y; }
-                const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w[c]));
-                const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w[c]));
-                if (dst16) *(uint32_t *)(dst16 + col) = hc_pack2(a0, a1);
-                else       *(float2 *)(dst + col)     = make_float2(a0, a1);
-                xs[c][2 * k] = a0; xs[c][2 * k + 1] = a1;
-                tmp[c] += a0 * a0 + a1 * a1;
-            } else if (col < n_embd) {
-                const float r0 = res16 ? hc_bf2f32(res16[col]) : res[col];
-                const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w[c]));
-                if (dst16) dst16[col] = hc_f2bf32(a0); else dst[col] = a0;
-                xs[c][2 * k] = a0;
-                tmp[c] += a0 * a0;
-            }
-        }
-    }
-#pragma unroll
-    for (int c = 0; c < HC_INJ_HC; ++c) {
-        tmp[c] = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK2>(tmp[c], s_sum[c]);
-    }
-    float scale[HC_INJ_HC];
-#pragma unroll
-    for (int c = 0; c < HC_INJ_HC; ++c) {
-        const float mean = tmp[c] / n_embd;
-        scale[c] = rsqrtf(mean + eps);
-    }
-    float inj[HC_INJ_HC] = {};
-#pragma unroll
-    for (int c = 0; c < HC_INJ_HC; ++c) {
-        const int64_t row = (int64_t) t * HC_INJ_HC + c;
-        const float * gp = gamma  + (int64_t) c * n_embd;
-        float *       xn = out_xn + row * n_embd;
-        uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
-#pragma unroll
-        for (int k = 0; k < KP; ++k) {
-            const int col = (tid + k * HC_CN_BLOCK2) * 2;
-            if (col + 1 < n_embd) {
-                const float2 gv = *(const float2 *)(gp + col);
-                const float v0 = scale[c] * xs[c][2 * k] * gv.x, v1 = scale[c] * xs[c][2 * k + 1] * gv.y;
-                if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
-                if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
-                if (out_xn_q8) {
-                    float amax = fmaxf(fabsf(v0), fabsf(v1));
-#pragma unroll
-                    for (int off = 1; off < 16; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
-                    const float d = amax / 127.0f;
-                    const float id = d > 0.0f ? 1.0f / d : 0.0f;
-                    const int j = col >> 1;
-                    const int kb = c * q8_blocks + (j >> 4);
-                    uint8_t * q8p = out_xn_q8 + ((size_t) kb * n_tokens + t) * 32 + ((j & 15) << 1);
-                    q8p[0] = (uint8_t)(int8_t) roundf(v0 * id);
-                    q8p[1] = (uint8_t)(int8_t) roundf(v1 * id);
-                    if ((j & 15) == 0) out_xn_scale[(size_t) kb * n_tokens + t] = d;
-                }
-                if (w_inject) {
-#pragma unroll
-                    for (int r = 0; r < HC_INJ_HC; ++r) {
-                        const float2 wv = *(const float2 *)(w_inject + (int64_t) r * HC_INJ_HC * n_embd + (int64_t) c * n_embd + col);
-                        inj[r] += wv.x * v0 + wv.y * v1;
-                    }
-                }
-            } else if (col < n_embd) {
-                const float v0 = scale[c] * xs[c][2 * k] * gp[col];
-                if (store_xn_f32) xn[col] = v0;
-                if (xh) xh[col] = hc_f2bf32(v0);
-                if (w_inject) {
-#pragma unroll
-                    for (int r = 0; r < HC_INJ_HC; ++r) {
-                        inj[r] += w_inject[(int64_t) r * HC_INJ_HC * n_embd + (int64_t) c * n_embd + col] * v0;
-                    }
-                }
-            }
-        }
-    }
-    if (out_inj) {
-        const int warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
-#pragma unroll
-        for (int r = 0; r < HC_INJ_HC; ++r) {
-            const float v = warp_reduce_sum(inj[r]);
-            if (lane == 0) s_inj[r][warp] = v;
-        }
-        __syncthreads();
-        if (tid < HC_INJ_HC) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int q = 0; q < HC_CN_BLOCK2 / WARP_SIZE; ++q) sum += s_inj[tid][q];
-            out_inj[(int64_t) t * HC_INJ_HC + tid] = sum;
-        }
-    }
-}
-
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
@@ -725,8 +557,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_inject
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// HC_COMBINE_V2 (default on; HC_COMBINE_V2=0 restores hc_combine_norm_inject_f32_b256): combine + grouped norm +
-// inject of one token per block. Thread i owns columns [8i, 8i+8) of all HC_INJ_HC streams (blockDim = n_embd/8):
+// hc_combine_norm_inject_v2 (hc_combine_norm_inject_f32_b256 when hc_v2_supported refuses the shape): combine +
+// grouped norm + inject of one token per block. Thread i owns columns [8i, 8i+8) of all HC_INJ_HC streams
+// (blockDim = n_embd/8):
 //   * every load of the token (4 x 16 B residual, block_out once for the 4 streams) is issued before any compute,
 //   * the 4 per-stream sums share one block reduction (one barrier instead of four serialized ones),
 //   * stores are 16 B (residual / xn bf16) and 8 B (q8),
@@ -906,11 +739,6 @@ static __global__ void __launch_bounds__(1024) hc_combine_norm_inject_v2(
     }
 }
 
-static bool hc_v2_enabled() {
-    static const bool on = getenv("HC_COMBINE_V2") ? atoi(getenv("HC_COMBINE_V2")) != 0 : true;
-    return on;
-}
-
 static bool hc_v2_supported(const int64_t n_embd, const int64_t hc) {
     return hc == HC_INJ_HC && n_embd % 256 == 0 && n_embd / HC_V2_COLS <= 1024;
 }
@@ -947,8 +775,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     const int64_t n_embd   = a.out_res->ne[0];
     const int64_t hc       = a.out_res->ne[1];
     const int64_t n_tokens = a.out_res->ne[2] * a.out_res->ne[3];
-    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: hc-combine-norm n_embd=%d hc=%d T=%d single=%d inject=%d\n",
-        (int) n_embd, (int) hc, (int) n_tokens, (int) a.single_block, a.out_inject != nullptr);
 
     GGML_ASSERT(a.out_res->ne[3] == 1);
     GGML_ASSERT(ggml_are_same_shape(a.out_res, a.out_xn) && ggml_are_same_shape(a.out_res, a.residual));
@@ -958,8 +784,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     // int8 copy of xn for the W8A8 HC down: allocated once and written by the row kernels below; the HC down
     // GEMM reads it through ggml_cuda_mmb_xnq8_get when its src1 root matches.
     ggml_cuda_hc_combine_norm_args aa = a;
-    static const bool q8fuse = getenv("MMB_HCD_W8A8") ? atoi(getenv("MMB_HCD_W8A8")) != 0 : true;
-    if (q8fuse && !a.single_block && (n_embd % 32) == 0 && n_embd <= HC_CN_MAX_EMB && n_tokens >= 512) {
+    if (!a.single_block && (n_embd % 32) == 0 && n_embd <= HC_CN_MAX_EMB && n_tokens >= 512) {
         const int q8_blocks = (int) (n_embd / 32);
         const size_t q8b = (size_t) q8_blocks * hc * n_tokens * 32;
         const size_t q8s = (size_t) q8_blocks * hc * n_tokens * sizeof(float);
@@ -980,47 +805,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
         return;
     }
 
-    if (a.moe_experts) {
-        GGML_ASSERT(hc == HC_INJ_HC && n_embd <= HC_CN_MAX_EMB && a.moe_weights && a.moe_gate && a.moe_shexp);
-        GGML_ASSERT(ggml_nelements(a.moe_shexp) == n_embd * n_tokens && ggml_nelements(a.moe_gate) == n_tokens);
-        const int n_used = (int) a.moe_experts->ne[1];
-        const ggml_cuda_kernel_launch_params lpi(dim3((int) n_tokens, 1, 1), HC_CN_BLOCK2, 0, ctx.stream());
-        if (a.moe_experts_bf16) {
-            ggml_cuda_kernel_launch(hc_combine_norm_moe_f32_b256<true>, lpi,
-                (const float *) a.inject->data, (const float *) a.residual->data,
-                (const void *) a.moe_experts->data, a.moe_scale ? (const float *) a.moe_scale->data : nullptr,
-                (const float *) a.moe_weights->data, (const float *) a.moe_gate->data, (const float *) a.moe_shexp->data,
-                (const float *) a.gamma->data,
-                (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
-                a.res_in_bf16, a.res_out_bf16,
-                (int) n_embd, n_used, a.s1, a.b1, a.s2, a.b2, a.eps,
-                a.w_inject ? (const float *) a.w_inject->data : nullptr,
-                a.out_inject ? (float *) a.out_inject->data : nullptr,
-                aa.out_xn_q8, aa.out_xn_scale, (int) (n_embd / 32), (int) n_tokens);
-        } else {
-            ggml_cuda_kernel_launch(hc_combine_norm_moe_f32_b256<false>, lpi,
-                (const float *) a.inject->data, (const float *) a.residual->data,
-                (const void *) a.moe_experts->data, a.moe_scale ? (const float *) a.moe_scale->data : nullptr,
-                (const float *) a.moe_weights->data, (const float *) a.moe_gate->data, (const float *) a.moe_shexp->data,
-                (const float *) a.gamma->data,
-                (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
-                a.res_in_bf16, a.res_out_bf16,
-                (int) n_embd, n_used, a.s1, a.b1, a.s2, a.b2, a.eps,
-                a.w_inject ? (const float *) a.w_inject->data : nullptr,
-                a.out_inject ? (float *) a.out_inject->data : nullptr,
-                aa.out_xn_q8, aa.out_xn_scale, (int) (n_embd / 32), (int) n_tokens);
-        }
-        return;
-    }
-
     if (a.out_inject) {
-        if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: hc-inj-final xn32=%d xn16=%d resin16=%d resout16=%d blk16=%d q8=%d inplace=%d T=%d\n",
-            (int) a.store_xn_f32, a.out_xn_bf16 != nullptr, a.res_in_bf16 != nullptr, a.res_out_bf16 != nullptr, a.blk_in_bf16 != nullptr,
-            aa.out_xn_q8 != nullptr, a.residual->data == a.out_res->data, (int) n_tokens);
         GGML_ASSERT(hc == HC_INJ_HC && a.w_inject && ggml_nelements(a.out_inject) == hc * n_tokens &&
                     a.w_inject->ne[0] == n_embd * hc && a.w_inject->ne[1] == hc);
         // the grouped q8 layout needs whole 32-token groups (the W8A8 consumer requires T % 128 == 0 anyway)
-        const bool v2 = hc_v2_enabled() && hc_v2_supported(n_embd, hc) && (!aa.out_xn_q8 || n_tokens % (1 << HC_V2_QGS) == 0);
+        const bool v2 = hc_v2_supported(n_embd, hc) && (!aa.out_xn_q8 || n_tokens % (1 << HC_V2_QGS) == 0);
         float *    o_res32 = a.res_out_bf16 ? nullptr : (float *) a.out_res->data;
         uint16_t * o_res16 = a.res_out_bf16;
         float *    o_xn32  = a.store_xn_f32 ? (float *) a.out_xn->data : nullptr;

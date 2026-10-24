@@ -790,9 +790,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-#ifndef FA7_DEFAULT
-#define FA7_DEFAULT 1   // pp2048 1706 -> 1735 t/s; NMSE vs fp64 causal reference ~3e-9 (existing path ~3e-5)
-#endif
 // ---------------------------------------------------------------------------------------------
 // fa7: GQA-aware WMMA flash attention for gfx1151, causal prefill only (NH=1 NK=32 PD=1, verified against a naive GPU
 // reference and a CPU fp64 reference on all heads).
@@ -800,7 +797,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 // mask is not read: the graph must mark it as the plain causal one (ggml_flash_attn_ext_set_causal_prefix). Everything
 // else keeps the existing path. K/V are first packed (pack_kv) into WMMA-fragment order in a pool buffer:
 //   Kp[kvh][T/16][16 db][16 key][16 d], Vp[kvh][T/16][16 db][16 d][16 slot] (slots: keys 0,2,..,14 then 1,3,..,15).
-// GGML_FA7=0 disables it.
+// pp2048 1706 -> 1735 t/s; NMSE vs fp64 causal reference ~3e-9 (existing path ~3e-5).
 #if defined(GGML_USE_HIP) && defined(RDNA3_5)
 #define FA7_ENABLED 1
 #endif
@@ -1055,8 +1052,6 @@ __global__ void pack_kv(const _Float16 * __restrict__ K, const _Float16 * __rest
 
 static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
-    static const bool on = getenv("GGML_FA7") ? atoi(getenv("GGML_FA7")) != 0 : FA7_DEFAULT;
-    if (!on) return false;
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
     if (!K || !V || !mask || dst->src[4] || dst->src[5] || dst->src[6] || dst->src[7]) return false;
@@ -1083,16 +1078,12 @@ static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const
 #endif
 }
 
-// GGML_CUDA_FA_GATE (default on; 0 disables): the gated attention output in the FA epilogue. Same expression per
-// element as cont_sigmoid_mul_v4, so bit-identical (wikitext PPL unchanged at 2048 and 4096 context on gfx1151).
-static bool ggml_cuda_fa_gate_on() {
-    static const bool on = getenv("GGML_CUDA_FA_GATE") ? atoi(getenv("GGML_CUDA_FA_GATE")) != 0 : true;
-    return on;
-}
+// The gated attention output in the FA epilogue. Same expression per element as cont_sigmoid_mul_v4, so
+// bit-identical (wikitext PPL unchanged at 2048 and 4096 context on gfx1151).
 
 bool ggml_cuda_qsa_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
 #if defined(GGML_USE_HIP)
-    return ggml_cuda_fa_gate_on() && fa->op == GGML_OP_FLASH_ATTN_EXT &&
+    return fa->op == GGML_OP_FLASH_ATTN_EXT &&
         ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
 #else
     GGML_UNUSED(ctx); GGML_UNUSED(fa);
@@ -1101,8 +1092,7 @@ bool ggml_cuda_qsa_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_ten
 }
 
 bool ggml_cuda_fa7_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
-    const bool on = ggml_cuda_fa_gate_on();
-    if (!on || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[3] != 1) return false;
+    if (fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[3] != 1) return false;
 #if defined(GGML_USE_HIP)
     return ggml_cuda_fa7_supported(ctx, fa) &&
         !ggml_cuda_flash_attn_ext_qsa_decode_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa) &&
