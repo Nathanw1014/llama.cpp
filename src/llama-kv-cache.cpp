@@ -1827,7 +1827,7 @@ skip:
 
         // the first row of every sequence is filled in full (and records the cells that can differ), the other rows
         // only copy it and update those cells: they are independent and are filled in parallel for large masks
-        // (ported from asf0/strix-llama.cpp 087fab319). LLAMA_KQ_MASK_THREADS: worker count (default 8, 1 = serial).
+        // (ported from asf0/strix-llama.cpp 087fab319). 8 workers once the rest rows hold >= 1M mask elements.
         std::vector<uint32_t> rest;
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1855,9 +1855,7 @@ skip:
             }
         };
 
-        static const int n_thr_env = getenv("LLAMA_KQ_MASK_THREADS") ? std::max(1, atoi(getenv("LLAMA_KQ_MASK_THREADS"))) : 8;
-        static const int64_t min_elems = getenv("LLAMA_KQ_MASK_MIN") ? atoll(getenv("LLAMA_KQ_MASK_MIN")) : (int64_t) 1 << 20;
-        const int n_thr = (int64_t) rest.size() * n_kv >= min_elems ? n_thr_env : 1;
+        const int n_thr = (int64_t) rest.size() * n_kv >= ((int64_t) 1 << 20) ? 8 : 1;
         if (n_thr == 1) {
             fill_rest(0, rest.size());
         } else {
@@ -1935,8 +1933,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
-    static const bool timing = getenv("LLAMA_KQ_MASK_TIMING") != nullptr;
-    const int64_t t_start = timing ? ggml_time_us() : 0;
+    //const int64_t t_start = ggml_time_us();
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1956,9 +1953,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
-    if (timing) {
-        fprintf(stderr, "%s: kq_mask n_tokens=%u n_kv=%lld %.3f ms\n", __func__, n_tokens, (long long) n_kv, (ggml_time_us() - t_start) / 1000.0);
-    }
+    //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
