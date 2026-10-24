@@ -143,12 +143,12 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     constexpr int Q2R = Q20 ? (BM * 8) / MMB_NT : 1;
     uint32_t q20[Q2R];
 
-    // gfx1151/ROCm 10.1 clang 24: per-step staging clears seven saves/32 scratch bytes per lane in the 128x256 BF16 tile.
-    // Remove this when prefetching this exact tile is spill-free.
+    // gfx1151/ROCm 10.1 clang 24: S119 has seven saves/32 bytes with loop-head BF16 row prefetch (2026-10-24); load the last three vectors near the final WMMAs.
+    // Remove this schedule when full-row prefetch is spill-free at the measured throughput.
 #if defined(__gfx1151__)
-    constexpr bool DEFER_A = !TAIL && BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2;
+    constexpr bool STAGGER_A = !TAIL && BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2;
 #else
-    constexpr bool DEFER_A = false;
+    constexpr bool STAGGER_A = false;
 #endif
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
@@ -174,13 +174,26 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2];
                 }
                 else if constexpr (WTYPE == 2) { const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
-                    a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4]; a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; }
+                    a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4];
+                    if constexpr (!STAGGER_A) { a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; } }
             } else { a0[i] = make_uint4(0,0,0,0); a1[i] = make_uint4(0,0,0,0); a3[i] = make_uint4(0,0,0,0); a4[i] = make_uint4(0,0,0,0); a5[i] = a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); a2[i] = 0; }
         }
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) {
             const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+        }
+    };
+    auto load_tail_regs = [&](const int ks) {
+        if constexpr (STAGGER_A) {
+#pragma unroll
+            for (int i = 0; i < A_ITEMS; ++i) {
+                const int row = tid + i * MMB_NT;
+                if (row < BM && row < a_rows) {
+                    const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
+                    a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7];
+                } else { a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); }
+            }
         }
     };
     auto store_lds = [&]() {
@@ -217,10 +230,9 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;   // whole fragments past the valid columns are never stored
     const int nks = K / MMB_BK;
-    if constexpr (!DEFER_A) { load_regs(0); store_lds(); __syncthreads(); }
+    load_regs(0); load_tail_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
-        if constexpr (DEFER_A) { load_regs(ks); store_lds(); __syncthreads(); }
-        else if (ks + 1 < nks) load_regs(ks + 1);
+        if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             // gfx1151/ROCm 10.1 clang 24: streaming B clears three dense spill names.
@@ -240,7 +252,19 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                     const v16s b = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)});
 #pragma unroll
-                    for (int i = 0; i < TM; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a[i], acc[i][j]);
+                    for (int i = 0; i < TM; ++i) {
+                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a[i], acc[i][j]);
+                        // gfx1151/ROCm 10.1 clang 24: S119 needs seven saves/32 bytes at loop head (2026-10-24); remove these bounds when full prefetch is spill-free.
+#if defined(__gfx1151__)
+                        if constexpr (STAGGER_A) {
+                            if (kk + 16 == MMB_BK && j + 1 == TN && i + 1 == TM / 2) {
+                                __builtin_amdgcn_sched_barrier(0);
+                                load_tail_regs(ks + 1 < nks ? ks + 1 : ks);
+                                __builtin_amdgcn_sched_barrier(0);
+                            }
+                        }
+#endif
+                    }
                 }
             } else {
                 v16s a[TM], b[TN]; const int r = lane & 15;
@@ -257,14 +281,24 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
             }
         }
         __syncthreads();
-        if constexpr (!DEFER_A) { if (ks + 1 < nks) store_lds(); __syncthreads(); }
+        if (ks + 1 < nks) store_lds();
+        __syncthreads();
     }
     // epilogue through LDS (per-wave 1 KB stage in the now-free A/B tile area); tiles are 16 rows, a_rows is a
     // multiple of 32 in this model, so whole tiles are either valid or beyond a_rows
     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : As) + wave * 256;
+    int store_wm = wm;
+    // gfx1151/ROCm 10.1 clang 24: the early epilogue offset costs one save/eight private bytes (2026-10-24); remove this bound when the compiler rematerializes it after compute.
+#if defined(__gfx1151__)
+    if constexpr (STAGGER_A) {
+        int store_tid = tid;
+        asm volatile("" : "+v"(store_tid));
+        store_wm = (store_tid >> 5) % WAVES_M;
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
-        const int ml = wm * WTM + i * 16; const bool ok = ml < a_rows;
+        const int ml = store_wm * WTM + i * 16; const bool ok = ml < a_rows;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
