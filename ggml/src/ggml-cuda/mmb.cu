@@ -1594,6 +1594,9 @@ void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_te
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb && ctx.mmb->bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb) return;
+    // the int8 xn copy is keyed by data pointer only: an xn of this graph at the same address must not find the
+    // previous graph's copy (the allocator reuses addresses across graphs)
+    ctx.mmb->xn_q8_for = nullptr;
     for (auto & work : mmb_state(ctx).streams) {
         for (auto & e : work.cache) delete e.buf;
         work.cache.clear();
