@@ -1568,6 +1568,15 @@ bool mmb_glu()     { static const bool v = getenv("MMB_GLU") ? atoi(getenv("MMB_
 
 } // namespace
 
+// Drops the cache entry whose buffer is p (handed out by ggml_cuda_mmb_cache_produce) when its producer did not
+// run after all, so no reader finds a copy that was never written.
+void ggml_cuda_mmb_cache_unproduce(ggml_backend_cuda_context & ctx, const uint16_t * p) {
+    if (!p || !ctx.mmb) return;
+    auto & cache = mmb_workspace(ctx).cache;
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (it->buf && it->buf->get() == p) { delete it->buf; cache.erase(it); return; }
+    }
+}
 const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     const ggml_tensor * root = mmb_root(t);
     for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {

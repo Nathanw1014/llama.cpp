@@ -18,6 +18,7 @@ uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const gg
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
 // BF16 copy of tensor t if one is cached for the current graph (consumers may read it instead of the F32 data)
 const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
+void ggml_cuda_mmb_cache_unproduce(ggml_backend_cuda_context & ctx, const uint16_t * p);
 // producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
 // 2 = routed GLU output, 3 = gate-mix output, 4 = F16 copy of the gate-mix output (MMB_DENSE_F16)
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n, bool f16 = false);
