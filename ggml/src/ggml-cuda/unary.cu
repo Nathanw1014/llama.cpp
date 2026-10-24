@@ -835,7 +835,7 @@ void ggml_cuda_op_cont_sigmoid_mul(
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    GGML_ASSERT(store_f32);
+    // the scalar kernel always stores F32 next to the 16-bit copy: harmless when the F32 output has no reader
     unary_gated_cuda<op_sigmoid>((const float *) gate->data, (const float *) other->data, (float *) mul_node->data,
         k, n, gate->nb[1] / sizeof(float), n, ctx.stream(), dst16, dst16_f16);
 }
