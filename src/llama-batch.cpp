@@ -13,7 +13,7 @@
 #include <sstream>
 
 void llama_resident_nextn::export_rows(ggml_backend_t backend, ggml_tensor * src, size_t offset) {
-    GGML_ASSERT(backend == producer && src->type == GGML_TYPE_F32 && ggml_is_contiguous(src));
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src));
     GGML_ASSERT(offset == n_exported && ggml_nbytes(src) % tensor->nb[1] == 0);
     GGML_ASSERT(offset * tensor->nb[1] + ggml_nbytes(src) <= n_rows * tensor->nb[1]);
     // Wait at the first write, so the next target graph can overlap the prior draft.
@@ -25,6 +25,7 @@ void llama_resident_nextn::export_rows(ggml_backend_t backend, ggml_tensor * src
     dst.view_src = nullptr;
     dst.buffer = tensor->buffer;
     dst.data = (char *) tensor->data + (offset + 1) * tensor->nb[1];
+    // The copy helper synchronizes both backends if the source needs a blocking copy.
     ggml_backend_tensor_copy_async(backend, producer, src, &dst);
     n_exported += ggml_nbytes(src) / tensor->nb[1];
     ggml_backend_event_record(ready, producer);
