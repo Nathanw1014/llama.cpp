@@ -1226,7 +1226,8 @@ static void test_resident_nextn(testing & t, const char * device) {
                         const int count = std::min(split, n - off);
                         ggml_context_ptr ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
                         auto * src = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 2560, 4, count);
-                        ggml_backend_t source = off == 0 ? producer.get() : cpu.get();
+                        // Alternate device copies (including nonzero offsets) and the CPU-source fallback.
+                        ggml_backend_t source = (off / split) % 2 == 0 ? producer.get() : cpu.get();
                         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), source));
                         ggml_backend_tensor_set_async(source, src, expected.data() + (size_t) (off + 1) * width, 0, ggml_nbytes(src));
                         rows->export_rows(source, src, off);
