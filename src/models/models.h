@@ -5,6 +5,7 @@
 #include "llama-model-loader.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -2338,6 +2339,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable bool       hc_up_il_tried = false;
     mutable bool       hc_up_il       = false;
     bool hc_up_interleaved() const;
+
+    // the f16 hc streams (LLAMA_HC_XN16) are taken by every reader: -1 = not decided yet; see qwen4exp_takes_f16_b
+    mutable std::atomic<int> hc_f16_b{-1};
 
     // LLAMA_HC_DOWN_INJECT=1: per hc down weight, a q8_0 [hc_dim, n_down + hc] copy with that block's inject rows
     // (quantized) appended, built on the first graph build with loaded weights, so one GEMM reads xn once for both

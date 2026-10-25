@@ -395,7 +395,8 @@ static bool qwen4exp_hc_xn16() {
 // il = -1 (it mixes with model.hc_head_*, not a layer's weights), so there is no layer to ask.
 // Answering once for the whole model is also the conservative direction - a file with bf16 in
 // only some layers keeps f32 everywhere rather than half the graph.
-static bool qwen4exp_takes_f16_b(const llama_model & model) {
+// Returns why the model keeps f32 (and the weight, in *who), or nullptr when the f16 streams are fine.
+static const char * qwen4exp_f16_b_blocker(const llama_model & model, const ggml_tensor ** who) {
     for (const auto & layer : model.layers) {
         // the QSA indexer projections are not listed: qwen4exp_indexer_in gives a bf16 one an f32 B
         const ggml_tensor * consumers[] = {
@@ -405,11 +406,55 @@ static bool qwen4exp_takes_f16_b(const llama_model & model) {
         };
         for (const ggml_tensor * w : consumers) {
             if (w != nullptr && w->type == GGML_TYPE_BF16) {
-                return false;
+                *who = w;
+                return "bf16";
             }
         }
     }
-    return true;
+    // Every reader of the f16 streams must also sit on a GPU buffer: the CPU mul_mat takes an f16 B only
+    // for an f16 weight, so with any of them host-resident (-ngl 0 -dev none, a partial -ngl, -ot ...=CPU)
+    // the f32 router is the first node with no backend and the scheduler aborts. The f16 streams are a
+    // GPU prefill optimisation, so such a model keeps f32 everywhere (as LLAMA_HC_XN16=0 did by hand).
+    auto on_gpu = [](const ggml_tensor * w) { return w == nullptr || llm_graph_weights_on_gpu(w->buffer); };
+    for (const auto & layer : model.layers) {
+        const ggml_tensor * readers[] = {
+            layer.hc_attn_down, layer.hc_attn_inject, layer.hc_ffn_down, layer.hc_ffn_inject,   // xn
+            layer.wqkv, layer.wqkv_gate, layer.wq, layer.wk, layer.wv, layer.ssm_beta, layer.ssm_alpha,
+            layer.index_q_proj, layer.index_k_proj,
+            layer.ffn_gate_inp, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps,
+            layer.ffn_gate_inp_shexp, layer.ffn_gate_shexp, layer.ffn_up_shexp,
+            layer.nextn.hc_head_down, layer.nextn.shared_head_head,
+        };
+        for (const ggml_tensor * w : readers) {
+            if (!on_gpu(w)) {
+                *who = w;
+                return "not on a GPU buffer";
+            }
+        }
+    }
+    for (const ggml_tensor * w : { model.hc_head_down, model.output }) {
+        if (!on_gpu(w)) {
+            *who = w;
+            return "not on a GPU buffer";
+        }
+    }
+    return nullptr;
+}
+
+// decided once per model, on the first prefill graph (the weights are placed by then): the loops above per
+// build_hc_mix call were ~400 x n_layer x 20 placement lookups per prefill graph
+static bool qwen4exp_takes_f16_b(const llama_model & model) {
+    const auto & m = static_cast<const llama_model_qwen4exp &>(model);
+    int v = m.hc_f16_b.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const ggml_tensor * who = nullptr;
+        const char * why = qwen4exp_f16_b_blocker(model, &who);
+        v = why == nullptr;
+        if (m.hc_f16_b.exchange(v) < 0 && why != nullptr) {
+            LLAMA_LOG_INFO("qwen4exp: f16 hc streams off, prefill keeps f32 (%s is %s)\n", ggml_get_name(who), why);
+        }
+    }
+    return v != 0;
 }
 
 // Community Flash-Next GGUFs ship some projections in bf16 (the QSA indexer, and in some files the hc down
