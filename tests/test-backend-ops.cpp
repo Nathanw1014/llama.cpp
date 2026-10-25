@@ -11860,6 +11860,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,t,t));
         test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,true,0,t,t));
     }
+    for (ggml_type t : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,257,12,true,0,t,t));
+        test_cases.emplace_back(new test_qsa_decode_maskless(1,4096,2051,12,true,100,t,t));
+        test_cases.emplace_back(new test_qsa_decode_maskless(4,32768,2051,12,true,8000,t,t));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,12,true,0,t,t));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(97,4096,2051,12,false,3,t,t));
+    }
     // mixed K/V types
     for (int q : {1,130}) {
         test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,true,100,GGML_TYPE_Q8_0,GGML_TYPE_F16));

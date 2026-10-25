@@ -7513,12 +7513,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep,
                 "flash_attn_sel_prep", flash_attn_sel_prep_len, flash_attn_sel_prep_data, "main", 2,
                 sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[GGML_TYPE_F16], "flash_attn_sel_gather_f16",
-                flash_attn_sel_gather_f16_len, flash_attn_sel_gather_f16_data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[GGML_TYPE_Q8_0], "flash_attn_sel_gather_q8_0",
-                flash_attn_sel_gather_q8_0_len, flash_attn_sel_gather_q8_0_data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[GGML_TYPE_Q4_0], "flash_attn_sel_gather_q4_0",
-                flash_attn_sel_gather_q4_0_len, flash_attn_sel_gather_q4_0_data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+#define CREATE_SEL_GATHER(T, NAME) \
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[T], "flash_attn_sel_gather_" #NAME, \
+                flash_attn_sel_gather_ ## NAME ## _len, flash_attn_sel_gather_ ## NAME ## _data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+            CREATE_SEL_GATHER(GGML_TYPE_F16, f16)
+            CREATE_SEL_GATHER(GGML_TYPE_Q8_0, q8_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q4_0, q4_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q4_1, q4_1)
+            CREATE_SEL_GATHER(GGML_TYPE_Q5_0, q5_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q5_1, q5_1)
+            CREATE_SEL_GATHER(GGML_TYPE_IQ4_NL, iq4_nl)
+#undef CREATE_SEL_GATHER
             static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
             for (uint32_t i = 0; i < 3; ++i) {
                 const uint32_t gqa = 4 * (i + 1);
@@ -14853,15 +14858,15 @@ static bool split_pmajor_log() {
     return log;
 }
 
-// a quantized K or V of the maskless selected-key op is dequantized to f16 first (GGML_VK_SEL_QKV=0 refuses it)
+// a quantized K or V of the maskless selected-key op is dequantized to f16 first (q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl: the types
+// with a gather shader; GGML_VK_SEL_QKV=0 refuses them)
 static bool ggml_vk_flash_attn_sel_kv_ok(const vk_device & device, const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F16) {
         return t->nb[0] == sizeof(ggml_fp16_t) && t->nb[1] % sizeof(ggml_fp16_t) == 0 &&
             t->nb[2] % sizeof(ggml_fp16_t) == 0 && t->nb[3] % sizeof(ggml_fp16_t) == 0;
     }
     static const bool qkv_env = [] { const char * e = getenv("GGML_VK_SEL_QKV"); return !(e && e[0] == '0'); }();
-    if (!qkv_env || (t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) ||
-        !device->pipeline_dequant[t->type] || !device->pipeline_flash_attn_sel_gather[t->type]) {
+    if (!qkv_env || !device->pipeline_dequant[t->type] || !device->pipeline_flash_attn_sel_gather[t->type]) {
         return false;
     }
     // f16 strides = block strides x block size: every stride must be whole blocks

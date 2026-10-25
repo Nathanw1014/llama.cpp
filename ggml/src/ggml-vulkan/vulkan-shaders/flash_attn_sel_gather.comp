@@ -4,6 +4,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
+#define FLOAT_TYPE float
 #include "types.glsl"
 
 // Maskless selected-key attention with a quantized (or mixed) K/V cache, few queries: after flash_attn_sel_prep.comp has
@@ -71,17 +72,36 @@ void main() {
             v[2 * j]     = dm * float16_t((w << 24) >> 24);
             v[2 * j + 1] = dm * float16_t(w >> 8);
         }
-#elif defined(DATA_A_Q4_0)
-        // byte j carries element j in its low nibble and element j + 16 in its high one (see dequant_q4_0.comp)
-        const uint shift = e < 16 ? 0 : 4;
-        const uint b0 = e % 16;
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            const uint w = uint(data_a[ib].qs[b0 / 2 + j]);
-            v[2 * j]     = dm * (float16_t((w >> shift) & 0xf) - float16_t(8.0));
-            v[2 * j + 1] = dm * (float16_t((w >> (8 + shift)) & 0xf) - float16_t(8.0));
-        }
+#else
+        // 4-bit types: byte j holds element j in its low nibble and element j + 16 in its high one (see dequant_q4_0.comp);
+        // q5 types add bit j of qh as bit 4
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
+        const float m = float(data_a[ib].m);
+#endif
+#if defined(DATA_A_Q5_0)
+        const uint qh = uint(data_a[ib].qh[1]) << 16 | uint(data_a[ib].qh[0]);
+#elif defined(DATA_A_Q5_1)
+        const uint qh = data_a[ib].qh;
+#endif
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            const uint el = e + j;
+            const uint byte = el % 16;
+            uint q = (uint(data_a[ib].qs[byte / 2]) >> (8 * (byte % 2) + (el < 16 ? 0 : 4))) & 0xf;
+#if defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+            q |= ((qh >> el) & 1) << 4;
+#endif
+#if defined(DATA_A_Q4_0)
+            v[j] = float16_t(float(dm) * (float(q) - 8.0));
+#elif defined(DATA_A_Q5_0)
+            v[j] = float16_t(float(dm) * (float(q) - 16.0));
+#elif defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
+            v[j] = float16_t(float(dm) * float(q) + m);
+#elif defined(DATA_A_IQ4_NL)
+            v[j] = float16_t(float(dm) * float(kvalues_iq4nl_const[q]));
 #else
 #error flash_attn_sel_gather: unhandled K/V type
+#endif
+        }
 #endif
 #endif
         data_dst[(g * p.n_head_kv + head) * (D / 8) + d0 / 8] = uvec4(
