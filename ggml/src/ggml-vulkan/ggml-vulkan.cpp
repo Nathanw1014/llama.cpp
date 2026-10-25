@@ -905,6 +905,7 @@ struct vk_device_struct {
     uint32_t shader_core_count;
     bool uma;
     bool prefer_host_memory;
+    bool uma_host_cached;  // UMA with a host-cached heap outside the device-local one: device buffers go there
     bool float_controls_rte_fp16;
     bool float_controls_denorm_preserve_fp16;
     bool subgroup_basic;
@@ -3006,7 +3007,7 @@ void vk_memory_logger::log_allocation(vk_buffer_ref buf_ref, size_t size) {
     allocations[buf->buffer] = size;
     total_device += device ? size : 0;
     total_host += device ? 0 : size;
-    VK_LOG_MEMORY(buf->device->name << ": +" << format_size(size) << " " << type << " at " << buf->buffer << ". Total device: " << format_size(total_device) << ", total host: " << format_size(total_host));
+    VK_LOG_MEMORY(buf->device->name << ": +" << format_size(size) << " " << type << " " << vk::to_string(buf->memory_property_flags) << " at " << buf->buffer << ". Total device: " << format_size(total_device) << ", total host: " << format_size(total_host));
 }
 
 void vk_memory_logger::log_deallocation(vk_buffer_ref buf_ref) {
@@ -4067,6 +4068,10 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
+        } else if (device->uma_host_cached) {
+            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal});
         } else if (device->uma) {
             // On UMA, prefer host-visible memory so direct tensor borrowing works.
@@ -8030,8 +8035,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->architecture = get_device_architecture(device->physical_device);
 
+        // GGML_VK_PREFER_HOST_MEMORY: unset = default placement, 0 = device-local first on UMA too, other = host-visible first
         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
-        device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
+        const bool prefer_host_memory_off = GGML_VK_PREFER_HOST_MEMORY != nullptr && strcmp(GGML_VK_PREFER_HOST_MEMORY, "0") == 0;
+        device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr && !prefer_host_memory_off;
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
@@ -8240,6 +8247,24 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // RADV on an AMD APU reports part of system memory as device-local, but places device-local buffers in the BIOS
+        // VRAM carve-out first and only spills to system memory once it is full. With a 2 GiB carve-out (128 GB Strix
+        // Halo boxes) a full carve-out was followed by "amdgpu: Couldn't update BO_VA (-12)" and a dead driver. The
+        // spill lands in host-cached system memory, so allocate there from the start and leave the carve-out alone.
+        device->uma_host_cached = false;
+        if (device->uma && !prefer_host_memory_off) {
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            const vk::MemoryPropertyFlags host_cached = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent |
+                                                        vk::MemoryPropertyFlagBits::eHostCached;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                const vk::MemoryType & mt = mem_props.memoryTypes[i];
+                if ((mt.propertyFlags & host_cached) == host_cached && !(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+                    !(mem_props.memoryHeaps[mt.heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+                    device->uma_host_cached = true;
+                    break;
+                }
+            }
+        }
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
