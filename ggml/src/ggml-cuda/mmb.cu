@@ -1353,12 +1353,14 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
         for (int j = 0; j < WTOKS; ++j)
 #pragma unroll
             for (int l = 0; l < 8; ++l) acc[i][j][l] = 0.0f;
+    // unroll the 32-K blocks of a stage only for short stages (BK <= 2)
+    constexpr int KB_UNROLL = BK <= 2 ? BK : 1;
     fetch_stage(0);
     for (int kb0 = 0; kb0 < nkb; kb0 += BK) {
         commit_stage();
         __syncthreads();
         if (kb0 + BK < nkb) fetch_stage(kb0 + BK);
-#pragma unroll(BK <= 2 ? BK : 1)
+#pragma unroll KB_UNROLL
         for (int kb = 0; kb < BK; ++kb) {
             mmb_vi4 a0[WROWS], a1[WROWS];
             float dw[WROWS][8];
