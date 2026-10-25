@@ -6698,6 +6698,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 unary->src[0] == cont && mul->op == GGML_OP_MUL && (mul->src[0] == unary || mul->src[1] == unary) && other &&
                 (other == node || other->view_src == node) && ggml_is_contiguous(other) && ggml_nelements(other) == ggml_nelements(node) &&
                 gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == node->ne[0] && gate->ne[1] == node->ne[1] &&
+                // the gated epilogues read the gate in float4: 16-byte rows and base, and QSA takes contiguous heads
+                ((uintptr_t) gate->data % 16) == 0 && gate->nb[1] % 16 == 0 && gate->nb[2] % 16 == 0 &&
+                (!fa_gate_qsa || gate->nb[2] == gate->nb[1] * gate->ne[1]) &&
                 gate->ne[2] == node->ne[2] && gate->ne[3] == 1 && ggml_are_same_shape(unary, cont) && ggml_is_contiguous(mul) &&
                 mul->type == GGML_TYPE_F32 && ggml_nelements(mul) == ggml_nelements(node) &&
                 ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { j + 2 });

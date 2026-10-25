@@ -1638,8 +1638,12 @@ bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
     const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+    // the graph-time half of gdn_chunk_eligible_raw: a z marked BF16-only must reach the chunked path, which aborts
+    // otherwise (only the q/k pointer alignment is left to run time)
+    const ggml_tensor * q = gdn->src[0];
+    const int64_t H = v->ne[1], Hk = q->ne[1];
     return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && !keep_rs && v->ne[0] == 128 && v->ne[2] >= gdn_chunk_min_tokens() &&
-        v->ne[1] * 128 % 8 == 0;
+        v->ne[1] * 128 % 8 == 0 && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && q->ne[3] == v->ne[3];
 #else
     GGML_UNUSED(gdn);
     return false;
@@ -1911,7 +1915,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // pp2048 1683 -> 1702 t/s over prep + scan; logits KLD vs the v1 chunk path at the KV-bf16 noise level
             const bool use_v2 = cv_ovr.x && qk_ovr.q && on_ovr.z && on_ovr.out16 && !on_ovr.out && sv1 == 128 &&
                 ((uintptr_t) cv_ovr.x) % 16 == 0 && (cv_ovr.C % 4) == 0 && (cv_ovr.vc % 4) == 0 &&
-                (int64_t) n_tokens * cv_ovr.C * 4 < INT32_MAX && (int64_t) n_tokens * H * 128 * 2 < INT32_MAX;
+                (int64_t) n_tokens * cv_ovr.C * 4 < INT32_MAX &&
+                (int64_t) n_tokens * H * 128 * (on_ovr.z_bf16 ? 2 : 4) < INT32_MAX;   // the scan's z byte offsets are int
             // z stored BF16-only (ggml_cuda_gdn_z16_ok, a graph-time choice) is read natively only by the v2 epilogue: when the
             // run-time checks above still refuse v2, the chunked scan below reads an F32 copy instead
             const bool z_widen = on_ovr.z_bf16 && !use_v2;

@@ -549,7 +549,7 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
         // split KV streams (one per sequence): ne[3] streams, run one after the other on per-stream views (maskless only)
         k->ne[3]==q->ne[3] && v->ne[3]==q->ne[3] && (q->ne[3]==1 || (!m && ids->ne[3]==q->ne[3])) &&
         ggml_nelements(k)/4/k->ne[3]<=INT_MAX &&
-        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
+        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 && k->nb[3]%16==0 && v->nb[3]%16==0 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
