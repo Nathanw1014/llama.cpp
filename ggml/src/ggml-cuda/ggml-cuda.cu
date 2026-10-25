@@ -771,6 +771,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    for (auto & ev : ovl_ev) {   // intra-graph concurrency events, created on first use
+        if (ev != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventDestroy(ev));
+            ev = nullptr;
+        }
+    }
+
     if (mmb) {
         // Queued work and captured graphs can still reference the MMB buffers.
         for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
@@ -7369,6 +7377,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_mmb_marks_clear(*cuda_ctx);
             cuda_ctx->mmb_graph_sigs.clear();
             cuda_ctx->mmb_res16_pending.clear();
+            cuda_ctx->ovl_regions.clear();   // keyed by tensor pointers too: a graph optimize never saw must not inherit them
             cuda_ctx->mmb_first_split = nullptr;
         }
     }
