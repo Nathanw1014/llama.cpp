@@ -1064,7 +1064,8 @@ bool ggml_cuda_norm_rope_multi_ok(const ggml_tensor * rms_norm, const ggml_tenso
     const int n_dims = ((const int32_t *) rope->op_params)[1];
     const int mode   = ((const int32_t *) rope->op_params)[2];
     const int n_offs = ((const int32_t *) rope->op_params)[15];
-    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION || n_offs != 0) return false;
+    // exactly the modes the unfused dispatch runs as multi-section rope (NEOX|MROPE runs as rope_neox there)
+    if ((mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) || n_offs != 0) return false;
     if (n_dims <= 0 || n_dims % 64 != 0 || n_dims > x->ne[0]) return false;
     // the rope reads the normalized row in place only through registers: dst must not alias the input row of another wave
     const uintptr_t xa = (uintptr_t) x->data, da = (uintptr_t) rope->data;

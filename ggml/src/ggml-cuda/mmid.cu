@@ -285,9 +285,11 @@ void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    // the histogram helper; the serial-scan 512/10 helper and the per-expert generic helper remain for other shapes
+    // the histogram helper (AMD wave32); the serial-scan 512/10 helper and the per-expert generic helper remain for other
+    // shapes. Its atomic scatter orders the rows of an expert differently from run to run: NVIDIA stream-k MMQ would then
+    // split K differently per run, so the token-ordered helpers stay there (bitwise reproducible outputs)
     const bool warp32 = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32; // the scan uses 32-lane shuffles
-    if (warp32 && n_experts <= MM_IDS_HIST_MAX_EXPERTS) {
+    if (GGML_CUDA_CC_IS_AMD(cc) && warp32 && n_experts <= MM_IDS_HIST_MAX_EXPERTS) {
         switch (n_expert_used) {
             case  2: mm_ids_helper_hist< 2><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
             case  4: mm_ids_helper_hist< 4><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;

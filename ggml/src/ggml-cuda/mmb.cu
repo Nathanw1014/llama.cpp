@@ -371,7 +371,8 @@ mmb_tq8_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict
     __shared__ __align__(16) uint16_t As[BM * LS];
     __shared__ __align__(16) uint16_t Bs[BN * LS];
     const int nM = (M + BM - 1) / BM, nT = (T + BN - 1) / BN, L = blockIdx.x;
-    const int gsz_all = GM * nT, gid = L / gsz_all, first_m = gid * GM, gsz = min(nM - first_m, GM), li = L - gid * gsz_all;
+    const int GMc = min(GM, nM);   // GM can be 1<<20 (one group): GM*nT would overflow int
+    const int gsz_all = GMc * nT, gid = L / gsz_all, first_m = gid * GMc, gsz = min(nM - first_m, GMc), li = L - gid * gsz_all;
     const int m0 = (first_m + li % gsz) * BM, t0 = (li / gsz) * BN;
     (void) nM;
     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
@@ -380,7 +381,7 @@ mmb_tq8_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict
     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
     const __amdgpu_buffer_rsrc_t wr = __builtin_amdgcn_make_buffer_rsrc((void *)(W + (size_t)(m0 / BM) * (K / BK) * MMB_TQ8_CHUNK), (short)0, (K / BK) * MMB_TQ8_CHUNK, 0x31004000);
     const __amdgpu_buffer_rsrc_t xr = __builtin_amdgcn_make_buffer_rsrc((void *)(Xh + (size_t)t0 * K), (short)0, min(BN, T - t0) * K * 2, 0x31004000);
-    const int xv = ((tid >> 3) * K + (tid & 7) * 8) * 2;           // item i adds i*32 rows (scalar)
+    const int xv = ((tid >> 3) * K + (tid & 7) * 8) * 2;           // item i adds i*32 rows (in voffset: soffset is not bounds-checked)
     const int qv = tid * 16, dv = 8192 + ((tid >> 2) * 2 + ((tid & 3) >> 1)) * 2;
     struct Stage { uint4 q0, q1; uint32_t d0, d1; uint4 bst[B_ITEMS]; };
     auto load = [&](Stage & S, const int ks) {
@@ -391,7 +392,7 @@ mmb_tq8_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict
         S.d1 = __builtin_amdgcn_raw_buffer_load_b16(wr, dv, so + 256, 0);
         S.q0 = make_uint4(a0[0], a0[1], a0[2], a0[3]); S.q1 = make_uint4(a1[0], a1[1], a1[2], a1[3]);
 #pragma unroll
-        for (int i = 0; i < B_ITEMS; ++i) { const auto x = __builtin_amdgcn_raw_buffer_load_b128(xr, xv, ks * BK * 2 + i * 32 * K * 2, 0); S.bst[i] = make_uint4(x[0], x[1], x[2], x[3]); }
+        for (int i = 0; i < B_ITEMS; ++i) { const auto x = __builtin_amdgcn_raw_buffer_load_b128(xr, xv + i * 32 * K * 2, ks * BK * 2, 0); S.bst[i] = make_uint4(x[0], x[1], x[2], x[3]); }
     };
     const int a_st = ((tid >> 2) * LS + (tid & 3) * 16) * 2;     // row r0 = tid>>2; row r1 = r0 + 64
     const int b_st = ((tid >> 3) * LS + (tid & 7) * 8) * 2;
@@ -1373,6 +1374,16 @@ __global__ void mmb_build_desc3(const int32_t * __restrict__ bounds, uint32_t * 
 } // namespace
 
 struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; bool f16; ggml_cuda_pool_alloc<uint16_t> * buf; };
+// Routing maps of the last fused GLU, reused by the routed down that reads that GLU's output (same ids tensor).
+struct mmb_ids_record {
+    const void * ids = nullptr;
+    const ggml_tensor * glu = nullptr;
+    const void * glu_data = nullptr;
+    int T = 0, n_used = 0, E = 0, si1 = 0;
+    const int32_t * ids_dst = nullptr;
+    const int32_t * bounds = nullptr;
+};
+
 struct ggml_cuda_mmb_context {
     struct workspace {
         std::vector<mmb_cache_entry> cache;
@@ -1386,13 +1397,24 @@ struct ggml_cuda_mmb_context {
     std::map<std::pair<const void *, const void *>, uint16_t *> shadow_pair;
     size_t shadow_bytes = 0;
     // int8 copy of the normalized streams (W8A8 HC down): written by the combine that produces xn, read by the
-    // next HCD GEMM; keyed by the xn tensor data pointer
+    // next HCD GEMM; keyed by the xn root tensor and its data pointer. A grown buffer is retired, not freed, until
+    // release_all: captured graphs keep the old pointers baked into their kernel arguments.
     void *   xn_q8 = nullptr;
     void *   xn_q8_scale = nullptr;
     size_t   xn_q8_cap = 0;
     size_t   xn_q8_scale_cap = 0;
-    const void * xn_q8_for = nullptr;
+    const ggml_tensor * xn_q8_for = nullptr;
+    const void * xn_q8_for_data = nullptr;
+    std::vector<void *> xn_q8_retired;
     int      xn_q8_gs = -1;   // q8 layout: -1 = [kb][t][32] / [kb][t]; g >= 0: token groups of 1<<g ([t/G][kb][G][32]), hc_combine_norm_inject_v2
+    // routed tier streams: the GLU pool buffers kept alive for the down, its routing maps, the pending side and the
+    // fork/prep/join events
+    std::vector<std::function<void()>> glu_hold;
+    mmb_ids_record ids_rec;
+    bool side_pending = false;
+    cudaEvent_t fork_ev[2] = {};
+    cudaEvent_t prep_ev = nullptr;
+    cudaEvent_t join_ev = nullptr;
 };
 
 namespace {
@@ -1416,14 +1438,35 @@ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_t
     mmb_workspace(ctx).cache.push_back({mmb_root(t), t->data, n, f16, buf});
     return buf->get();
 }
-static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+// 16-bit copy of src1 (n elements) inside a slot or cache entry of its root: the entry itself, or a contiguous row range
+// of it (a view at an offset, e.g. the last-token strip of a trimmed layer). The copy has the root's element layout.
+static const uint16_t * mmb_copy_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, const bool f16) {
     const ggml_tensor * root = mmb_root(src1);
-    // Slot producers have graph dependencies; temporary conversions belong to their stream.
+    const bool sub = src1->view_src != nullptr && ggml_is_contiguous(src1) && ggml_is_contiguous(root) && root->type == GGML_TYPE_F32;
+    auto at = [&](const void * e_data, const size_t e_n, const uint16_t * buf) -> const uint16_t * {
+        if (e_data == src1->data && e_n == n) return buf;
+        if (!sub || e_data != root->data) return nullptr;
+        const size_t off = (size_t) ((const char *) src1->data - (const char *) e_data);
+        if ((const char *) src1->data < (const char *) e_data || off % sizeof(float) != 0 || off / sizeof(float) + n > e_n) return nullptr;
+        return buf + off / sizeof(float);
+    };
     for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {
         auto & work = mmb_state(ctx).streams[si];
-        for (int k = 0; k < (int) std::size(work.slots); ++k) { auto & e = work.slots[k]; if (e.buf && !e.f16 && e.root == root && e.data == src1->data && e.n == n) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return e.buf->get(); } }
+        for (int k = 0; k < (int) std::size(work.slots); ++k) {
+            auto & e = work.slots[k];
+            if (!e.buf || e.f16 != f16 || e.root != root) continue;
+            if (const uint16_t * p = at(e.data, e.n, e.buf->get())) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return p; }
+        }
     }
-    for (auto & e : mmb_workspace(ctx).cache) if (!e.f16 && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : mmb_workspace(ctx).cache) {
+        if (e.f16 != f16 || e.root != root) continue;
+        if (const uint16_t * p = at(e.data, e.n, e.buf->get())) return p;
+    }
+    return nullptr;
+}
+static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+    // Slot producers have graph dependencies; temporary conversions belong to their stream.
+    if (const uint16_t * p = mmb_copy_find(ctx, src1, n, false)) return p;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
@@ -1432,12 +1475,7 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
 // F16 (RNE) copy of an F32 activation: the exact value mmb_f32split_kernel stores as the hi half, so the f16hi
 // dense GEMM on this copy is bit-identical to the split kernel's hi*hi accumulation.
 static const uint16_t * mmb_f16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
-    const ggml_tensor * root = mmb_root(src1);
-    for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {
-        auto & work = mmb_state(ctx).streams[si];
-        for (int k = 0; k < (int) std::size(work.slots); ++k) { auto & e = work.slots[k]; if (e.buf && e.f16 && e.root == root && e.data == src1->data && e.n == n) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return e.buf->get(); } }
-    }
-    for (auto & e : mmb_workspace(ctx).cache) if (e.f16 && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    if (const uint16_t * p = mmb_copy_find(ctx, src1, n, true)) return p;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n, true);
     const int64_t nb = (int64_t) n;
     mmb_f32_to_f16_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, nb);
@@ -1445,13 +1483,7 @@ static const uint16_t * mmb_f16_activation(ggml_backend_cuda_context & ctx, cons
 }
 // cached 16-bit copy of src1 written by its producer (f16: the dense F16 copy), nullptr if none: no conversion
 static const uint16_t * mmb_act_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, const bool f16) {
-    const ggml_tensor * root = mmb_root(src1);
-    for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {
-        auto & work = mmb_state(ctx).streams[si];
-        for (int k = 0; k < (int) std::size(work.slots); ++k) { auto & e = work.slots[k]; if (e.buf && e.f16 == f16 && e.root == root && e.data == src1->data && e.n == n) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return e.buf->get(); } }
-    }
-    for (auto & e : mmb_workspace(ctx).cache) if (e.f16 == f16 && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
-    return nullptr;
+    return mmb_copy_find(ctx, src1, n, f16);
 }
 
 // Shadow BF16 copies of IQ4_NL dense weights: dequantised once (same LUT*scale -> BF16 RNE as mmb_dq_row36, so the
@@ -1597,6 +1629,12 @@ void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     // the int8 xn copy is keyed by data pointer only: an xn of this graph at the same address must not find the
     // previous graph's copy (the allocator reuses addresses across graphs)
     ctx.mmb->xn_q8_for = nullptr;
+    ctx.mmb->xn_q8_for_data = nullptr;
+    // holds left by a GLU whose down did not run through mmb (another kernel or backend)
+    for (auto it = ctx.mmb->glu_hold.rbegin(); it != ctx.mmb->glu_hold.rend(); ++it) (*it)();
+    ctx.mmb->glu_hold.clear();
+    ctx.mmb->ids_rec = mmb_ids_record{};
+    ctx.mmb->side_pending = false;
     for (auto & work : mmb_state(ctx).streams) {
         for (auto & e : work.cache) delete e.buf;
         work.cache.clear();
@@ -1613,6 +1651,10 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx) {
     for (auto & e : ctx.mmb->shadow_pair) CUDA_CHECK(cudaFree(e.second));
     if (ctx.mmb->xn_q8) CUDA_CHECK(cudaFree(ctx.mmb->xn_q8));
     if (ctx.mmb->xn_q8_scale) CUDA_CHECK(cudaFree(ctx.mmb->xn_q8_scale));
+    for (void * p : ctx.mmb->xn_q8_retired) CUDA_CHECK(cudaFree(p));
+    for (cudaEvent_t e : { ctx.mmb->fork_ev[0], ctx.mmb->fork_ev[1], ctx.mmb->prep_ev, ctx.mmb->join_ev }) {
+        if (e) CUDA_CHECK(cudaEventDestroy(e));
+    }
     delete ctx.mmb;
     ctx.mmb = nullptr;
 }
@@ -1625,19 +1667,22 @@ uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const gg
 // int8 copy of the normalized streams: the producing combine calls xnq8_buf (allocating/recording the key), the
 // W8A8 HC down GEMM calls xnq8_get with its src1 root; a mismatch (single-block combine, different graph) means
 // the buffer does not hold this xn and the GEMM falls back to its own quantization.
-uint8_t * ggml_cuda_mmb_xnq8_buf(ggml_backend_cuda_context & ctx, const void * xn_data, size_t bytes, size_t scale_bytes) {
+uint8_t * ggml_cuda_mmb_xnq8_buf(ggml_backend_cuda_context & ctx, const ggml_tensor * xn_root, size_t bytes, size_t scale_bytes) {
     ggml_cuda_mmb_context & st = mmb_state(ctx);
     if (st.xn_q8_cap < bytes) {
-        if (st.xn_q8) CUDA_CHECK(cudaFree(st.xn_q8));
+        if (st.xn_q8) st.xn_q8_retired.push_back(st.xn_q8);
+        bytes = std::max(bytes, 2 * st.xn_q8_cap);   // geometric: the retired buffers stay bounded by the live one
         CUDA_CHECK(cudaMalloc(&st.xn_q8, bytes));
         st.xn_q8_cap = bytes;
     }
     if (st.xn_q8_scale_cap < scale_bytes) {
-        if (st.xn_q8_scale) CUDA_CHECK(cudaFree(st.xn_q8_scale));
+        if (st.xn_q8_scale) st.xn_q8_retired.push_back(st.xn_q8_scale);
+        scale_bytes = std::max(scale_bytes, 2 * st.xn_q8_scale_cap);
         CUDA_CHECK(cudaMalloc(&st.xn_q8_scale, scale_bytes));
         st.xn_q8_scale_cap = scale_bytes;
     }
-    st.xn_q8_for = xn_data;
+    st.xn_q8_for = xn_root;
+    st.xn_q8_for_data = xn_root->data;
     st.xn_q8_gs = -1;
     return (uint8_t *) st.xn_q8;
 }
@@ -1647,9 +1692,9 @@ void ggml_cuda_mmb_xnq8_set_layout(ggml_backend_cuda_context & ctx, const int gs
 float * ggml_cuda_mmb_xnq8_scale(ggml_backend_cuda_context & ctx) {
     return (float *) mmb_state(ctx).xn_q8_scale;
 }
-const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context & ctx, const void * xn_data, const float ** scale_out, int * gs_out) {
+const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context & ctx, const ggml_tensor * xn_root, const float ** scale_out, int * gs_out) {
     ggml_cuda_mmb_context & st = mmb_state(ctx);
-    if (!st.xn_q8 || st.xn_q8_for != xn_data) return nullptr;
+    if (!st.xn_q8 || st.xn_q8_for != xn_root || st.xn_q8_for_data != xn_root->data) return nullptr;
     *scale_out = (const float *) st.xn_q8_scale;
     if (gs_out) *gs_out = st.xn_q8_gs;
     return (const uint8_t *) st.xn_q8;
@@ -1812,6 +1857,9 @@ static const uint16_t * mmb_f16sat_activation(ggml_backend_cuda_context & ctx, c
 }
 // Layout record, process-wide like the routed R2 one: data pointer -> bytes for dense Q8_0 tensors rewritten in place.
 static std::mutex g_dq_mutex;
+// serializes the in-place repacks (check, rewrite, record) across backend contexts sharing the weights; the device is
+// synchronized before a rewrite so no other context's kernel still reads the old layout
+static std::mutex g_repack_mutex;
 static std::map<const char *, size_t> g_dq_packed;
 static std::atomic<int> g_dq_count{0};
 bool ggml_cuda_mmb_dq_packed(const ggml_tensor * w) {
@@ -1965,7 +2013,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if ((M % 64) == 0 && (K % 128) == 0 && (T % 128) == 0) {
             const float * xsc = nullptr;
             int xtm = -1;
-            const uint8_t * xq = ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1)->data, &xsc, &xtm);
+            const uint8_t * xq = ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1), &xsc, &xtm);
             bool fused = xq != nullptr;
             ggml_cuda_pool_alloc<uint8_t> xq_buf(ctx.pool());
             ggml_cuda_pool_alloc<float> xsc_buf(ctx.pool());
@@ -2079,6 +2127,7 @@ bool ggml_cuda_mmb_down16() { return true; }
 bool ggml_cuda_mmb_blk16() { return true; }
 bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
+    if (ggml_cuda_mmb_dq_packed(w)) return false;   // the kernel decodes the row-major Q8_0 layout, not the dense R2 tiles
     if (hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
@@ -2158,6 +2207,9 @@ template <int WTYPE, int BN, bool PAIR = true> __global__ void __launch_bounds__
         const std::int32_t * __restrict__ rows_in, const std::int32_t * __restrict__ rows_out,
         const std::int32_t * __restrict__ pad_bounds, const uint32_t * __restrict__ tiles,
         const std::size_t expert_bytes, std::size_t m, std::size_t k) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+  NO_DEVICE_CODE;   // RDNA3 WMMA and wave32 inline asm
+#else
   constexpr int BM = 128, BK = 2;
   constexpr bool kPair = PAIR;
 
@@ -2631,6 +2683,7 @@ template <int WTYPE, int BN, bool PAIR = true> __global__ void __launch_bounds__
     }
     return;
   }
+#endif
 }
 
 // Tier streams: the routed small tier (hundreds of experts under THRESH rows: weight-streaming bound, ~360 GB/s
@@ -2643,21 +2696,24 @@ template <int WTYPE, int BN, bool PAIR = true> __global__ void __launch_bounds__
 // the following routed-down op builds its ids/desc on the side stream (after small GLU), main waits only for that,
 // then big down (main, after big GLU) and small down (side, after small GLU) overlap; join at the end of down.
 // pp2048 1675 -> 1684 t/s vs a per-op join, PPL unchanged.
-static bool g_side_pending[GGML_CUDA_MAX_DEVICES] = {};
-static std::vector<std::function<void()>> g_glu_hold;   // GLU pool buffers kept alive while its side tier is pending
+// The pending side, the holds, the routing record and the events are per backend context (ggml_cuda_mmb_context).
 template <typename T> static ggml_cuda_pool_alloc<T> & mmb_hold_alloc(ggml_backend_cuda_context & ctx, size_t n) {
     auto * a = new ggml_cuda_pool_alloc<T>(ctx.pool(), n);
-    g_glu_hold.push_back([a]() { delete a; });
+    mmb_state(ctx).glu_hold.push_back([a]() { delete a; });
     return *a;
 }
 // The routed down reuses the routing maps of the GLU before it (same ids tensor). For the GLU
 // (src1 [K, 1, T]) the helper writes ids_dst = token*n_used + slot, which is exactly the down's ids_src1 (src1 [K, n_used, T])
 // and ids_dst; the bounds are the same. The GLU maps are held (mmb_hold_alloc) until the down releases them.
-struct mmb_ids_record { const void * ids = nullptr; int T = 0, n_used = 0, E = 0, si1 = 0; const int32_t * ids_dst = nullptr; const int32_t * bounds = nullptr; };
-static mmb_ids_record g_ids_rec[GGML_CUDA_MAX_DEVICES];
-static void mmb_hold_release() {
-    for (auto it = g_glu_hold.rbegin(); it != g_glu_hold.rend(); ++it) (*it)(); g_glu_hold.clear();
-    for (auto & r : g_ids_rec) r = mmb_ids_record{};
+static void mmb_hold_release(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_mmb_context & st = mmb_state(ctx);
+    for (auto it = st.glu_hold.rbegin(); it != st.glu_hold.rend(); ++it) (*it)();
+    st.glu_hold.clear();
+    st.ids_rec = mmb_ids_record{};
+}
+static cudaEvent_t mmb_event(cudaEvent_t & e) {
+    if (!e) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    return e;
 }
 struct mmb_tier_fork {
     cudaStream_t main = nullptr, side = nullptr;
@@ -2668,21 +2724,16 @@ struct mmb_tier_fork {
         constexpr int SIDE = GGML_CUDA_MAX_STREAMS - 1;
         main = ctx.stream();
         if (ctx.curr_stream_no == SIDE) return;
-        static cudaEvent_t ev[GGML_CUDA_MAX_DEVICES][2] = {};
-        cudaEvent_t * e = ev[ctx.device];
-        if (e[0] == nullptr) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&e[0], cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&e[1], cudaEventDisableTiming));
-        }
+        ggml_cuda_mmb_context & st = mmb_state(ctx);
         side = ctx.stream(ctx.device, SIDE);
-        if (mode == 2 && g_side_pending[ctx.device]) {
-            g_side_pending[ctx.device] = false;      // side already ordered after its own GLU work
+        if (mode == 2 && st.side_pending) {
+            st.side_pending = false;      // side already ordered after its own GLU work
         } else {
-            CUDA_CHECK(cudaEventRecord(e[0], main));
-            CUDA_CHECK(cudaStreamWaitEvent(side, e[0], 0));
+            CUDA_CHECK(cudaEventRecord(mmb_event(st.fork_ev[0]), main));
+            CUDA_CHECK(cudaStreamWaitEvent(side, st.fork_ev[0], 0));
         }
-        if (mode == 1) { nojoin = true; g_side_pending[ctx.device] = true; }
-        join = e[1];
+        if (mode == 1) { nojoin = true; st.side_pending = true; }
+        join = mmb_event(st.fork_ev[1]);
     }
     cudaStream_t small() const { return side ? side : main; }
     ~mmb_tier_fork() {
@@ -2692,6 +2743,14 @@ struct mmb_tier_fork {
         }
     }
 };
+static void mmb_join_pending(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_mmb_context & st = mmb_state(ctx);
+    if (!st.side_pending) return;
+    st.side_pending = false;
+    const cudaEvent_t ej = mmb_event(st.join_ev);
+    CUDA_CHECK(cudaEventRecord(ej, ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1)));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ej, 0));
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Down R2: routed MoE down projection (Q5_1, K=640) on a repacked shadow of the expert weights (team/moe-down md4,
@@ -3476,6 +3535,7 @@ bool ggml_cuda_mmb_r2_overlaps(const void * base, const size_t size) {
 // small temporary buffer and repacked from it back into the tensor's own memory.
 void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!mmb_enabled(ctx) || !mmb_r2_eligible(w)) return;
+    std::lock_guard<std::mutex> repack_lock(g_repack_mutex);
     const char * key = (const char *) w->data;
     {
         std::lock_guard<std::mutex> lock(g_r2_mutex);
@@ -3498,6 +3558,8 @@ void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_t
         return;
     }
     constexpr int CHUNK = 16;   // experts per temporary copy (16 x 1.2 MB)
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaDeviceSynchronize());
     {
         ggml_cuda_pool_alloc<uint8_t> tmp(ctx.pool(), (size_t) CHUNK * eb);
         for (int e0 = 0; e0 < E; e0 += CHUNK) {
@@ -3526,10 +3588,9 @@ static bool mmb_down_r2_launch(ggml_backend_cuda_context & ctx, const ggml_tenso
     mmb_r2_build_desc<<<1, 1024, 0, prep_stream>>>(bounds, desc.get(), E, n_rt, n_max);
     cudaStream_t stream = prep_stream;
     if (xp) {
-        static cudaEvent_t eprep[GGML_CUDA_MAX_DEVICES] = {};
-        if (!eprep[ctx.device]) CUDA_CHECK(cudaEventCreateWithFlags(&eprep[ctx.device], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventRecord(eprep[ctx.device], prep_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), eprep[ctx.device], 0));
+        const cudaEvent_t eprep = mmb_event(mmb_state(ctx).prep_ev);
+        CUDA_CHECK(cudaEventRecord(eprep, prep_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), eprep, 0));
         stream = ctx.stream();
     }
     mmb_r2_down_kernel<640><<<n_max, 256, 0, stream>>>((const uint8_t *) src0->data, (size_t) src0->nb[2], xhp, ids_src1, ids_dst, desc.get(), Dh, D, M);
@@ -3554,6 +3615,7 @@ void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context & ctx, const ggml_te
 void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw) {
     if (!mmb_enabled(ctx)) return;
     if (!mmb_g2_eligible(gw) || !mmb_g2_eligible(uw) || gw->data == uw->data || !ggml_are_same_shape(gw, uw) || gw->nb[2] != uw->nb[2]) return;
+    std::lock_guard<std::mutex> repack_lock(g_repack_mutex);
     {
         std::lock_guard<std::mutex> lock(g_r2_mutex);
         const char * kg = (const char *) gw->data, * ku = (const char *) uw->data;
@@ -3580,6 +3642,8 @@ void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         return;
     }
     constexpr int CHUNK = 16;   // experts per temporary copy
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaDeviceSynchronize());
     {
         ggml_cuda_pool_alloc<uint8_t> tmp(ctx.pool(), (size_t) CHUNK * eb);
         for (const ggml_tensor * w : {gw, uw}) {
@@ -3662,7 +3726,7 @@ void ggml_cuda_mul_mat_id_g2_gemv_glu(ggml_backend_cuda_context & ctx, const ggm
 }
 
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    const bool xp = g_side_pending[ctx.device];
+    const bool xp = mmb_state(ctx).side_pending;
     cudaStream_t stream = xp ? ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1) : ctx.stream();   // prep stream
     const int K = (int) src0->ne[0], M = (int) src0->ne[1], E = (int) src0->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
@@ -3673,8 +3737,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
-    const mmb_ids_record & rec = g_ids_rec[ctx.device];
-    const bool reuse = !xp && rec.ids == ids->data && rec.T == T && rec.n_used == n_used && rec.E == E &&
+    const mmb_ids_record & rec = mmb_state(ctx).ids_rec;
+    const bool reuse = !xp && rec.ids == ids->data && rec.glu == mmb_root(src1) && rec.glu_data == mmb_root(src1)->data && rec.T == T && rec.n_used == n_used && rec.E == E &&
         rec.si1 == si1 && ne11 == n_used && sis1 == n_used && ggml_cuda_mmb_r2_packed(src0);
     ggml_cuda_pool_alloc<int32_t> ids_src1_a(ctx.pool()), ids_dst_a(ctx.pool()), bounds_a(ctx.pool());
     const int32_t * ids_src1_p, * ids_dst_p, * bounds_p;
@@ -3692,14 +3756,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     {   // down R2: Q5_1 down experts with a repacked shadow -> one interleaved launch (no big/small tier split)
         uint16_t * Dh_r2 = ggml_cuda_mmb_is_bf16_only(ctx, dst) ? (uint16_t *) dst->data : nullptr;
         if (mmb_down_r2_launch(ctx, src0, xhp, Dh_r2, Dh_r2 ? nullptr : (float *) dst->data, ids_src1_p, ids_dst_p, bounds_p, E, M, K, n_rows, stream, xp)) {
-            if (g_side_pending[ctx.device]) {   // the pending side (small GLU tier) must be joined before the reduction
-                g_side_pending[ctx.device] = false;
-                static cudaEvent_t ej[GGML_CUDA_MAX_DEVICES] = {};
-                if (!ej[ctx.device]) CUDA_CHECK(cudaEventCreateWithFlags(&ej[ctx.device], cudaEventDisableTiming));
-                CUDA_CHECK(cudaEventRecord(ej[ctx.device], ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1)));
-                CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ej[ctx.device], 0));
-            }
-            mmb_hold_release();
+            mmb_join_pending(ctx);   // the pending side (small GLU tier) must be joined before the reduction
+            mmb_hold_release(ctx);
             return;
         }
     }
@@ -3733,10 +3791,9 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds_p, desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN_rt, BN_SMALL, THRESH);
 
     if (xp) {
-        static cudaEvent_t eprep[GGML_CUDA_MAX_DEVICES] = {};
-        if (!eprep[ctx.device]) CUDA_CHECK(cudaEventCreateWithFlags(&eprep[ctx.device], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventRecord(eprep[ctx.device], stream));
-        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), eprep[ctx.device], 0));
+        const cudaEvent_t eprep = mmb_event(mmb_state(ctx).prep_ev);
+        CUDA_CHECK(cudaEventRecord(eprep, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), eprep, 0));
         stream = ctx.stream();
     }
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
@@ -3766,14 +3823,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), M, K);
     }
     });
-    if (g_side_pending[ctx.device]) {   // a path without fork: join the pending side now
-        g_side_pending[ctx.device] = false;
-        static cudaEvent_t ej[GGML_CUDA_MAX_DEVICES] = {};
-        if (!ej[ctx.device]) CUDA_CHECK(cudaEventCreateWithFlags(&ej[ctx.device], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventRecord(ej[ctx.device], ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1)));
-        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ej[ctx.device], 0));
-    }
-    mmb_hold_release();
+    mmb_join_pending(ctx);   // a path without fork: join the pending side now
+    mmb_hold_release(ctx);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3790,7 +3841,7 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
 }
 
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
-    mmb_hold_release();   // stale holds (should be empty)
+    mmb_hold_release(ctx);   // stale holds (should be empty)
     cudaStream_t stream = ctx.stream();
     const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
@@ -3802,7 +3853,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // rows (T=1..8) through tile padding (tg128 -0.7).
     constexpr int BN_gluk = 128;
     // gluk decodes Q4_K / Q5_K superblocks and Q5_1 only: the other routed types keep the legacy tiers
-    const bool glk_this = T >= 128 && (gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q5_1);
+    const bool glk_this = T >= 128 && M % 2 == 0 && (gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q5_1);   // the pair epilogue stores row pairs
     const int BN_rt = glk_this ? BN_gluk : BN_sel;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     auto & ids_src1 = mmb_hold_alloc<int32_t>(ctx, n_rows);
@@ -3816,7 +3867,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
     if (ne11 == 1 && sis1 == 1) {
-        g_ids_rec[ctx.device] = mmb_ids_record{ids->data, T, n_used, E, si1, ids_dst.get(), bounds.get()};
+        mmb_state(ctx).ids_rec = mmb_ids_record{ids->data, glu, glu->data, T, n_used, E, si1, ids_dst.get(), bounds.get()};
     }
     if (ggml_cuda_mmb_g2_packed(gw) && ggml_cuda_mmb_g2_packed(uw)) {   // GLU R2: one launch, no tier split / side stream
         uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
@@ -3985,8 +4036,11 @@ void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_
     if (!w || w->type != GGML_TYPE_Q8_0 || w->op != GGML_OP_NONE || w->view_src != nullptr || !w->data || !w->buffer ||
             ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w) ||
             w->ne[2] != 1 || w->ne[3] != 1 || !mmb_tq8_shape(w->ne[1], w->ne[0])) return;
+    std::lock_guard<std::mutex> repack_lock(g_repack_mutex);
     const char * key = (const char *) w->data;
     if (ggml_cuda_mmb_dq_packed(w)) return;
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaDeviceSynchronize());
     const int K = (int) w->ne[0], M = (int) w->ne[1];
     const size_t tile = (size_t) (K / 64) * MMB_TQ8_CHUNK, bytes = (size_t) (M / 128) * tile;
     GGML_ASSERT(bytes == ggml_nbytes(w) && tile == (size_t) 128 * (K / 32) * 34);

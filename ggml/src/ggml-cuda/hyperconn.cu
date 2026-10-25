@@ -789,7 +789,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
         const size_t q8b = (size_t) q8_blocks * hc * n_tokens * 32;
         const size_t q8s = (size_t) q8_blocks * hc * n_tokens * sizeof(float);
         const ggml_tensor * xroot = a.out_xn->view_src ? a.out_xn->view_src : a.out_xn;
-        aa.out_xn_q8    = ggml_cuda_mmb_xnq8_buf(ctx, xroot->data, q8b, q8s);
+        aa.out_xn_q8    = ggml_cuda_mmb_xnq8_buf(ctx, xroot, q8b, q8s);
         aa.out_xn_scale = ggml_cuda_mmb_xnq8_scale(ctx);
     }
 

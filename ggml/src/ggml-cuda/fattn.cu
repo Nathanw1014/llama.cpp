@@ -1083,7 +1083,9 @@ static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const
 
 bool ggml_cuda_qsa_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
 #if defined(GGML_USE_HIP)
-    return fa->op == GGML_OP_FLASH_ATTN_EXT &&
+    // the fused op must reach the prefill kernel (decode is tried first) and the gate spans one stream
+    return fa->op == GGML_OP_FLASH_ATTN_EXT && fa->src[0]->ne[3] == 1 &&
+        !ggml_cuda_flash_attn_ext_qsa_decode_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa) &&
         ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
 #else
     GGML_UNUSED(ctx); GGML_UNUSED(fa);
@@ -1192,5 +1194,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // a maskless selected-key op (visibility only in src[5]) runs on the QSA kernels alone: an op neither takes must
+    // go to another backend instead of the abort in ggml_cuda_flash_attn_ext
+    if (dst->src[5] && !dst->src[3]) {
+#if defined(GGML_USE_HIP)
+        return ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(device, dst) ||
+               ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(device, dst);
+#else
+        return false;
+#endif
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

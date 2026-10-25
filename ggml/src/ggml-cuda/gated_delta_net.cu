@@ -1920,6 +1920,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // z stored BF16-only (ggml_cuda_gdn_z16_ok, a graph-time choice) is read natively only by the v2 epilogue: when the
             // run-time checks above still refuse v2, the chunked scan below reads an F32 copy instead
             const bool z_widen = on_ovr.z_bf16 && !use_v2;
+            // F32 norm output (v1 scan): it is written while inputs freed by the allocator after this node are still read
+            // (later sequences' inputs, the initial state of head blocks not yet resident): stage it, copy at the end
+            ggml_cuda_pool_alloc<float> out_stage(ctx.pool());
+            float * out_base = on_ovr.out;
+            if (on_ovr.out && !use_v2) {
+                out_stage.alloc((size_t) n_seqs * n_tokens * H * 128);
+                out_base = out_stage.get();
+            }
             auto run = [&](auto CLc, const int64_t is) {
                 // sequence `is`: its q/k/v (or conv input and history), g/beta, state in/out, output rows and z / norm output
                 const size_t ro = (size_t) is * n_tokens * H * 128;   // output rows, z and the norm output of the sequence
@@ -1934,7 +1942,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 float * dsts = dst_d + ro;
                 const float * zs = on_ovr.z ? (const float *) ((const char *) on_ovr.z + ro * (on_ovr.z_bf16 ? 2 : 4)) : nullptr;
                 uint16_t * o16s = on_ovr.out16 ? on_ovr.out16 + ro : nullptr;
-                float * o32s = on_ovr.out ? on_ovr.out + ro : nullptr;
+                float * o32s = out_base ? out_base + ro : nullptr;
                 constexpr int CL = decltype(CLc)::value;
                 const int nch = (int) ((n_tokens + CL - 1) / CL);
                 if (use_v2) {
@@ -1980,6 +1988,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
             };
             for (int64_t is = 0; is < n_seqs; ++is) {
                 run(std::integral_constant<int, 32>{}, is);  //CL64 fails LDS 90KB > 64KB limit
+            }
+            if (out_base != on_ovr.out) {
+                CUDA_CHECK(cudaMemcpyAsync(on_ovr.out, out_base, (size_t) n_seqs * n_tokens * H * 128 * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream));
             }
             return;
         }

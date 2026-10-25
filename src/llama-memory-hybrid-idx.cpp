@@ -112,15 +112,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (mem_idx) {
-        // the QSA layers must all run where a kernel reads the selection list: HIP (RDNA3.5), or a backend that takes the probe op
-        // CUDA is not asked: its supports_op does not look at the list
+        // the QSA layers must all run where a kernel reads the selection list: a backend that takes the probe op
+        // (ggml-cuda: the HIP QSA kernels on RDNA3.5)
         bool all = true, any = false;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
-            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
             any = true;
-            all = all && (std::strcmp(reg, "ROCm") == 0 ||
-                          (std::strcmp(reg, "CUDA") != 0 && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il)));
+            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
         }
         selected_key_attn = any && all && offload;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }

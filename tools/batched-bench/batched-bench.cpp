@@ -128,7 +128,7 @@ int llama_batched_bench(int argc, char ** argv) {
 
                 // BB_DEPTH=D: every sequence first holds D tokens of context (untimed), the prompt follows at position D
                 static const int depth = getenv("BB_DEPTH") ? atoi(getenv("BB_DEPTH")) : 0;
-                const int n_ctx_req = (is_pp_shared ? (params.kv_unified ? pp : pl*pp) + pl*tg : pl*(pp + tg)) + pl*depth;
+                const int n_ctx_req = (is_pp_shared ? (params.kv_unified ? pp : pl*pp) + pl*tg : pl*(pp + tg)) + (is_pp_shared && params.kv_unified ? depth : pl*depth);   // a shared unified depth is decoded once
 
                 if (n_ctx_req > n_kv_max) {
                     continue;
@@ -146,11 +146,6 @@ int llama_batched_bench(int argc, char ** argv) {
                     if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                         LOG_ERR("%s: llama_decode() failed (depth)\n", __func__);
                         return 1;
-                    }
-                    if (is_pp_shared) {
-                        for (int32_t i = 1; i < pl; ++i) {
-                            llama_memory_seq_cp(mem, 0, i, -1, -1);
-                        }
                     }
                 }
 
@@ -190,7 +185,7 @@ int llama_batched_bench(int argc, char ** argv) {
                             llama_model_free(model);
                             return 1;
                         }
-                        llama_memory_seq_rm(mem, 0, pp, -1);
+                        llama_memory_seq_rm(mem, 0, depth + pp, -1);
                     }
                 }
 

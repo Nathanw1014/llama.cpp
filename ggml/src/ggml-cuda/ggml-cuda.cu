@@ -6892,7 +6892,10 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
             const int iu = find(i - 2, i + 4,   [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "ffn_up", sfx); });
             const int ig = find(i + 1, i + 80,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "shared_expert_gate", sfx); });
             const int b  = find(i + 1, i + 120, [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL && name_is(u, "ffn_moe_weighted", sfx); });
-            if (iu >= 0 && ig >= 0 && b >= 0 && ig < b && iu < b) {
+            // a MUL feeding the weighted node (per-expert down scale) starts the fused weighted reduction that also covers
+            // the end node: the group would cross the join
+            auto scaled = [&](const ggml_tensor * u) { return u && u->op == GGML_OP_MUL; };
+            if (iu >= 0 && ig >= 0 && b >= 0 && ig < b && iu < b && !scaled(cg->nodes[b]->src[0]) && !scaled(cg->nodes[b]->src[1])) {
                 cands.push_back({ std::min(i, iu), b, { t, cg->nodes[iu], cg->nodes[ig] }, 2, false });
             }
         } else if (name_is(t, "Vcur", sfx)) {
@@ -6909,6 +6912,10 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         if (c.a <= prev_b) { continue; }
         std::unordered_set<const ggml_tensor *> S(c.seeds.begin(), c.seeds.end());
         std::unordered_set<const ggml_tensor *> M;
+        // tensors outside the region (KV cache, recurrent state) written in place by a node of each side (SET_ROWS, CPY
+        // into a view), and the outside roots each side's real ops read: a later reader of such a root has no src edge
+        // to its writer, so it joins the writer's side; a write to a root the other side already read is rejected
+        std::unordered_set<const ggml_tensor *> WS, WM, RS, RM;
         bool ok = true;
         for (int j = c.a; j < c.b && ok; ++j) {
             const ggml_tensor * n = cg->nodes[j];
@@ -6917,15 +6924,28 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * x = n->src[s];
                 if (!x) continue;
-                reads_s |= S.count(x) > 0 || S.count(root(x)) > 0;
-                reads_m |= M.count(x) > 0 || M.count(root(x)) > 0;
+                reads_s |= S.count(x) > 0 || S.count(root(x)) > 0 || WS.count(root(x)) > 0;
+                reads_m |= M.count(x) > 0 || M.count(root(x)) > 0 || WM.count(root(x)) > 0;
             }
             if (n->view_src) {
-                reads_m |= M.count(n->view_src) > 0;
+                reads_m |= M.count(n->view_src) > 0 || WM.count(n->view_src) > 0;
+                reads_s |= WS.count(n->view_src) > 0;
             }
-            if (reads_s && reads_m) ok = false;
-            else if (reads_s) S.insert(n);
-            else M.insert(n);
+            if (reads_s && reads_m) { ok = false; break; }
+            const bool side_s = reads_s;
+            (side_s ? S : M).insert(n);
+            auto & W = side_s ? WS : WM;
+            auto & R = side_s ? RS : RM;
+            const bool outside = n->view_src && S.count(n->view_src) == 0 && M.count(n->view_src) == 0;
+            if (outside && !ggml_cuda_is_view_or_noop(n)) {
+                if ((side_s ? RM : RS).count(n->view_src) > 0) { ok = false; break; }
+                W.insert(n->view_src);
+            }
+            if (ggml_cuda_is_view_or_noop(n)) continue;   // a view reads nothing: its real reader records the root
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * x = n->src[s];
+                if (x && S.count(root(x)) == 0 && M.count(root(x)) == 0) R.insert(root(x));
+            }
         }
         // M must hold real work, and the S seeds must all be inside the range
         bool m_work = false;
@@ -7371,7 +7391,7 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
+    if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0 || !cuda_ctx->ovl_regions.empty()) {
         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
         if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
             ggml_cuda_mmb_marks_clear(*cuda_ctx);
@@ -7857,7 +7877,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const ggml_tensor * g = m.x->view_src;
                 if (!g || !ggml_cuda_gdn_z16_ok(g)) continue;
                 const ggml_tensor * zt = m.z->view_src ? m.z->view_src : m.z;
-                if (zt->op != GGML_OP_MUL_MAT || zt->type != GGML_TYPE_F32 || !ggml_is_contiguous(zt) || zt->ne[0] % 8 != 0 ||
+                // an F32-weight GEMM (f32split / f16hi) always stores F32: it cannot honour the mark
+                if (zt->op != GGML_OP_MUL_MAT || zt->type != GGML_TYPE_F32 || zt->src[0]->type == GGML_TYPE_F32 || !ggml_is_contiguous(zt) || zt->ne[0] % 8 != 0 ||
                     ggml_nelements(zt) != ggml_nelements(m.z) || (zt->flags & GGML_TENSOR_FLAG_OUTPUT) ||
                     !ggml_cuda_mmb_supported_mm(*cuda_ctx, zt->src[0], zt->src[1], zt)) continue;
                 int zi = -1;
@@ -7931,9 +7952,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             const ggml_tensor * t = cgraph->nodes[i];
             if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K || t->src[0]->type == GGML_TYPE_Q8_0 || t->src[0]->type == GGML_TYPE_F32) && ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
         }
-        for (int i = 0; i < cgraph->n_nodes; ++i) {   // MMB_DOWN_R2: repacked shadow of Q5_1 routed-down experts
-            const ggml_tensor * t = cgraph->nodes[i];
-            if (t->op == GGML_OP_MUL_MAT_ID && t->src[0]->type == GGML_TYPE_Q5_1) ggml_cuda_mmb_down_r2_prepare(*cuda_ctx, t->src[0]);
+        {   // MMB_DOWN_R2: repacked shadow of Q5_1 routed-down experts (device memory only); a GLU input is a gate/up,
+            // whose fused GLU kernels read the plain Q5_1 layout
+            std::unordered_set<const ggml_tensor *> glu_in;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (t->op != GGML_OP_GLU) continue;
+                for (int s = 0; s < 2; ++s) if (t->src[s]) glu_in.insert(t->src[s]);
+            }
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                // src1 [K, 1, T] is the broadcast gate/up input (also when a bias ADD_ID sits before the GLU); a down reads n_used rows
+                if (t->op == GGML_OP_MUL_MAT_ID && t->src[0]->type == GGML_TYPE_Q5_1 && glu_in.count(t) == 0 && t->src[1]->ne[1] != 1 &&
+                        t->src[0]->buffer && ggml_backend_buffer_is_cuda(t->src[0]->buffer)) ggml_cuda_mmb_down_r2_prepare(*cuda_ctx, t->src[0]);
+            }
         }
         {   // MMB_DENSE_R2: in-place tile repack of dense Q8_0 weights whose only readers in this graph are MUL_MAT src0
             std::unordered_set<const ggml_tensor *> other_use;
@@ -7942,7 +7974,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
                     const ggml_tensor * x = t->src[s];
                     if (x->type != GGML_TYPE_Q8_0) continue;
-                    if (s != 0 || t->op != GGML_OP_MUL_MAT) other_use.insert(x->view_src ? x->view_src : x);
+                    // the packed fallback (mul_mat_dq) takes a contiguous F32 src1 only
+                    const bool mm_ok = s == 0 && t->op == GGML_OP_MUL_MAT && t->src[1] && t->src[1]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(t->src[1]) && ggml_is_contiguous(t);
+                    if (!mm_ok) other_use.insert(x->view_src ? x->view_src : x);
                     if (x->view_src) other_use.insert(x->view_src);
                 }
             }
@@ -7983,7 +8018,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             const ggml_tensor * glu = cgraph->nodes[i];
             if (glu->op != GGML_OP_GLU || !glu->src[0] || !glu->src[1] || glu->src[0]->op != GGML_OP_MUL_MAT_ID) continue;
             if (!ggml_cuda_mmb_supported_glu(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
-            ggml_cuda_mmb_glu_r2_prepare(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0]);   // MMB_GLU_R2: in-place G2 repack of the Q4_K pair
+            if (glu->src[0]->src[0]->buffer && ggml_backend_buffer_is_cuda(glu->src[0]->src[0]->buffer) &&
+                    glu->src[1]->src[0]->buffer && ggml_backend_buffer_is_cuda(glu->src[1]->src[0]->buffer)) {
+                ggml_cuda_mmb_glu_r2_prepare(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0]);   // MMB_GLU_R2: in-place G2 repack of the Q4_K pair
+            }
             for (const auto * input : {glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu->src[0], glu->src[1]}) {
                 auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                 params->add_alloc_dep(params->user_data, root, const_cast<ggml_tensor *>(glu));

@@ -24,9 +24,9 @@ void ggml_cuda_mmb_cache_unproduce(ggml_backend_cuda_context & ctx, const uint16
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n, bool f16 = false);
 // int8 copy of the normalized streams for the W8A8 HC down: the producing combine allocates/keys it, the GEMM
 // looks it up by its src1 root (a mismatch means it does not hold this xn and the GEMM quantizes itself)
-uint8_t * ggml_cuda_mmb_xnq8_buf(ggml_backend_cuda_context & ctx, const void * xn_data, size_t bytes, size_t scale_bytes);
+uint8_t * ggml_cuda_mmb_xnq8_buf(ggml_backend_cuda_context & ctx, const ggml_tensor * xn_root, size_t bytes, size_t scale_bytes);
 float * ggml_cuda_mmb_xnq8_scale(ggml_backend_cuda_context & ctx);
-const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context & ctx, const void * xn_data, const float ** scale_out, int * gs_out = nullptr);
+const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context & ctx, const ggml_tensor * xn_root, const float ** scale_out, int * gs_out = nullptr);
 void ggml_cuda_mmb_xnq8_set_layout(ggml_backend_cuda_context & ctx, int gs);
 void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx);
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx);

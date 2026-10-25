@@ -1072,9 +1072,11 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
-    GGML_UNUSED(n_stream);   // split streams select per stream (one sequence's cells each)
+    // split streams select per stream (one sequence's cells each). Depth bound of the QSA kernels: prefill 262140 (uint16
+    // cell groups, 0xFFFF pad), decode (one stream, <= 512 queries) 262144
+    const bool depth_ok = n_kv<=262140 || (n_stream==1 && ubatch.n_tokens<=512 && n_kv<=262144);
     return selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
+        n_kv>hparams.indexer_top_k+ratio-1 && depth_ok && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
         type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;

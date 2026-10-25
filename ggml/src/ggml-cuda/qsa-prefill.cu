@@ -535,9 +535,12 @@ void qsa3_attn_kernel(
 }
 
 bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(ctx.device, dst);
+}
+bool ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(int device, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     if (!q || !k || !v || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
-            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
+            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) return false;
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
     // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
     if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1)) return false;
