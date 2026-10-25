@@ -1594,7 +1594,7 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
-        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const int n_ctx_train = n_ctx_model();
 
         {
             // note: the capping itself is done in n_ctx_slot(), here we only report it
@@ -1618,7 +1618,7 @@ private:
                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
 
             if (n_ctx_capped > n_ctx_train) {
-                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
+                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d, training context extended by --rope-scale) - capping\n",
                         n_ctx_capped, n_ctx_train);
             }
         }
@@ -4861,7 +4861,21 @@ private:
         });
     }
 
-    // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // the context the model can serve: its training context, extended by an explicit RoPE frequency scale
+    // (--rope-scale N / --rope-freq-scale; YaRN x4 serves 4 x the original context). The context ignores the scale
+    // with --rope-scaling none, and YaRN extends --yarn-orig-ctx when it is given.
+    int n_ctx_model() const {
+        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const float scale = params_base.rope_freq_scale;
+        if (scale > 0.0f && scale < 1.0f && params_base.rope_scaling_type != LLAMA_ROPE_SCALING_TYPE_NONE) {
+            const int base = params_base.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && params_base.yarn_orig_ctx > 0 ?
+                params_base.yarn_orig_ctx : n_ctx_train;
+            return (int) std::min<double>((double) base / scale, (double) INT32_MAX);
+        }
+        return n_ctx_train;
+    }
+
+    // context size of a single slot, capped by --kv-unified-per-slot and by the context the model can serve
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 
@@ -4869,7 +4883,7 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
-        return std::min(res, llama_model_n_ctx_train(model_tgt));
+        return std::min(res, n_ctx_model());
     }
 
     server_response_reader get_response_reader() {
