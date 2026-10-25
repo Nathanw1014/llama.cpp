@@ -1870,7 +1870,7 @@ void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const size_t n = (size_t) T * K;
     ggml_cuda_pool_alloc<uint16_t> xh(ctx.pool(), n);
     mmb_cvt_f32_f16_sat<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, xh.get(), n);
-    mmb_tq8_launch((const uint8_t *) src0->data, xh.get(), (float *) dst->data, nullptr, true, M, K, T, false, true, stream);
+    mmb_tq8_launch((const uint8_t *) src0->data, xh.get(), (float *) dst->data, nullptr, true, M, K, T, mmb_tq8_k7(M, K), true, stream);
 }
 int ggml_cuda_mmb_f16_reader(ggml_backend_cuda_context & ctx, const ggml_tensor * n) {
     if (!n || n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1]) return 0;
@@ -3428,7 +3428,7 @@ static std::set<const char *> g_g2_failed;
 static bool mmb_g2_eligible(const ggml_tensor * w) {
     return w && w->type == GGML_TYPE_Q4_K && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data && w->buffer &&
            ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_is_contiguous(w) && w->ne[3] == 1 &&
-           w->ne[0] % 256 == 0 && w->ne[0] <= 8192 && w->ne[1] % G2_BM == 0 && w->ne[2] >= 1 && w->ne[2] <= 1024 &&
+           (w->ne[0] == 2048 || w->ne[0] == 2560 || w->ne[0] == 4096) && w->ne[1] % G2_BM == 0 && w->ne[2] >= 1 && w->ne[2] <= 1024 &&
            w->nb[2] == (size_t) w->ne[1] * (w->ne[0] / 256) * 144;
 }
 } // namespace
@@ -3724,7 +3724,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool dmid = RT != 1 && RT != 2 && RT != 3;
     const int nbig_max   = n_rows / 64 + E + 2;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
-    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), dmid ? nbig_max : n_rows / BN_rt + E + 1);
+    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
     ggml_cuda_pool_alloc<uint32_t> desc_mid(ctx.pool(), !dmid ? 1 : E + 1);
     if (dmid)
@@ -3801,7 +3801,8 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // Gated at T>=128: it wins the prefill (pp2048 +40) but costs decode-width
     // rows (T=1..8) through tile padding (tg128 -0.7).
     constexpr int BN_gluk = 128;
-    const bool glk_this = T >= 128;
+    // gluk decodes Q4_K / Q5_K superblocks and Q5_1 only: the other routed types keep the legacy tiers
+    const bool glk_this = T >= 128 && (gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q5_1);
     const int BN_rt = glk_this ? BN_gluk : BN_sel;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     auto & ids_src1 = mmb_hold_alloc<int32_t>(ctx, n_rows);
@@ -3831,7 +3832,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
     const int nbig_cap   = glk_this ? n_rows / BN_gluk + E + 2 : n_rows / 64 + E + 2;
     const int nbig_max   = nbig_cap;   // legacy name used by the non-gluk branches
-    const int nsmall_max = E + 1;
+    const int nsmall_max = E * ((THRESH + 31) / 32) + 1;   // small experts take ceil(cnt / 32) tiles
     auto & desc_big = mmb_hold_alloc<uint32_t>(ctx, nbig_cap);
     auto & desc_small = mmb_hold_alloc<uint32_t>(ctx, nsmall_max);
     auto & desc_mid = mmb_hold_alloc<uint32_t>(ctx, glk_this ? 1 : E + 1);
@@ -3856,7 +3857,8 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
         if (glk_this) {
-            mmb_tier_fork fork(ctx, 1);
+            // joined here: an op between this GLU and the down (a router-weight MUL, a down off MMB) reads the output
+            mmb_tier_fork fork(ctx);
             {
                 const dim3 gs((M + 63) / 64, nsmall_max);
                 mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
@@ -3977,6 +3979,9 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
 // place. Only weights whose every reader in the graph is a MUL_MAT src0 are passed here (ggml-cuda.cu graph_optimize).
 void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!mmb_enabled(ctx)) return;
+    // the token embedding is read by GET_ROWS in other graphs (and is the LM head when tied): the in-place layout would
+    // be read as Q8_0 rows there, and the graph-local reader scan cannot see those graphs
+    if (w && strstr(w->name, "token_embd") != nullptr) return;
     if (!w || w->type != GGML_TYPE_Q8_0 || w->op != GGML_OP_NONE || w->view_src != nullptr || !w->data || !w->buffer ||
             ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w) ||
             w->ne[2] != 1 || w->ne[3] != 1 || !mmb_tq8_shape(w->ne[1], w->ne[0])) return;
