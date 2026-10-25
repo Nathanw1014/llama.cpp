@@ -91,8 +91,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # config.json says "full_attention"; newer transformers load the same layers as "indexed_attention"
+        if any(t not in ("linear_attention", "full_attention", "indexed_attention") for t in layer_types[:n_layer]):
+            raise ValueError(f"unknown qwen4exp layer types {sorted(set(layer_types))}")
         self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            [ratio if layer_types[i] != "linear_attention" else 0 for i in range(n_layer)]
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
