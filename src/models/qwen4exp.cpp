@@ -24,6 +24,7 @@
 // defined below, used by the graph constructor
 static bool    qwen4exp_last_attn_trim();
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
+static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h);
 
 // the PLE row gather of a batch, defined below set_input
 static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst);
@@ -1077,6 +1078,22 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
+// The strip the indexer scores with. The raw score is F32 [n_blocks, n_idx_h, strip] and its ReLU is a second tensor
+// of that size, so a fixed strip grows the scratch with the context: 2 x 2 GiB at n_kv = 1M. Halve the strip (rounding
+// up) while the raw score exceeds 2^27 elements (its size at n_kv = 262144, 512 MiB), down to 64 queries. The
+// last-layer trim aligns q_first to qwen4exp_query_strip: a 512 strip halves to powers of two, which divide it, and a
+// shorter ubatch has q_first = 0.
+static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h) {
+    int64_t strip = qwen4exp_query_strip(n_tokens, n_stream);
+    if (n_stream != 1) {
+        return strip;
+    }
+    while (strip >= 128 && n_blocks * n_idx_h * strip > ((int64_t) 1 << 27)) {
+        strip = (strip + 1) / 2;
+    }
+    return strip;
+}
+
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
@@ -1249,7 +1266,8 @@ public:
         res &= compact == (scalar && n_stream == 1);
         res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
-        const int64_t next_strip = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
+        const int64_t next_strip = qwen4exp_score_strip(params.ubatch.n_tokens/n_stream, n_stream, n_blocks,
+                params.hparams.indexer_n_head);
         const auto next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, n_blocks, next_strip, ratio,
                 params.hparams.indexer_top_k/ratio, compact);
         res &= score_strip == next_strip;
@@ -1415,7 +1433,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar && n_stream == 1;   // split streams: F32 per-block bias per stream, same tails
         qsa->maskless = scalar;
-        qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
+        qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact);
         qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
@@ -1526,8 +1544,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
+    const int64_t strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, n_idx_h);
     GGML_ASSERT(q_first % strip == 0);
+    GGML_ASSERT(inp->score_strip == strip);
 
     // the strips slice the block cells and the tails; copy these host inputs to the compute backend once, so no strip
     // needs an input copy and the scheduler cannot cut a split inside a (fused) block selection
