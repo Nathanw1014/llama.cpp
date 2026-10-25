@@ -24628,11 +24628,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             if (!src || src->op == GGML_OP_NONE) {
                                 continue;
                             }
+#if defined(GGML_USE_EXL3)
                             // EXL3 SwiGLU fusion on the two-pass paths: the rotation reads gate and up into the scratch,
                             // and a barrier separates it from the kernel that writes the result
                             if (ctx->fused_exl3_glu && k == 0 && !ggml_vk_exl3_glu_single_pass(cgraph->nodes[i + 1])) {
                                 continue;
                             }
+#endif
                             if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                                 bool found = false;
                                 for (int n = 0; n < k; ++n) {
