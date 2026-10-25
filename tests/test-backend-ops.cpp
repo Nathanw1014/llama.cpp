@@ -7413,6 +7413,21 @@ struct test_moe_glu_f16 : public test_case {
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
+    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K with M % 128 == 0 and K % 256 == 0, and must not run otherwise
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
+            return true;
+        }
+        const bool expect = type_w == GGML_TYPE_Q4_K && n_ff % 128 == 0 && n_embd % 256 == 0;
+        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_PAIR_SWIGLU");
+        if (expect != (n > 0)) {
+            msg = "MUL_MAT_ID_PAIR_SWIGLU dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
+            return false;
+        }
+        return true;
+    }
+
     test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
                      bool up_first = false, bool hist = false)
         : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
