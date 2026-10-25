@@ -2013,7 +2013,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if ((M % 64) == 0 && (K % 128) == 0 && (T % 128) == 0) {
             const float * xsc = nullptr;
             int xtm = -1;
-            const uint8_t * xq = ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1), &xsc, &xtm);
+            // the int8 copy covers the whole xn root: only a reader of all of it may use it
+            const uint8_t * xq = src1->data == mmb_root(src1)->data && ggml_nelements(src1) == ggml_nelements(mmb_root(src1)) ?
+                ggml_cuda_mmb_xnq8_get(ctx, mmb_root(src1), &xsc, &xtm) : nullptr;
             bool fused = xq != nullptr;
             ggml_cuda_pool_alloc<uint8_t> xq_buf(ctx.pool());
             ggml_cuda_pool_alloc<float> xsc_buf(ctx.pool());

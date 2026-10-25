@@ -6465,6 +6465,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_norm_gated_match match;
         int skip = ggml_cuda_norm_gated_match_at(cgraph, i, match);
         if (skip == 0) skip = ggml_cuda_norm_rows_match_at(cgraph, i, match);
+        if (skip > 0 && match.z && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, match.z->view_src ? match.z->view_src : match.z)) {
+            // a BF16-only z is read only by the GDN scan epilogue: this F32 reader would take its bits as F32
+            GGML_ABORT("norm-gated: z of %s was stored BF16-only but the gated norm was not fused into the GDN scan", node->name);
+        }
         if (skip > 0) {
             if (match.staged) {
                 for (int j = i; j <= i + skip; ++j) {
@@ -7958,7 +7962,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * t = cgraph->nodes[i];
                 if (t->op != GGML_OP_GLU) continue;
-                for (int s = 0; s < 2; ++s) if (t->src[s]) glu_in.insert(t->src[s]);
+                for (int s = 0; s < 2; ++s) {
+                    const ggml_tensor * x = t->src[s];
+                    if (x && x->op == GGML_OP_ADD_ID) x = x->src[0];   // expert bias between the GEMM and the GLU
+                    if (x) glu_in.insert(x);
+                }
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * t = cgraph->nodes[i];
@@ -8057,6 +8065,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+        // nodes inside an intra-graph concurrency region (planned above, with its alloc deps) must not be reordered
+        std::vector<char> in_ovl(cgraph->n_nodes, 0);
+        for (int k = 0; k < cgraph->n_nodes && !cuda_ctx->ovl_regions.empty(); ++k) {
+            auto it = cuda_ctx->ovl_regions.find(cgraph->nodes[k]);
+            if (it == cuda_ctx->ovl_regions.end()) continue;
+            for (int e = k; e < cgraph->n_nodes; ++e) {
+                in_ovl[e] = 1;
+                if (cgraph->nodes[e] == it->second.end) break;
+            }
+        }
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
@@ -8067,6 +8085,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
                     continue;
+                }
+                if (std::any_of(in_ovl.begin() + i, in_ovl.begin() + j + 3, [](char c) { return c != 0; })) {
+                    break;
                 }
                 // Group both outputs before allocation so the shared result cannot alias intervening nodes.
                 std::rotate(cgraph->nodes + i + 3, cgraph->nodes + j, cgraph->nodes + j + 3);
