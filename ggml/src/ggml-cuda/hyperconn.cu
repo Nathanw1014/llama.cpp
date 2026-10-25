@@ -785,9 +785,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     // GEMM reads it through ggml_cuda_mmb_xnq8_get when its src1 root matches.
     ggml_cuda_hc_combine_norm_args aa = a;
     if (!a.single_block && (n_embd % 32) == 0 && n_embd <= HC_CN_MAX_EMB && n_tokens >= 512) {
+        // the v2 rows kernel writes token groups of 1 << HC_V2_QGS: the last group is padded, not truncated
         const int q8_blocks = (int) (n_embd / 32);
-        const size_t q8b = (size_t) q8_blocks * hc * n_tokens * 32;
-        const size_t q8s = (size_t) q8_blocks * hc * n_tokens * sizeof(float);
+        const int64_t n_tok_pad = GGML_PAD(n_tokens, 1 << HC_V2_QGS);
+        const size_t q8b = (size_t) q8_blocks * hc * n_tok_pad * 32;
+        const size_t q8s = (size_t) q8_blocks * hc * n_tok_pad * sizeof(float);
         const ggml_tensor * xroot = a.out_xn->view_src ? a.out_xn->view_src : a.out_xn;
         aa.out_xn_q8    = ggml_cuda_mmb_xnq8_buf(ctx, xroot, q8b, q8s);
         aa.out_xn_scale = ggml_cuda_mmb_xnq8_scale(ctx);
@@ -808,8 +810,8 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     if (a.out_inject) {
         GGML_ASSERT(hc == HC_INJ_HC && a.w_inject && ggml_nelements(a.out_inject) == hc * n_tokens &&
                     a.w_inject->ne[0] == n_embd * hc && a.w_inject->ne[1] == hc);
-        // the grouped q8 layout needs whole 32-token groups (the W8A8 consumer requires T % 128 == 0 anyway)
-        const bool v2 = hc_v2_supported(n_embd, hc) && (!aa.out_xn_q8 || n_tokens % (1 << HC_V2_QGS) == 0);
+        // the grouped q8 layout pads the last 32-token group (see the q8 buffer above), so any token count takes it
+        const bool v2 = hc_v2_supported(n_embd, hc);
         float *    o_res32 = a.res_out_bf16 ? nullptr : (float *) a.out_res->data;
         uint16_t * o_res16 = a.res_out_bf16;
         float *    o_xn32  = a.store_xn_f32 ? (float *) a.out_xn->data : nullptr;

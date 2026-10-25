@@ -1295,7 +1295,8 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
     const int b_ts = wave;   // one wave per token tile
     // activation layout: [kb][t][32] + scales [kb][t] (x_gs < 0), or token-grouped [t/G][kb][G][32] + [t/G][kb][G]
     // with G = 1 << x_gs (<= 16): the group block index of (t, kb) is ((t >> gs) * nkb + kb) * G + (t & (G-1))
-    const int    b_t  = t0 + b_ts * 16 + sub_lane;
+    // a token past T (the tail of the last tile) reads token T-1: its row is never stored
+    const int    b_t  = min(t0 + b_ts * 16 + sub_lane, T - 1);
     const size_t b_bi = x_gs < 0 ? (size_t) b_t : (((size_t) (b_t >> x_gs) * nkb) << x_gs) + (b_t & ((1 << x_gs) - 1));
     const size_t x_kb = x_gs < 0 ? (size_t) T : ((size_t) 1 << x_gs);   // block-index stride of one kb
     const size_t s_kb = x_kb;
@@ -2124,7 +2125,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
         // W8A8 int8 route: Q8_0 weights read as int8, activations quantized per 32-K block into the [kb][t][32]
         // layout; int8 WMMA with the per-block scale in the f32 accumulator. Other shapes take the bf16 tiles.
-        if ((M % 64) == 0 && (K % 128) == 0 && (T % 128) == 0) {
+        if ((M % 64) == 0 && (K % 128) == 0) {
             const float * xsc = nullptr;
             int xtm = -1;
             // the int8 copy covers the whole xn root: only a reader of all of it may use it
@@ -2145,10 +2146,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             // 32-row tile up to 1024 tokens: M=320 at T=512 gives only 20 blocks of 64 rows for 40 CUs; 32-row blocks
             // are 0.4-0.7% faster end to end at ub 512/1024 (same sums)
             if (T <= 1024 && M % 32 == 0) {
-                mmb_hcd_w8a8_kernel<32, 128, 4, 2, 4><<<dim3(M / 32, T / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
+                mmb_hcd_w8a8_kernel<32, 128, 4, 2, 4><<<dim3(M / 32, (T + 127) / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
                     mmb_tok_identity{T}, fused ? xtm : -1, true);
             } else
-            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2><<<dim3(M / 64, T / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
+            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2><<<dim3(M / 64, (T + 127) / 128), MMB_NT, 0, stream>>>(W, xq, xsc, D, Dh2, sf, M, K, T,
                 mmb_tok_identity{T}, fused ? xtm : -1, true);
             CUDA_CHECK(cudaGetLastError());
             return;
