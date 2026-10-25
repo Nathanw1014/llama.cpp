@@ -1407,18 +1407,17 @@ static bool qwen4exp_qsa_dense_shortcut() {
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention runs without a mask. Only the selected-key
-// attention kernels understand that layout (F16 K/V, head 256, single stream), so the selection needs
-// selected_key_attn: every QSA layer's device took the probe op (llama_memory_hybrid_idx). The selection carries
-// cells through f32, hence the 2^24 bound on n_kv.
+// attention kernels understand that layout (head 256, single stream), so the selection needs selected_key_attn:
+// every QSA layer's device took the probe op with the cache's K/V types (llama_memory_hybrid_idx). The selection
+// carries cells through f32, hence the 2^24 bound on n_kv.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
-        ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
+        bool selected_key_attn) {
     return selected_key_attn && blk_bias && cparams.causal_attn && n_stream == 1 && ratio > 1 &&
         hparams.indexer_top_k % ratio == 0 &&
         n_kv > (int64_t) hparams.indexer_top_k + ratio - 1 && n_kv <= 16777216 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f &&
-        !hparams.attn_soft_cap && hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
-        type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
+        !hparams.attn_soft_cap && hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256;
 }
 
 // the selection decision for one ratio: the gate above, no SWA, and a cache whose visibility the selection
@@ -1430,7 +1429,7 @@ static bool qwen4exp_block_selection(const llama_memory_hybrid_idx_context * mct
     const auto * attn = mctx->get_attn();
     return attn != nullptr && hparams.n_swa == 0 &&
         qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv, ubatch, cparams, hparams,
-                attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn()) &&
+                mctx->qsa_selected_key_attn()) &&
         mctx->qsa_scalar_visibility(ubatch, (uint32_t) ratio);
 }
 

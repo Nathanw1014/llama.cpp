@@ -24,14 +24,14 @@
 // can dev run maskless selected-key attention with the shapes of QSA layer il? A probe op, as for
 // weight buffer types. Only a backend whose flash attention reads the list without a mask takes it:
 // the mask-reading kernels would attend every cell, so their supports_op refuses the op.
-static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il) {
+static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il, ggml_type type_k, ggml_type type_v) {
     ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx { ggml_init(params) };
     const int64_t d     = hp.n_embd_head_k(il);
     const int64_t n_sel = hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1;
     ggml_tensor * q   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 1, hp.n_head(il), 1);
-    ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
-    ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), type_k, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), type_v, d, 4*n_sel, hp.n_head_kv(il), 1);
     ggml_tensor * ids = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, n_sel, 1, 1, 1);
     ggml_tensor * fa  = ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
     ggml_flash_attn_ext_add_top_k(fa, ids, 0);
@@ -148,10 +148,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // LLAMA_QSA_IDX_K_F16=1 keeps the indexer keys f16 under a quantized -ctk (A/B of the selection quality)
+        static const bool idx_k_f16 = [] { const char * e = getenv("LLAMA_QSA_IDX_K_F16"); return e && atoi(e) != 0; }();
+        const ggml_type type_k_idx = idx_k_f16 ? GGML_TYPE_F16 : type_k;
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, GGML_TYPE_F32, v_trans, offload, unified,
+            model, hparams_idx, type_k_idx, GGML_TYPE_F32, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
@@ -213,30 +217,37 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // complete-block selection hands flash attention a selected-key list and no mask, so every
         // QSA layer must sit on a device whose kernels read that list. Ask each layer's device with
         // a probe op rather than by backend name: a backend without the kernels refuses the op.
+        // probe f16 (the kernels exist) and then the cache types (they take this cache)
+        const bool kv_f16 = type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
+        // LLAMA_QSA_MASKLESS_QKV=0 keeps a quantized cache on the masked top-k
+        static const bool qkv_env = [] { const char * e = getenv("LLAMA_QSA_MASKLESS_QKV"); return !(e && e[0] == '0'); }();
         bool all = true;
+        bool all_typed = true;
         bool any = false;
         for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] == 0) {
                 continue;
             }
             any = true;
-            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, (int) il);
+            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, (int) il, GGML_TYPE_F16, GGML_TYPE_F16);
+            all_typed = all_typed && (kv_f16 ||
+                qsa_selected_key_supported(model.dev_layer(il), model.hparams, (int) il, type_k, type_v));
         }
-        selected_key_attn = any && all && offload;
+        const bool kernels = any && all && offload;
+        selected_key_attn = kernels && all_typed && (kv_f16 || qkv_env);
         // LLAMA_QSA_SELECTED_KEY=0 keeps the masked top-k everywhere, =1 forces the selection (validation)
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) {
             selected_key_attn = atoi(e) != 0;
         }
-        // the probe uses F16 K/V whatever the cache type, but the graph takes the maskless path only for an
-        // f16 K and V cache (qwen4exp_use_block_selection), so say which path a quantized cache gets
-        const bool kv_f16 = type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
-        if (!selected_key_attn) {
-            LLAMA_LOG_INFO("%s: QSA attention: masked top-k (no selected-key kernels on this backend)\n", __func__);
-        } else if (!kv_f16) {
-            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels, masked top-k (K/V cache %s/%s, not f16)\n", __func__,
+        if (selected_key_attn) {
+            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels (maskless block selection), K/V cache %s/%s\n", __func__,
                 ggml_type_name(type_k), ggml_type_name(type_v));
+        } else if (!kernels) {
+            LLAMA_LOG_INFO("%s: QSA attention: masked top-k (no selected-key kernels on this backend)\n", __func__);
         } else {
-            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels (maskless block selection)\n", __func__);
+            LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels, masked top-k (K/V cache %s/%s: %s)\n", __func__,
+                ggml_type_name(type_k), ggml_type_name(type_v),
+                !all_typed ? "no kernels for this type" : "LLAMA_QSA_MASKLESS_QKV=0");
         }
     }
 }
