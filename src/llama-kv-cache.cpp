@@ -943,6 +943,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 return updated;
             }
 
+            // the scheduler skips the sync of a re-allocation that keeps every buffer (lazy realloc sync): the previous
+            // decode may still read the input memory written here
+            ggml_backend_sched_synchronize(sched);
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {

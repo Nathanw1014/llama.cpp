@@ -1734,10 +1734,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        // the inputs may share memory with tensors of the previous graph: it must be done (see the reset above)
-        if (!reused) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        // the inputs may share memory with tensors of the previous graph: it must be done (see the reset above). A reused
+        // graph too: on an integrated GPU the device reads host input buffers in place (no copy), so the previous ubatch
+        // may still be reading the mask and positions this would overwrite
+        ggml_backend_sched_synchronize(sched.get());
 
         const auto t_inputs_us = ggml_time_us();
 
