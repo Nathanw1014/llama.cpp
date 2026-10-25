@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -94,6 +95,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU (requires LLAMA_QSA_INCREMENTAL=1)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -489,6 +491,107 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
+}
+
+static int test_mtp_cache_only(const size_t seed, const float stdev) {
+    gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    const uint32_t sections[] = { 8, 8, 0, 0 };
+    gguf_set_val_u32(meta.get(), "qwen4exp.nextn_predict_layers", 1);
+    gguf_set_val_u32(meta.get(), "qwen4exp.context_length", 4096);
+    gguf_set_val_u32(meta.get(), "qwen4exp.embedding_length", 32);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.head_count", 1);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.head_count_kv", 1);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.key_length", 32);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.value_length", 32);
+    gguf_set_val_u32(meta.get(), "qwen4exp.rope.dimension_count", 32);
+    gguf_set_arr_data(meta.get(), "qwen4exp.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.head_count", 1);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.key_length", 32);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.top_k", 8);
+    gguf_set_arr_data(meta.get(), "qwen4exp.ple.layers", GGUF_TYPE_UINT32, nullptr, 0);
+
+    ggml_backend_dev_t devices[] = { nullptr };
+    llama_model_params mp = llama_model_default_params();
+    mp.devices = devices;
+    mp.n_gpu_layers = 0;
+    mp.use_extra_bufts = false;
+    mp.load_mtp = true;
+    tensor_data_params data = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+    GGML_ASSERT(model);
+
+    struct observations {
+        int stores = 0;
+        int queries = 0;
+    } seen[2];
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = cp.n_batch = cp.n_ubatch = 4096;
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 0;
+    cp.n_threads = cp.n_threads_batch = 4;
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.cb_eval = [](ggml_tensor * t, bool ask, void * opaque) {
+        if (!ask) { return false; }
+        auto & seen = *static_cast<observations *>(opaque);
+        if (strstr(t->name, "indexer_q-") != nullptr) { ++seen.queries; }
+        if (t->op == GGML_OP_SET_ROWS && t->src[1]->type == GGML_TYPE_I64) {
+            auto * ids = t->src[1];
+            std::vector<int64_t> rows(ggml_nelements(ids));
+            ggml_backend_tensor_get(ids, rows.data(), 0, ggml_nbytes(ids));
+            for (const int64_t row : rows) { GGML_ASSERT(row >= 0 && row < t->ne[1]); }
+            ++seen.stores;
+        }
+        return false;
+    };
+
+    std::vector<uint8_t> states[2];
+    std::vector<float> logits[2];
+    const std::vector<float> hidden(llama_model_n_embd_out(model.get()), 0.125f);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    for (int pruned = 0; pruned < 2; ++pruned) {
+        cp.cb_eval_user_data = &seen[pruned];
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(ctx);
+        llama_set_embeddings_nextn(ctx.get(), true, pruned != 0);
+        llama_batch_ext_ptr batch(llama_batch_ext_init(ctx.get()));
+        const auto run = [&](int first, int count, bool output) {
+            llama_batch_ext_clear(batch.get());
+            for (int i = first; i < first + count; ++i) {
+                const int idx = llama_batch_ext_add_token(batch.get(), 0, i % n_vocab);
+                const llama_pos pos[] = { i, i, i, 0 };
+                GGML_ASSERT(idx >= 0);
+                GGML_ASSERT(llama_batch_ext_set_pos(batch.get(), idx, pos));
+                GGML_ASSERT(llama_batch_ext_set_embd_state(batch.get(), idx, { hidden.data(), 1, hidden.size() }));
+                llama_batch_ext_set_output_logits(batch.get(), idx, output);
+            }
+            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+        };
+        // Three equal catch-ups grow metadata without changing incremental-pooling shapes.
+        for (int first = 0; first < 1536; first += 512) { run(first, 512, false); }
+        GGML_ASSERT(seen[pruned].stores == 11);
+        GGML_ASSERT(pruned ? seen[pruned].queries == 0 : seen[pruned].queries > 0);
+        const auto save = [&] {
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+            states[pruned].insert(states[pruned].end(), state.begin(), state.end());
+        };
+        save();
+        llama_set_embeddings_nextn(ctx.get(), true, true);
+        for (int i = 1536; i < 1540; ++i) {
+            run(i, 1, true);
+            const float * output = llama_get_logits_ith(ctx.get(), 0);
+            GGML_ASSERT(output);
+            for (int j = 0; j < n_vocab; ++j) { GGML_ASSERT(std::isfinite(output[j])); }
+            logits[pruned].insert(logits[pruned].end(), output, output + n_vocab);
+        }
+        save();
+    }
+    GGML_ASSERT(states[0] == states[1]);
+    GGML_ASSERT(logits[0].size() == logits[1].size());
+    GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
+    LOG("PASS: Qwen4Exp MTP cache-only growth, row bounds, cache bytes and four continuation logits match the full graph\n");
+    return 0;
 }
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -1128,6 +1231,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool mtp_cache_only = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1154,6 +1258,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
+            mtp_cache_only = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -1208,6 +1314,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (mtp_cache_only) {
+            return test_mtp_cache_only(seed, stdev);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }

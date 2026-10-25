@@ -486,8 +486,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->add_input(std::move(inp));
 
     // gfx1151 HIP, 2026-10-22: cache-only matched upstream logits and state at b/ub4096 with one sequence.
-    // Narrow, split and multi-sequence catch-up stay on the full graph; pruned b4096/ub512 aborts in k_set_rows.
-    // Widen only after the same 60127-token logits/state comparison passes.
+    // Metadata growth is covered on CPU. Widen the configured batch/sequence limits only after the same 60127-token HIP logits/state comparison passes.
     const bool cache_only = cparams.n_seq_max == 1 && cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
             (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
             cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.nextn_layer_offset == 0;
@@ -1496,10 +1495,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(pooled, "indexer_k", il);
 
     if (cache_only) {
-        // set_input still fills these metadata tensors, so retain their graph allocation.
+        // set_input still fills these tensors. Views make the allocator check their sizes as the cache grows; unused leaves are not checked.
         for (ggml_tensor * t : { inp->cell_blk, inp->blk_cells, inp->blk_pos, inp->bias, inp->tail_idxs }) {
             if (t) {
-                ggml_build_forward_expand(gf, t);
+                ggml_build_forward_expand(gf, ggml_view_1d(ctx0, t, ggml_nelements(t), 0));
             }
         }
         ggml_build_forward_expand(gf, pooled);

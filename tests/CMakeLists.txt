@@ -230,6 +230,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-qwen4exp-mtp-cache-only ARGS --mtp-cache-only -s 1234)
+    set_tests_properties(test-qwen4exp-mtp-cache-only PROPERTIES ENVIRONMENT "LLAMA_QSA_INCREMENTAL=1")
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
