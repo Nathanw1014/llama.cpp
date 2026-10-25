@@ -1622,7 +1622,11 @@ int ggml_cuda_mmb_f16_marks(ggml_backend_cuda_context & ctx, const ggml_tensor *
     return it == ctx.mmb->f16_marks.end() ? 0 : it->second;
 }
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb ? ctx.mmb->bf16_only.size() : 0; }
-void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    // a graph output is read by the host after the graph (embeddings, MTP hidden state): it keeps its F32 store
+    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) return;
+    mmb_state(ctx).bf16_only.insert(t);
+}
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb && ctx.mmb->bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb) return;

@@ -7726,7 +7726,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 for (const ggml_tensor * b : blks) {
                     if (ggml_nrows(b) < 512 || b->ne[0] % 8 != 0) continue;
                     bool producer_ok = false;   // only producers that honour a BF16 mark
-                    if (b->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(*cuda_ctx, b->src[0], b->src[1], b)) producer_ok = true;
+                    // the F32-weight (f32split / f16hi) and tall IQ4_NL GEMMs always store F32: they cannot honour the mark
+                    if (b->op == GGML_OP_MUL_MAT && b->src[0]->type != GGML_TYPE_F32 &&
+                        !(b->src[0]->type == GGML_TYPE_IQ4_NL && b->ne[0] <= 384 && b->src[0]->ne[0] >= 4096) &&
+                        ggml_cuda_mmb_supported_mm(*cuda_ctx, b->src[0], b->src[1], b)) producer_ok = true;
                     if (!producer_ok) {
                         for (size_t ir = 0; ir < reds.size() && !producer_ok; ++ir) {
                             const int k = reds[ir].first;
