@@ -5,6 +5,23 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif
 
+// ROCm 10.1 / gfx1151 clang 24 spills in these 15 float-KV tiles. Remove this scope when their stock ISA is spill-free.
+static constexpr __device__ bool ggml_cuda_fattn_tile_use_spill_fix(const int DKQ, const int ncols1, const int ncols2, const bool softcap, const bool q8_0_KV) {
+#if defined(RDNA3_5)
+    if (q8_0_KV) {
+        return false;
+    }
+    return (DKQ == 64 && ncols1 == 8 && ncols2 == 1 && !softcap) ||
+        (DKQ == 128 && ncols1 == 16 && (ncols2 == 1 || (ncols2 == 2 && !softcap))) ||
+        (DKQ == 256 && ((ncols1 == 32 && ncols2 == 1) || (!softcap && ((ncols1 < 8 && ncols1*ncols2 == 8) || (ncols1 == 4 && ncols2 == 8))))) ||
+        (DKQ == 320 && ncols1 == 1 && ncols2 == 32 && !softcap) ||
+        (DKQ == 512 && ncols1 == 1 && ncols2 == 2 && !softcap) ||
+        ((DKQ == 80 || DKQ == 96 || DKQ == 112) && ncols1 == 64 && ncols2 == 1 && !softcap);
+#else
+    return false;
+#endif
+}
+
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
@@ -284,7 +301,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 8,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 8,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 6,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 3, 128, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 3, 128,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 3,  64,  64)
@@ -295,7 +312,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 16, 256, 5,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 32, 256, 3,  64,  64)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 6,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  3,  96, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
@@ -606,6 +623,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
                 }
             }
         }
+#if defined(RDNA3_5)
+        if constexpr (ggml_cuda_fattn_tile_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap, q8_0_KV)) {
+            __builtin_amdgcn_sched_barrier(0);
+        }
+#endif
     }
 
     if (k_KQ_0 + nbatch_K < DKQ) {
@@ -642,12 +664,22 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
+#if defined(RDNA3_5)
+    constexpr bool state_in_lds = ggml_cuda_fattn_tile_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap, q8_0_KV) && ncols == 64;
+#else
+    constexpr bool state_in_lds = false;
+#endif
+
     constexpr int DVp = (DV + 2*warp_size - 1) & ~(2*warp_size - 1); // DV padded to multiple of 2*warp_size.
 
     // KQ_cs == KQ chunk size, number of KQ values in j direction to store as one contiguous chunk in memory.
     // KQ is originally 2D but uses a Z-shaped 3D memory pattern like KQ[ncols/KQ_cs][DVp][KQ_cs].
 #ifdef FAST_FP16_AVAILABLE
+#if defined(RDNA3_5)
+    constexpr int KQ_cs = ggml_cuda_fattn_tile_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap, q8_0_KV) && DKQ == 128 ? 1 : (cpw < 2*cpy_ne ? cpw : 2*cpy_ne);
+#else
     constexpr int KQ_cs = cpw < 2*cpy_ne ? cpw : 2*cpy_ne;
+#endif
 #else
     constexpr int KQ_cs = cpw < 1*cpy_ne ? cpw : 1*cpy_ne;
 #endif // FAST_FP16_AVAILABLE
@@ -686,6 +718,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, q8_0_KV>(
             Q_tmp, K_data, KV_tmp, stride_K, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+    }
+
+    if constexpr (state_in_lds) {
+        asm volatile("" ::: "memory");
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -770,6 +806,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
             }
 #endif // FAST_FP16_AVAILABLE
+            if constexpr (state_in_lds) {
+                asm volatile("" ::: "memory");
+            }
         }
 
 #pragma unroll
@@ -830,6 +869,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
                 }
             }
+#if defined(RDNA3_5)
+            if constexpr (ggml_cuda_fattn_tile_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap, q8_0_KV)) {
+                __builtin_amdgcn_sched_barrier(0);
+            }
+#endif
+            if constexpr (state_in_lds) {
+                asm volatile("" ::: "memory");
+            }
         }
 #else
 #pragma unroll
@@ -868,7 +915,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool q8_0_KV> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 #if defined(RDNA3_5) && defined(GGML_CUDA_FATTN_VGPR192)
+// ROCm 10.1/Clang 24, gfx1151, 2026-10-23: waves_per_eu changes kernel ISA.
+// Keep the cap until a replacement is validated on hardware.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 __attribute__((amdgpu_num_vgpr(192)))
+#pragma clang diagnostic pop
 #endif // defined(RDNA3_5) && defined(GGML_CUDA_FATTN_VGPR192)
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -893,6 +945,13 @@ static __global__ void flash_attn_tile(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #ifdef FLASH_ATTN_AVAILABLE
+#if defined(__gfx1151__) && !defined(GGML_CUDA_FATTN_VGPR192)
+    // The gfx1151 launcher replaces this copy with the dedicated factory.
+    if constexpr (DKQ == 256 && DV == 256 && ncols1 == 4 && ncols2 == 8 && !use_logit_softcap && !q8_0_KV) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // defined(__gfx1151__) && !defined(GGML_CUDA_FATTN_VGPR192)
 #if defined(GGML_USE_HIP) && !defined(RDNA3_5)
     if constexpr (q8_0_KV) {
         NO_DEVICE_CODE;
@@ -955,6 +1014,12 @@ static __global__ void flash_attn_tile(
 
     constexpr int cpw = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp.
     constexpr int np  = nwarps > ncols ? nwarps/ncols : 1; // Number of parallel warps per Q column.
+#if defined(RDNA3_5)
+    constexpr bool state_in_lds = ggml_cuda_fattn_tile_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap, q8_0_KV) && ncols == 64;
+#else
+    constexpr bool state_in_lds = false;
+#endif
+
     static_assert(cpw == 1 || np == 1, "bad cpw / np");
     static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
 
@@ -970,7 +1035,20 @@ static __global__ void flash_attn_tile(
     __shared__ half2 Q_tmp[ncols * DKQ/2];
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
+#if defined(RDNA3_5)
+    constexpr int nvkq = cpw * ((DVp/2)/warp_size);
+    __align__(16) half2 VKQ_reg[state_in_lds ? 1 : nvkq] = {{0.0f, 0.0f}};
+    __shared__ half2 VKQ_lds[state_in_lds ? nwarps*warp_size*nvkq : 1];
+    half2 * VKQ = state_in_lds ? VKQ_lds + (threadIdx.y*warp_size + threadIdx.x)*nvkq : VKQ_reg;
+    if constexpr (state_in_lds) {
+#pragma unroll
+        for (int i = 0; i < nvkq; ++i) {
+            VKQ[i] = make_half2(0.0f, 0.0f);
+        }
+    }
+#else
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+#endif
 #else
     __shared__ float Q_tmp[ncols * DKQ];
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
@@ -1241,7 +1319,8 @@ static void launch_fattn_tile_case(
     bool use_q8_0_KV = false;
     fattn_kernel_t fattn_kernel;
 #ifdef GGML_USE_HIP
-    if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
+    // Native Q8 KV needs one query; the tile switch can only select these columns.
+    if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256) && (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1))) {
         use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
         fattn_kernel = use_q8_0_KV
             ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
