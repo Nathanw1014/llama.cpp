@@ -1100,8 +1100,9 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
 // qsa_prefill larger ubatches). The HIP backend (RDNA3.5) and Vulkan (flash_attn_sel) have them, so the selection needs
 // selected_key_attn (all QSA layers run there). Dense kernels do not read the list: ggml-cuda aborts, Vulkan declines.
-// The depth must also fit the kernel that runs the op: both selected-key kernels take GGML_QSA_MAX_KEYS (ggml-cuda
-// common.cuh). The model side cannot see the backend, so it mirrors the bound; a deeper n_kv takes the masked route.
+// The depth must also fit the kernel that runs the op: the HIP selected-key kernels take GGML_QSA_MAX_KEYS (ggml-cuda
+// common.cuh), and a deeper maskless op would abort there. The model side cannot see the backend, so it mirrors that
+// bound for every backend: Vulkan's flash_attn_sel goes deeper (~8M keys) but takes the masked route above 1M too.
 static constexpr int64_t QSA_MASKLESS_MAX_KV = 1048576;  // == GGML_QSA_MAX_KEYS: llama/ must not depend on ggml-cuda headers
 static_assert(QSA_MASKLESS_MAX_KV % 4 == 0, "qsa_prefill requires a multiple-of-4 key count at its depth bound");
 

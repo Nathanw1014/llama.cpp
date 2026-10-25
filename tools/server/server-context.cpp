@@ -1594,7 +1594,7 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
-        const int n_ctx_train = n_ctx_model();
+        const int n_ctx_max = n_ctx_model();
 
         {
             // note: the capping itself is done in n_ctx_slot(), here we only report it
@@ -1617,9 +1617,9 @@ private:
             const int n_ctx_capped = params_base.kv_unified_per_slot > 0 ?
                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
 
-            if (n_ctx_capped > n_ctx_train) {
-                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d, training context extended by --rope-scale) - capping\n",
-                        n_ctx_capped, n_ctx_train);
+            if (n_ctx_capped > n_ctx_max) {
+                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d: the training context, or what --rope-scale extends it to) - capping\n",
+                        n_ctx_capped, n_ctx_max);
             }
         }
 
