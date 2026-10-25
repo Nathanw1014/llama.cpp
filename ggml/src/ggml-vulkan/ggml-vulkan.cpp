@@ -24625,7 +24625,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     for (int k = 0; k <= ctx->num_additional_fused_ops; ++k) {
                         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
                             ggml_tensor *src = cgraph->nodes[i + k]->src[s];
-                            if (!src || src->op == GGML_OP_NONE) {
+                            if (!src) {
+                                continue;
+                            }
+                            // weights never share memory with the output, but a split input (the scheduler's copy of a
+                            // tensor another backend made, e.g. a CPU EXL3 linear) is a GGML_OP_NONE compute tensor that
+                            // ggml-alloc can reuse for the output in place
+                            if (src->op == GGML_OP_NONE && (src->buffer == nullptr || !ggml_backend_buffer_is_vk(src->buffer) ||
+                                ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
                                 continue;
                             }
 #if defined(GGML_USE_EXL3)

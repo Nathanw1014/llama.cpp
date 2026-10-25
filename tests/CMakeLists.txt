@@ -292,6 +292,7 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-mmid-d16-exact.cpp)
 llama_build_and_test(test-alloc-reuse.cpp)
+llama_build_and_test(test-sched-split-fusion.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
