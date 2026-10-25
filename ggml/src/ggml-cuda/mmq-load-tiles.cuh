@@ -30,7 +30,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI1_0;
     const int kqsx = txi % QI1_0;
 
+// ROCm 10.1 clang 24: bounded row loads clear gfx1151 Q1_0 J112/J128 spills (2026-10).
+// Remove these bounds when the compiler keeps row loads and unpacking within the register budget.
+#if defined(RDNA3_5)
+#pragma clang loop unroll_count(J >= 112 ? 1 : I/(nrows*nwarps))
+#else
 #pragma unroll
+#endif
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
 
@@ -77,7 +83,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int ksx = threadIdx.x % scale_entries_per_row;
     const int scale_block = ksx / scale_entries_per_block;
 
+#if defined(RDNA3_5)
+#pragma clang loop unroll_count(J >= 112 ? 1 : I/nwarps)
+#else
 #pragma unroll
+#endif
     for (int i0 = 0; i0 < I; i0 += nwarps) {
         int i = i0 + threadIdx.y;
 
@@ -650,7 +660,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nrows = ggml_cuda_get_physical_warp_size() / threads_per_row;
     const int kqsx = threadIdx.x % threads_per_row;
 
+// ROCm 10.1 clang 24: this bound keeps gfx1151 Q2_K J64/J80 VGPRs at or below stock with rolled K (2026-10).
+// Remove this bound when rolling K no longer raises register use for these tiles.
+#if defined(RDNA3_5)
+#pragma clang loop unroll_count(J >= 64 ? 1 : I/(nrows*nwarps))
+#else
 #pragma unroll
+#endif
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
 

@@ -173,6 +173,13 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     // half the CTA idle while the other half decoded 64 weights (~600 VALU per stage against 16 WMMA per wave).
     constexpr bool Q51S = false && WTYPE == 32 + GGML_TYPE_Q5_1 && BM * 2 == MMB_NT && MMB_BK == 64;   // off: measured neutral-to-negative (1678 -> 1668 t/s pp2048)
 
+    // gfx1151/ROCm 10.1 clang 24: S119 has seven saves/32 bytes with loop-head BF16 row prefetch (2026-10-24); load the last three vectors near the final WMMAs.
+    // Remove this schedule when full-row prefetch is spill-free at the measured throughput.
+#if defined(__gfx1151__)
+    constexpr bool STAGGER_A = !TAIL && BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2;
+#else
+    constexpr bool STAGGER_A = false;
+#endif
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -206,7 +213,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2];
                 }
                 else if constexpr (WTYPE == 2) { const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
-                    a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4]; a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; }
+                    a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4];
+                    if constexpr (!STAGGER_A) { a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; } }
             } else { a0[i] = make_uint4(0,0,0,0); a1[i] = make_uint4(0,0,0,0); a3[i] = make_uint4(0,0,0,0); a4[i] = make_uint4(0,0,0,0); a5[i] = a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); a2[i] = 0; }
         }
         }
@@ -214,6 +222,18 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         for (int i = 0; i < B_ITEMS; ++i) {
             const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+        }
+    };
+    auto load_tail_regs = [&](const int ks) {
+        if constexpr (STAGGER_A) {
+#pragma unroll
+            for (int i = 0; i < A_ITEMS; ++i) {
+                const int row = tid + i * MMB_NT;
+                if (row < BM && row < a_rows) {
+                    const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
+                    a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7];
+                } else { a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); }
+            }
         }
     };
     auto store_lds = [&]() {
@@ -254,24 +274,58 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;   // whole fragments past the valid columns are never stored
     const int nks = K / MMB_BK;
-    load_regs(0); store_lds(); __syncthreads();
+    load_regs(0); load_tail_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
-            v16s a[TM], b[TN]; const int r = lane & 15;
+            // gfx1151/ROCm 10.1 clang 24: streaming B clears three dense spill names.
+            // Remove this when the full fragment bank is spill-free.
+#if defined(__gfx1151__)
+            constexpr bool STREAM = !TAIL && ((BM == 128 && BN == 128 && WTM == 32 && WTN == 64 && (WTYPE == 0 || WTYPE == 176 || WTYPE == 181)) || (BM == 128 && BN == 256 && WTM == 64 && WTN == 64 && WTYPE == 2));
+#else
+            constexpr bool STREAM = false;
+#endif
+            if constexpr (STREAM) {
+                v16s a[TM]; const int r = lane & 15;
 #pragma unroll
-            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+                for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    a[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+                for (int j = 0; j < TN; ++j) {
+                    const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const v16s b = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)});
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+                    for (int i = 0; i < TM; ++i) {
+                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b, a[i], acc[i][j]);
+                        else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a[i], acc[i][j]);
+                        // gfx1151/ROCm 10.1 clang 24: S119 needs seven saves/32 bytes at loop head (2026-10-24); remove these bounds when full prefetch is spill-free.
+#if defined(__gfx1151__)
+                        if constexpr (STAGGER_A) {
+                            if (kk + 16 == MMB_BK && j + 1 == TN && i + 1 == TM / 2) {
+                                __builtin_amdgcn_sched_barrier(0);
+                                load_tail_regs(ks + 1 < nks ? ks + 1 : ks);
+                                __builtin_amdgcn_sched_barrier(0);
+                            }
+                        }
+#endif
+                    }
+                }
+            } else {
+                v16s a[TM], b[TN]; const int r = lane & 15;
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
-                    if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b[j], a[i], acc[i][j]);
-                    else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+                for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b[j], a[i], acc[i][j]);
+                        else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+            }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
@@ -280,9 +334,18 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     // epilogue through LDS (per-wave 1 KB stage in the now-free A/B tile area); tiles are 16 rows, a_rows is a
     // multiple of 32 in this model, so whole tiles are either valid or beyond a_rows
     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : As) + wave * 256;
+    int store_wm = wm;
+    // gfx1151/ROCm 10.1 clang 24: the early epilogue offset costs one save/eight private bytes (2026-10-24); remove this bound when the compiler rematerializes it after compute.
+#if defined(__gfx1151__)
+    if constexpr (STAGGER_A) {
+        int store_tid = tid;
+        asm volatile("" : "+v"(store_tid));
+        store_wm = (store_tid >> 5) % WAVES_M;
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
-        const int ml = wm * WTM + i * 16; const bool ok = ml < a_rows;
+        const int ml = store_wm * WTM + i * 16; const bool ok = ml < a_rows;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
@@ -671,6 +734,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     uint32_t lbg[LBR][2], lbu[LBR][2];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
     if constexpr (LB) { for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i); }
+    // gfx1151/ROCm 10.1 clang 24: direct activation staging clears 20 wide-GLU spill names without changing the 64x256 tile.
+    // Remove this when activation prefetch keeps these tiles spill-free.
+#if defined(__gfx1151__)
+    constexpr bool DEFER_B = BM == 64 && BN == 256 && WTM == 32 && WTN == 64;
+#else
+    constexpr bool DEFER_B = false;
+#endif
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -708,10 +778,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 } else { gm[i] = um[i] = g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); }
             }
         }
+        if constexpr (!DEFER_B) {
 #pragma unroll
-        for (int i = 0; i < B_ITEMS; ++i) {
-            const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
-            bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+            for (int i = 0; i < B_ITEMS; ++i) {
+                const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
+                bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+            }
         }
     };
     auto store_lds = [&]() {
@@ -744,8 +816,16 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 }
             }
         }
+        if constexpr (DEFER_B) {
+#pragma unroll 2
+            for (int i = 0; i < B_ITEMS; ++i) {
+                const int c = tid + i * MMB_NT, row = xrow(c >> 3);
+                *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = row >= 0 ? *(const uint4 *)(Xh + (size_t)row * K + weight_ks * MMB_BK + (c & 7) * 8) : make_uint4(0,0,0,0);
+            }
+        } else {
 #pragma unroll
-        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+            for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+        }
     };
     v8f accg[TM][TN], accu[TM][TN];
 #pragma unroll
@@ -763,22 +843,52 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
-            v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+            // gfx1151/ROCm 10.1 clang 24: streaming gate/up fragments clears 20 GLU spill names.
+            // Remove this when both fragment banks are spill-free.
+#if defined(__gfx1151__)
+            constexpr bool STREAM = (BM == 128 && BN == 128 && WTM == 64 && WTN == 32) || (BM == 64 && BN == 256 && WTM == 32 && WTN == 64);
+#else
+            constexpr bool STREAM = false;
+#endif
+            if constexpr (STREAM) {
+                v16s b[TN]; const int r = lane & 15;
 #pragma unroll
-            for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
-                au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
-                b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+                for (int i = 0; i < TM; ++i) {
+                    const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    {
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                            accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accg[i][j]); }
+                        }
+                    {
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
 #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    if constexpr (TAIL) { if (!jact[j]) continue; }
-                    accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
-                    accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                            accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accu[i][j]); }
+                        }
                 }
+            } else {
+                v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+#pragma unroll
+                for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                    au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        if constexpr (TAIL) { if (!jact[j]) continue; }
+                        accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
+                        accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                    }
+            }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
@@ -2100,8 +2210,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else if (mmb_quant_type_dense(src0->type)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
-            if (big) MMB_BIG_DENSE(WT, W);
-            else     { MMB_SMALL_DENSE(WT, W); }
+            if constexpr (WT < 32 || mmb_quant_type_dense_supported(static_cast<ggml_type>(WT - 32))) {
+                if (big) MMB_BIG_DENSE(WT, W);
+                else     { MMB_SMALL_DENSE(WT, W); }
+            }
         });
     } else {
         if (big) MMB_BIG_DENSE(2, W);
@@ -3913,59 +4025,61 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // small kernel (duplicate desc_small consumers) must not launch.
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        if (glk_this) {
-            // joined here: an op between this GLU and the down (a router-weight MUL, a down off MMB) reads the output
-            mmb_tier_fork fork(ctx);
-            {
-                const dim3 gs((M + 63) / 64, nsmall_max);
-                mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
+        if constexpr (WT < 32 || mmb_quant_type_routed_supported(static_cast<ggml_type>(WT - 32))) {
+            if (glk_this) {
+                // joined here: an op between this GLU and the down (a router-weight MUL, a down off MMB) reads the output
+                mmb_tier_fork fork(ctx);
+                {
+                    const dim3 gs((M + 63) / 64, nsmall_max);
+                    mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
+                }
+                {
+                    const dim3 gb((M + 63) / 64, nbig_cap);
+                    mmb_routed_gluk_kernel<WT, BN_gluk><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                return;
             }
-            {
-                const dim3 gb((M + 63) / 64, nbig_cap);
-                mmb_routed_gluk_kernel<WT, BN_gluk><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
-            }
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        if (BM_BIG == 128 && BN_sel != 256) {
-            const dim3 gbig((M + 127) / 128, nbig_max);
-            if (BN_sel == 64) mmb_routed_glu_kernel<128, 64, 64, 16, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-            else              mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-        } else {
-            auto launch_big = [&](auto bn_tag) {
-                constexpr int BN = decltype(bn_tag)::value;
-                const dim3 gbig((M + 63) / 64, nbig_max);
-                if constexpr (WT == 32 + GGML_TYPE_Q4_K && BN == 128) {
-                    if (q4k_half) {
-                        mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            if (BM_BIG == 128 && BN_sel != 256) {
+                const dim3 gbig((M + 127) / 128, nbig_max);
+                if (BN_sel == 64) mmb_routed_glu_kernel<128, 64, 64, 16, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                else              mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else {
+                auto launch_big = [&](auto bn_tag) {
+                    constexpr int BN = decltype(bn_tag)::value;
+                    const dim3 gbig((M + 63) / 64, nbig_max);
+                    if constexpr (WT == 32 + GGML_TYPE_Q4_K && BN == 128) {
+                        if (q4k_half) {
+                            mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                        } else {
+                            mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                        }
+                    } else if constexpr (BN == 64) {
+                        mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
                     } else {
                         mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
                     }
-                } else if constexpr (BN == 64) {
-                    mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                } else {
-                    mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                }
-            };
-            if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
-            else if (BN_sel == 64) launch_big(std::integral_constant<int,64>{});
-            else               launch_big(std::integral_constant<int,128>{});
-        }
-        if (!glk_this) mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<dim3((M + 63) / 64, E + 1), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_mid.get(), M, K);
-        if (glk_this) return;
-        if (BM_SMALL == 128) {
-            const dim3 gsmall((M + 127) / 128, nsmall_max);
-            mmb_routed_glu_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
-        } else {
-            const dim3 gsmall((M + 63) / 64, nsmall_max);
-            if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
-                if (q4k_half) {
-                    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                };
+                if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
+                else if (BN_sel == 64) launch_big(std::integral_constant<int,64>{});
+                else               launch_big(std::integral_constant<int,128>{});
+            }
+            if (!glk_this) mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<dim3((M + 63) / 64, E + 1), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_mid.get(), M, K);
+            if (glk_this) return;
+            if (BM_SMALL == 128) {
+                const dim3 gsmall((M + 127) / 128, nsmall_max);
+                mmb_routed_glu_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+            } else {
+                const dim3 gsmall((M + 63) / 64, nsmall_max);
+                if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
+                    if (q4k_half) {
+                        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                    } else {
+                        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+                    }
                 } else {
                     mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
                 }
-            } else {
-                mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
             }
         }
     });

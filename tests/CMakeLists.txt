@@ -230,6 +230,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-qwen4exp-mtp-cache-only ARGS --mtp-cache-only -s 1234)
+    set_tests_properties(test-qwen4exp-mtp-cache-only PROPERTIES ENVIRONMENT "LLAMA_QSA_INCREMENTAL=1")
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -274,6 +276,7 @@ llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
 # group is a tool: three runs (default, GGML_VK_MMID_MANUAL_FRAG=0, GGML_VK_TEST_MF_SKEW=1) compared by test-vk-exact-mmid-frag.py
 llama_build(test-vk-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-mtp-pcum.cpp)
+llama_build_and_test(test-draft-vocab.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

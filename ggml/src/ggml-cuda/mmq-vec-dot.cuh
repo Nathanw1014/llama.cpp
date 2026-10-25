@@ -169,6 +169,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int i0 = (warp_i / ntx) * rows_per_warp;
 
+// ROCm 10.1 clang 24: rolling K clears gfx1151 J32 spills (2026-10).
+// Remove this limit when the compiler keeps WMMA results within each K slice.
+#if defined(RDNA3_5)
+#pragma clang loop unroll(disable)
+#endif
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
         const int k0 = k00 + k01;
 
@@ -700,6 +705,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+// ROCm 10.1 clang 24: rolling K clears gfx1151 J16 spills (2026-10).
+// Remove this limit when the compiler keeps WMMA results within each K slice.
+#if defined(RDNA3_5)
+#pragma clang loop unroll(disable)
+#endif
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
         const int k0 = k00 + k01;
 
