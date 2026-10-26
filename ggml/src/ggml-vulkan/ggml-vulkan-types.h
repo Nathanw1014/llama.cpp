@@ -975,6 +975,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_qsa_expand[2];  // qwen4exp complete-block selection after TOP_K: [0] bitonic (strips), [1] rank (<= 8 rows)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_sum_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1381,6 +1382,15 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // qwen4exp complete-block selection after TOP_K (QSA_EXPAND): the inputs and output of the matched chain
+    bool fused_qsa_expand {};
+    struct qsa_expand_args {
+        const ggml_tensor * blocks;   // TOP_K ids
+        const ggml_tensor * scores;
+        const ggml_tensor * cells;    // [r, n_blocks] view of the block cells
+        const ggml_tensor * tail;
+        ggml_tensor * out;            // the CONCAT
+    } qsa_expand {};
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
     int fused_hc_post_norm {};

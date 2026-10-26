@@ -11193,56 +11193,168 @@ struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
 
 // Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
 // backend fuses the whole subgraph into one kernel; the CPU computes it node by node. Exact integer comparison.
+// qwen4exp complete-block selection after its TOP_K (qwen4exp_select_complete_blocks), the chain Vulkan runs as one
+// QSA_EXPAND dispatch. Score patterns (mode):
+//   0  distinct scores, every query sees more than `budget` blocks (the blocks past a per-query limit are -inf)
+//   1  some queries see fewer than `budget` blocks: TOP_K must take -inf blocks, whose cells read -1. They are a suffix of
+//      the row, as for one sequence, so the -1 slots land in the same place whichever of them TOP_K takes. Those rows
+//      also hold scores of exactly -1 (invalid: step(-1 + 1) = 0) and the next float above -1 (valid)
+//   2  n_blocks == budget, every block taken: scattered -inf, -1 and next-above -1 (blocks of other sequences, holes)
+// Ties among selected scores never decide the cut (CPU partial_sort has no tie rule to compare against).
+// strips > 1 or first_strip > 0 builds the selection the way build_qsa_top_k does for strips of n_query rows: each strip
+// scores a bounded prefix of the blocks (a prefix view of the block cells), reads its tail rows through a view at the
+// strip's offset, and the strips are joined along the rows; first_strip > 0 is the LLAMA_FN_LAST_ATTN_TRIM layout
+// (one strip at a nonzero row offset). last_rows sets a ragged final strip.
 struct test_qsa_expand : public test_case {
-    const int n_blocks, n_query;
-    ggml_tensor * score = nullptr, * cells = nullptr, * tail = nullptr;
-    test_qsa_expand(int n_blocks, int n_query) : n_blocks(n_blocks), n_query(n_query) {}
+    const int n_blocks, n_query, mode, strips, first_strip, last_rows, budget;
+    static constexpr int r = 4;
+    std::vector<ggml_tensor *> scores;
+    std::vector<int> score_blocks, rows;
+    ggml_tensor * cells = nullptr, * tail = nullptr;
+    test_qsa_expand(int n_blocks, int n_query, int mode = 0, int strips = 1, int first_strip = 0, int last_rows = 0, int budget = 512)
+        : n_blocks(n_blocks), n_query(n_query), mode(mode), strips(strips), first_strip(first_strip),
+          last_rows(last_rows > 0 ? last_rows : n_query), budget(budget) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_EXPAND"; }
-    std::string vars() override { return VARS_TO_STR2(n_blocks, n_query); }
+    std::string vars() override {
+        std::string v = VARS_TO_STR2(n_blocks, n_query);
+        if (mode)                  v += ",mode=" + std::to_string(mode);
+        if (strips > 1)            v += ",strips=" + std::to_string(strips);
+        if (first_strip)           v += ",first_strip=" + std::to_string(first_strip);
+        if (last_rows != n_query)  v += ",last_rows=" + std::to_string(last_rows);
+        if (budget != 512)         v += ",budget=" + std::to_string(budget);
+        return v;
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return 0.0; }
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t r = 4, budget = 512;
-        score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_query, 1);
-        cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, 1);
-        tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r-1, n_query, 1);
+
+    bool strip_layout() const { return strips > 1 || first_strip > 0; }
+
+    // GGML_VK_TEST_REQUIRE_QSA_EXPAND=1: one QSA_EXPAND dispatch per strip while GGML_VK_QSA_EXPAND is on, none when off
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        // no fusion label: the knob-off run asserts 0 instead of being skipped (the census skip names GGML_VK_QSA_EXPAND=0)
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_EXPAND")) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "QSA_EXPAND"), want = env_knob_on("GGML_VK_QSA_EXPAND") ? strips : 0;
+        if (n != want) {
+            msg = "QSA_EXPAND dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    static ggml_tensor * select(ggml_context * ctx, ggml_tensor * score, ggml_tensor * block_cells, ggml_tensor * tail, int64_t budget) {
+        const int64_t nb = score->ne[0], nq = score->ne[1];
         ggml_tensor * blocks=ggml_cont(ctx,ggml_top_k(ctx,score,budget));
         ggml_tensor * order=ggml_argsort(ctx,ggml_cast(ctx,blocks,GGML_TYPE_F32),GGML_SORT_ORDER_ASC);
-        ggml_tensor * blocks_view=ggml_view_4d(ctx,blocks,1,budget,n_query,1,blocks->nb[0],blocks->nb[1],blocks->nb[2],0);
-        blocks=ggml_reshape_3d(ctx,ggml_get_rows(ctx,blocks_view,order),budget,n_query,1);
-        ggml_tensor * score_view=ggml_view_4d(ctx,score,1,n_blocks,n_query,1,score->nb[0],score->nb[1],score->nb[2],0);
+        ggml_tensor * blocks_view=ggml_view_4d(ctx,blocks,1,budget,nq,1,blocks->nb[0],blocks->nb[1],blocks->nb[2],0);
+        blocks=ggml_reshape_3d(ctx,ggml_get_rows(ctx,blocks_view,order),budget,nq,1);
+        ggml_tensor * score_view=ggml_view_4d(ctx,score,1,nb,nq,1,score->nb[0],score->nb[1],score->nb[2],0);
         ggml_tensor * picked=ggml_get_rows(ctx,score_view,blocks);
         ggml_tensor * valid=ggml_step(ctx,ggml_scale_bias(ctx,picked,1.0f,1.0f));
-        ggml_tensor * cells_view=ggml_reshape_3d(ctx,cells,r,n_blocks,1);
-        ggml_tensor * flat=ggml_reshape_2d(ctx,blocks,budget*n_query,1);
+        ggml_tensor * cells_view=ggml_reshape_3d(ctx,block_cells,r,nb,1);
+        ggml_tensor * flat=ggml_reshape_2d(ctx,blocks,budget*nq,1);
         ggml_tensor * out=ggml_get_rows(ctx,cells_view,flat);
-        out=ggml_reshape_4d(ctx,out,r,budget,n_query,1);
+        out=ggml_reshape_4d(ctx,out,r,budget,nq,1);
         out=ggml_scale_bias(ctx,ggml_cast(ctx,out,GGML_TYPE_F32),1.0f,1.0f);
         out=ggml_mul(ctx,out,valid);
         out=ggml_cast(ctx,ggml_scale_bias(ctx,out,1.0f,-1.0f),GGML_TYPE_I32);
-        out=ggml_reshape_4d(ctx,out,budget*r,n_query,1,1);
+        out=ggml_reshape_4d(ctx,out,budget*r,nq,1,1);
         return ggml_concat(ctx,out,tail,0);
     }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        scores.clear(); score_blocks.clear(); rows.clear();
+        if (!strip_layout()) {
+            score_blocks.push_back(n_blocks);
+            rows.push_back(n_query);
+            ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_query, 1);
+            scores.push_back(score);
+            cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, 1);
+            tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r-1, n_query, 1);
+            return select(ctx, score, cells, tail, budget);
+        }
+        const int64_t n_rows = (int64_t) (first_strip + strips - 1)*n_query + last_rows;
+        cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, 1);
+        tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r-1, n_rows, 1);
+        std::vector<ggml_tensor *> chunks;
+        for (int s = first_strip; s < first_strip + strips; ++s) {
+            const int nq = s == first_strip + strips - 1 ? last_rows : n_query;
+            // later strips see more blocks: the scorer of an earlier strip is bounded (score_key_limits)
+            const int nb = std::max(budget, n_blocks - 37*(first_strip + strips - 1 - s));
+            score_blocks.push_back(nb);
+            rows.push_back(nq);
+            ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nb, nq, 1);
+            scores.push_back(score);
+            ggml_tensor * block_cells = nb < n_blocks ? ggml_view_2d(ctx, cells, r*nb, 1, cells->nb[1], 0) : cells;
+            ggml_tensor * t = ggml_view_4d(ctx, tail, r-1, nq, 1, 1, tail->nb[1], tail->nb[2], tail->nb[2], (size_t) s*n_query*tail->nb[1]);
+            chunks.push_back(select(ctx, score, block_cells, t, budget));
+        }
+        ggml_tensor * out = chunks[0];
+        for (size_t i = 1; i < chunks.size(); ++i) {
+            out = ggml_concat(ctx, out, chunks[i], 1);
+        }
+        return out;
+    }
+
+    void init_score(ggml_tensor * t, int nb, int nq, int strip) {
+        std::vector<float> v((size_t) nb*nq);
+        const float above_minus_one = std::nextafter(-1.0f, 0.0f);
+        for (int q = 0; q < nq; ++q) {
+            const int qq = q + 1000*strip;
+            float * row = v.data() + (size_t) q*nb;
+            for (int b = 0; b < nb; ++b) {
+                // distinct within a row: 7919 is invertible mod the prime 100003
+                row[b] = 0.001f*((b*7919 + qq*104729) % 100003);
+            }
+            if (mode == 0) {
+                const int limit = nb - (qq*7) % std::max(1, nb - budget - 8);
+                for (int b = limit; b < nb; ++b) row[b] = -INFINITY;
+            } else if (mode == 1) {
+                // visible prefix of 1 .. nb blocks; about half the rows see fewer than budget
+                const int visible = 1 + (qq*389 + 17) % nb;
+                for (int b = visible; b < nb; ++b) row[b] = -INFINITY;
+                if (visible < budget) {
+                    for (int b = 0; b < visible; ++b) {
+                        if (b % 5 == 0) row[b] = -1.0f;
+                        if (b % 5 == 1) row[b] = above_minus_one;
+                    }
+                }
+            } else {
+                for (int b = 0; b < nb; ++b) {
+                    const int k = (b*13 + qq*7) % 7;
+                    if (k == 0 || k == 4) row[b] = -INFINITY;
+                    if (k == 1) row[b] = -1.0f;
+                    if (k == 2) row[b] = above_minus_one;
+                }
+            }
+        }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
             if (t->op!=GGML_OP_NONE) continue;
-            if (t==score) {
-                std::vector<float> v((size_t) n_blocks*n_query);
-                for (int q=0;q<n_query;++q) for (int b=0;b<n_blocks;++b) {
-                    // distinct scores (no ties), the blocks past a per-query limit invisible
-                    const int limit = n_blocks - (q*7)%std::max(1,n_blocks-520);
-                    v[(size_t) q*n_blocks+b] = b < limit ? 0.001f*((b*7919+q*104729)%100003) : -INFINITY;
+            const auto it = std::find(scores.begin(), scores.end(), t);
+            if (it != scores.end()) {
+                const size_t i = it - scores.begin();
+                init_score(t, score_blocks[i], rows[i], (int) i);
+            } else if (t==cells) {
+                std::vector<int32_t> v((size_t) r*n_blocks);
+                for (size_t i=0;i<v.size();++i) {
+                    // cell ids up to 2^24 - 1 (n_kv <= 16777216), and -1 for a missing member
+                    v[i] = i % 97 == 3 ? -1 : (int32_t) ((i*2654435761u) % 16777216u);
                 }
                 ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
-            } else if (t==cells) {
-                std::vector<int32_t> v((size_t) 4*n_blocks);
-                for (size_t i=0;i<v.size();++i) v[i]=(int32_t)((i*31+5)%(4*n_blocks));
-                ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
             } else if (t==tail) {
-                std::vector<int32_t> v((size_t) 3*n_query);
-                for (int q=0;q<n_query;++q) for (int j=0;j<3;++j) v[q*3+j]= j < q%4 ? 4*n_blocks-3+j : -1;
+                const int64_t n = t->ne[1];
+                std::vector<int32_t> v((size_t) (r-1)*n);
+                for (int64_t q=0;q<n;++q) for (int j=0;j<r-1;++j) v[q*(r-1)+j]= j < q%r ? (int32_t) (4*n_blocks-3+j+q) : -1;
                 ggml_backend_tensor_set(t,v.data(),0,ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
             }
         }
     }
@@ -15933,6 +16045,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
     test_cases.emplace_back(new test_qsa_prefill(640,4096,257,true,true));
     for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
+    // QSA_EXPAND (Vulkan): -inf / -1 sentinels, ragged tails, scattered invisible blocks, decode rows 1..8 (rank kernel),
+    // the Flash-Next strip shape, bounded strips with views, the trimmed last layer, a ragged last strip, a smaller budget
+    for (int nq = 1; nq <= 8; ++nq) {
+        test_cases.emplace_back(new test_qsa_expand(8192, nq, 1));
+        test_cases.emplace_back(new test_qsa_expand(2048, nq, 0));
+        test_cases.emplace_back(new test_qsa_expand(512, nq, 2));
+    }
+    for (int nq : {9, 64, 512}) {
+        test_cases.emplace_back(new test_qsa_expand(2048, nq, 1));
+        test_cases.emplace_back(new test_qsa_expand(512, nq, 2));
+    }
+    test_cases.emplace_back(new test_qsa_expand(8192, 512, 0));
+    test_cases.emplace_back(new test_qsa_expand(8192, 512, 1));
+    test_cases.emplace_back(new test_qsa_expand(4096, 512, 1, 4));          // 4 strips of 512, bounded scorers
+    test_cases.emplace_back(new test_qsa_expand(4096, 512, 0, 3, 0, 76));   // ragged last strip (1100-token ubatch)
+    test_cases.emplace_back(new test_qsa_expand(4096, 512, 1, 1, 3));       // LLAMA_FN_LAST_ATTN_TRIM: one strip at row 1536
+    test_cases.emplace_back(new test_qsa_expand(2048, 4, 1, 2, 1));         // views at decode width
+    test_cases.emplace_back(new test_qsa_expand(100, 9, 1, 1, 0, 0, 64));
+    test_cases.emplace_back(new test_qsa_expand(100, 3, 2, 1, 0, 0, 100));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,12,128));
@@ -16009,6 +16140,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
         return test_cases;
+    }
+
+    // qwen4exp complete-block selection (TOP_K + the chain QSA_EXPAND fuses) at the Flash-Next d32k shape: one 512-row
+    // strip and decode rows. Perf mode repeats only the final CONCAT, so read the chain's time with GGML_VK_PERF_LOGGER
+    for (int nq : {512, 1, 8}) {
+        test_cases.emplace_back(new test_qsa_expand(8192, nq, 0));
     }
 
     // is the qwen4exp hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
@@ -17124,6 +17261,8 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
     add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
+    add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
+    add("QSA_EXPAND",          new test_qsa_expand(2048, 4, 1, 2, 1), "QSA_EXPAND/21=2");
     add("TOPK_MOE_EARLY_SOFTMAX",      new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX/5=1");
     add("TOPK_MOE_EARLY_SOFTMAX_NORM", new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX_NORM/10=1");
     add("TOPK_MOE_LATE_SOFTMAX",       new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX_WEIGHT), "TOPK_MOE_LATE_SOFTMAX/6=1");
