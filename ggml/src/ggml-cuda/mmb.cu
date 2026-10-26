@@ -3901,8 +3901,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     // THRESH=32 (was 128): more MoE experts use the wide BN tile during prefill.
     // Measured on qwen3.8-flash-next / gfx1151, -p 2048 -d 0,12000,32000,64000:
     // +3.6% d0, +4.7% d12k, +4.0% d32k, +1.9% d64k vs THRESH=128; byte-identical
-    // output, test-backend-ops 29643/29643. Env MMB_THRESH overrides.
-    static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
+    // output, test-backend-ops 29643/29643. The descriptor arrays are sized for it (no override).
+    constexpr int THRESH = 32;
     // RT 2/3 use a 64-token big tile (half the padding waste on the ~40-row experts); the desc must be built with
     // the same width the kernel reads.
     // gfx1151 / qwen3.8-flash-next pp2048 d0, RT=0 -> 2: 1598 -> 1821 t/s (less logging this time, tighter tails):
@@ -3982,7 +3982,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
-    static const int BN_sel = getenv("MMB_BN") ? atoi(getenv("MMB_BN")) : 128;
+    constexpr int BN_sel = 128;   // the big-tier token tile; nbig_cap and launch_big are sized for 64 / 128 / 256 only
     // gluk mode: gufo-style raw-code kPair GEMM for the routed GLU; desc built
     // at BN=128 token tiles for the big tier.
     // Gated at T>=128: it wins the prefill (pp2048 +40) but costs decode-width
@@ -4015,8 +4015,8 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // THRESH=32 (was 128): more MoE experts use the wide BN tile during prefill.
     // Measured on qwen3.8-flash-next / gfx1151, -p 2048 -d 0,12000,32000,64000:
     // +3.6% d0, +4.7% d12k, +4.0% d32k, +1.9% d64k vs THRESH=128; byte-identical
-    // output, test-backend-ops 29643/29643. Env MMB_THRESH overrides.
-    static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
+    // output, test-backend-ops 29643/29643. The descriptor arrays are sized for it (no override).
+    constexpr int THRESH = 32;
     const int nbig_cap   = glk_this ? n_rows / BN_gluk + E + 2 : n_rows / 64 + E + 2;
     const int nbig_max   = nbig_cap;   // legacy name used by the non-gluk branches
     const int nsmall_max = E * ((THRESH + 31) / 32) + 1;   // small experts take ceil(cnt / 32) tiles
