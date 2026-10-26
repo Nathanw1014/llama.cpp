@@ -7346,13 +7346,14 @@ struct test_swiglu_iq3_mmvq : public test_case {
 struct test_moe_prefill : public test_case {
     const bool glu; const int64_t n;
     const ggml_type quant;
+    const bool down_f16; // the down chain of fused_moe_f16: f16 B, MUL by the router weights, CPY(f16)
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR3(glu, n, quant); }
+    std::string vars() override { return down_f16 ? VARS_TO_STR4(glu, n, quant, down_f16) : VARS_TO_STR3(glu, n, quant); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2560 * 640 * 10 * n * (glu ? 2 : 1); }
-    test_moe_prefill(bool glu, int64_t n, ggml_type type = GGML_TYPE_COUNT)
-        : glu(glu), n(n), quant(type == GGML_TYPE_COUNT ? (glu ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ4_NL) : type) {}
+    test_moe_prefill(bool glu, int64_t n, ggml_type type = GGML_TYPE_COUNT, bool down_f16 = false)
+        : glu(glu), n(n), quant(type == GGML_TYPE_COUNT ? (glu ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ4_NL) : type), down_f16(down_f16) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 512, n);
         ggml_set_name(ids_all, "ids");
@@ -7364,7 +7365,11 @@ struct test_moe_prefill : public test_case {
             return ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gw, x, ids), ggml_mul_mat_id(ctx, uw, x, ids));
         }
         ggml_tensor * dw = ggml_new_tensor_3d(ctx, quant, 640, 2560, 512);
-        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 640, 10, n);
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, down_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, 640, 10, n);
+        if (down_f16) {
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 10, n);
+            return ggml_cast(ctx, ggml_mul(ctx, ggml_mul_mat_id(ctx, dw, x, ids), w), GGML_TYPE_F16);
+        }
         return ggml_mul_mat_id(ctx, dw, x, ids);
     }
     void initialize_tensors(ggml_context * ctx) override {
@@ -7549,6 +7554,15 @@ struct test_mul_mat_id_cpy16 : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const char * name = with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DOWN_STREAM", name)) {
+            // GGML_VK_TEST_REQUIRE_DOWN_STREAM=1: the streaming launch must run for q5_1 with m % 256 == 0 and k % 64 == 0, and not otherwise
+            const bool expect = type_a == GGML_TYPE_Q5_1 && m % 256 == 0 && k % 64 == 0 && n > 8;
+            const int64_t nd = dispatch_census_count(backend, "path:MUL_MAT_ID_DOWN_STREAM");
+            if (expect != (nd > 0)) {
+                msg = "MUL_MAT_ID_DOWN_STREAM dispatches: " + std::to_string(nd) + (expect ? " (expected > 0)" : " (expected 0)");
+                return false;
+            }
+        }
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_MMID_F16OUT", name)) {
             return true;   // not asked, not the Vulkan backend, or the device cannot fuse
         }
@@ -12939,7 +12953,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true));
     // MUL_MAT_ID (+ MUL) + CPY(f16), f32 and f16 B, exact and ragged tiles: one type per store (int8 legacy / K / q6_K, the routed
     // iq3_xxs / iq4_nl pf); the A loaders are test_mul_mat_id's and the dense pf cases'
-    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_1}) {
         const int64_t k = GGML_PAD(640, ggml_blck_size(t));
         for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  256,  64,    k));
@@ -12947,6 +12961,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  200,  70, 2560));
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 640, 130,  512));
         }
+    }
+    // q5_1 streaming down: several 256-feature workgroups, tile edges (9, 63, 64, 65, 129 rows), f32 / f16 B
+    for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {9, 63, 64, 65, 129}) {
+            test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, tb, 16, 4, true, 512, n, 640));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, tb, 16, 4, false, 768, 70, 256));
+        // more than one 64- or 128-row tile per expert
+        for (int64_t n : {129, 255, 300}) {
+            test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, tb, 4, 2, true, 512, n, 640));
+        }
+    }
+    if (env_opt_in("GGML_VK_TEST_REQUIRE_DOWN_STREAM")) {
+        // the Flash-Next down (512 experts, 10 used, ub2048)
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, GGML_TYPE_F16, 512, 10, true, 2560, 2048, 640));
     }
     // the REAP-320 shapes (about 1 min of host quantization and CPU reference each): with the engagement opt-in only
     if (env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT")) {
@@ -12981,6 +13010,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q6_K,   256, 256, 16, 8, nt));
     }
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, 64, 10, 256));
+    test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q5_1,   2560, 640, 64, 10, 256));   // streaming q5_1 down
     for (int part : {1, 2, 3}) {
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 256, 128, 16, 4, 129, part));
         test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 128, 16, 10, 129, part));
@@ -14537,6 +14567,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 512, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
+    test_cases.emplace_back(new test_moe_prefill(false, 2048, GGML_TYPE_Q5_1, true));
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
