@@ -4998,6 +4998,18 @@ static bool ggml_cuda_moe_sgma_tail(const ggml_cuda_moe_weighted_reduction_match
         ggml_cuda_moe_weighted_reduction_sgma_supported(m.experts, m.expert_scale, m.weights, sig->src[0], mul->src[0], add);
 }
 
+// A z GEMM marked BF16-only (ggml_cuda_gdn_z16_ok) wrote BF16 values into the first half of its F32 buffer for the GDN
+// scan epilogue. When the fused out-norm is refused at run time (alignment, aliasing), the unfused gated norm reads z as
+// F32: widen it in place first. It runs after the GDN op, so after the OVL join that orders the z GEMM, and a captured
+// graph replays it with the GEMM that stored BF16 only.
+static void ggml_cuda_gdn_widen_z16(ggml_backend_cuda_context & ctx, const ggml_tensor * z) {
+    const ggml_tensor * zt = z->view_src ? z->view_src : z;
+    const int64_t n = ggml_nelements(zt);
+    ggml_cuda_pool_alloc<float> tmp(ctx.pool(), n);
+    ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(zt->data, tmp.get(), n, ctx.stream());
+    CUDA_CHECK(cudaMemcpyAsync(zt->data, tmp.get(), (size_t) n * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5126,8 +5138,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
                 return a->data && b->data && a0 < b1 && b0 < a1;
             };
+            // a BF16-only z is read in place by the scan while the norm output is written: no overlap with it at all
+            const bool z16_mark = ok && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, m.z->view_src ? m.z->view_src : m.z);
             const bool alias_ok = ok && !overlap(m.dst, node) &&
-                (!overlap(m.dst, m.z) || (m.dst->data == m.z->data && ggml_nbytes(m.dst) == ggml_nbytes(m.z)));
+                (!overlap(m.dst, m.z) || (!z16_mark && m.dst->data == m.z->data && ggml_nbytes(m.dst) == ggml_nbytes(m.z)));
             if (ok && alias_ok) {
                 bool f16 = false;
                 uint16_t * dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, j + sk, m.dst, &f16);
@@ -5135,14 +5149,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 float * dst32 = (dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, m.dst)) ? nullptr : (float *) m.dst->data;
                 // BF16 z: the z GEMM stored BF16 only (marked in graph_optimize); the scan reads it in place
                 const bool z16 = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, m.z->view_src ? m.z->view_src : m.z);
-                if (z16 && (dst32 != nullptr && overlap(m.dst, m.z))) {
-                    GGML_ABORT("GDN BF16 z: %s output aliases its BF16 z", node->name);
-                }
                 ggml_cuda_gdn_set_out_norm(node, (const float *) m.w->data, (const float *) m.z->data, dst32, dst16, m.eps, f16, z16);
                 s_precomputed[r] = sk;
-            } else if (sk > 0 && m.z && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, m.z->view_src ? m.z->view_src : m.z)) {
-                GGML_ABORT("GDN BF16 z: z of %s was stored BF16-only but the gated norm is not fused into the scan", node->name);
             }
+            // not fused with a BF16-only z: the gated norm widens z when it runs (ggml_cuda_gdn_widen_z16)
             break;
         }
     }
@@ -6497,8 +6507,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int skip = ggml_cuda_norm_gated_match_at(cgraph, i, match);
         if (skip == 0) skip = ggml_cuda_norm_rows_match_at(cgraph, i, match);
         if (skip > 0 && match.z && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, match.z->view_src ? match.z->view_src : match.z)) {
-            // a BF16-only z is read only by the GDN scan epilogue: this F32 reader would take its bits as F32
-            GGML_ABORT("norm-gated: z of %s was stored BF16-only but the gated norm was not fused into the GDN scan", node->name);
+            // the GDN scan refused the fused out-norm at run time: this F32 reader needs the BF16-only z widened
+            ggml_cuda_gdn_widen_z16(*cuda_ctx, match.z);
         }
         if (skip > 0) {
             if (match.staged) {
