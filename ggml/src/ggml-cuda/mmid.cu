@@ -98,7 +98,9 @@ static __global__ void mm_ids_helper_hist(
     for (int idx = tid; idx < n_slots; idx += blockDim.x) {
         const int token = idx / n_used;
         const int iex   = idx - token * n_used;
-        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+        const int expert = ids[token * si1 + iex];
+        if ((unsigned) expert >= (unsigned) n_experts) continue;   // no expert's, as in mm_ids_helper
+        atomicAdd(&counts[expert], 1);
     }
     __syncthreads();
 
@@ -143,6 +145,7 @@ static __global__ void mm_ids_helper_hist(
         const int token  = idx / n_used;
         const int iex    = idx - token * n_used;
         const int expert = ids[token * si1 + iex];
+        if ((unsigned) expert >= (unsigned) n_experts) continue;
         const int dst    = counts[expert] + atomicAdd(&cursors[expert], 1);
         ids_dst[dst] = idx;
         if (write_inverse) {
