@@ -7406,32 +7406,35 @@ struct test_moe_glu_f16 : public test_case {
     const int64_t n_tokens;
     const bool up_first;
     const bool hist;
+    const bool chain32;   // the f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU, no casts (models without fused_moe_f16)
 
-    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU_F16"; }
-    std::string vars() override { return VARS_TO_STR9(type_w, type_x, n_embd, n_ff, n_expert, n_used, n_tokens, up_first, hist); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU"; }
+    std::string vars() override { return VARS_TO_STR10(type_w, type_x, n_embd, n_ff, n_expert, n_used, n_tokens, up_first, hist, chain32); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
-    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K with M % 128 == 0 and K % 256 == 0, and must not run otherwise
+    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K / q5_K with M % 128 == 0 and K % 256 == 0, and must not run
+    // otherwise
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
             return true;
         }
-        const bool expect = type_w == GGML_TYPE_Q4_K && n_ff % 128 == 0 && n_embd % 256 == 0;
-        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_PAIR_SWIGLU");
+        const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0;
+        const char * path = chain32 ? "path:MUL_MAT_ID_PAIR_SWIGLU_F32" : "path:MUL_MAT_ID_PAIR_SWIGLU";
+        const int64_t n = dispatch_census_count(backend, path);
         if (expect != (n > 0)) {
-            msg = "MUL_MAT_ID_PAIR_SWIGLU dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
+            msg = std::string(path) + " dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
             return false;
         }
         return true;
     }
 
     test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
-                     bool up_first = false, bool hist = false)
+                     bool up_first = false, bool hist = false, bool chain32 = false)
         : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
-          up_first(up_first), hist(hist) {}
+          up_first(up_first), hist(hist), chain32(chain32) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
@@ -7443,11 +7446,17 @@ struct test_moe_glu_f16 : public test_case {
         ggml_tensor * gw = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
         ggml_set_name(uw, "up_exps");
         ggml_set_name(gw, "gate_exps");
-        ggml_tensor * up = ggml_cast(ctx, ggml_mul_mat_id(ctx, uw, x, ids), GGML_TYPE_F16);
+        ggml_tensor * up = ggml_mul_mat_id(ctx, uw, x, ids);
+        if (!chain32) {
+            up = ggml_cast(ctx, up, GGML_TYPE_F16);
+        }
         if (up_first && gf) {
             ggml_build_forward_expand(gf, up);
         }
-        ggml_tensor * gate = ggml_cast(ctx, ggml_mul_mat_id(ctx, gw, x, ids), GGML_TYPE_F16);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gw, x, ids);
+        if (!chain32) {
+            gate = ggml_cast(ctx, gate, GGML_TYPE_F16);
+        }
         ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
         ggml_set_name(out, "out");
         return out;

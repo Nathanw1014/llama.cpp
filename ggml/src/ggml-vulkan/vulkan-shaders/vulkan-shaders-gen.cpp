@@ -970,6 +970,12 @@ void process_shaders() {
     // MUL_MAT_ID_PAIR_SWIGLU: q4_K gate + up + SwiGLU, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_glu_q4_k_f16", "mul_mm_id_glu.comp", {});
     string_to_spv("mul_mm_id_glu_q4_k_f32", "mul_mm_id_glu.comp", {{"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q4_k_f16_o32", "mul_mm_id_glu.comp", {{"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q4_k_f32_o32", "mul_mm_id_glu.comp", {{"B_F32", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f16", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
