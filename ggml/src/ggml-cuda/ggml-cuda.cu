@@ -7761,11 +7761,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, xn)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, xn);
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
+                // the combine reads a BF16 block_out only at view offset 0 (graph_compute), and only inside its own nodes
+                struct blk_use { const ggml_tensor * b; int i0, n; bool offs0; };
+                std::vector<blk_use> uses;
                 std::vector<const ggml_tensor *> blks;
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     ggml_cuda_hc_combine_norm_args ca;
-                    if (ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false) > 0)
-                        blks.push_back(ca.block_out->view_src ? ca.block_out->view_src : ca.block_out);
+                    const int nc = ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false);
+                    if (nc <= 0) continue;
+                    const ggml_tensor * b = ca.block_out->view_src ? ca.block_out->view_src : ca.block_out;
+                    if (std::none_of(uses.begin(), uses.end(), [b](const blk_use & u) { return u.b == b; })) blks.push_back(b);
+                    uses.push_back({ b, i, nc, ca.block_out->view_offs == 0 });
                 }
                 std::vector<std::pair<int, ggml_cuda_moe_weighted_reduction_match>> reds;   // matched once, ascending
                 for (int k = 0; k < cgraph->n_nodes && !blks.empty(); ++k) {
@@ -7775,6 +7781,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 for (const ggml_tensor * b : blks) {
                     if (ggml_nrows(b) < 512 || b->ne[0] % 8 != 0) continue;
+                    if (std::any_of(uses.begin(), uses.end(), [b](const blk_use & u) { return u.b == b && !u.offs0; })) continue;
+                    auto in_combine = [&uses, b](int n) {
+                        return std::any_of(uses.begin(), uses.end(), [b, n](const blk_use & u) { return u.b == b && n >= u.i0 && n < u.i0 + u.n; });
+                    };
                     bool producer_ok = false;   // only producers that honour a BF16 mark
                     // the F32-weight (f32split / f16hi) and tall IQ4_NL GEMMs always store F32: they cannot honour the mark
                     if (b->op == GGML_OP_MUL_MAT && b->src[0]->type != GGML_TYPE_F32 &&
@@ -7795,28 +7805,40 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     int bi = -1;
                     bi = pos_of(b);
                     if (bi < 0) continue;
-                    bool ok = true; int nread = 0;
-                    for (auto rr = readers_after(b, bi + 1); rr.first != rr.second && ok; ++rr.first) {
-                        const int n = *rr.first; (void) n;
-                        const ggml_tensor * t = cgraph->nodes[n];
-                        ++nread;
-                        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_REPEAT) continue;
-                        if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
-                        ok = false;
-                    }
+                    // readers: nodes of a combine on b, directly or through views / reshapes of it
+                    int nread = 0;
+                    std::function<bool(const ggml_tensor *, int)> readers_ok = [&](const ggml_tensor * x, int xi) {
+                        for (auto rr = readers_after(x, xi + 1); rr.first != rr.second; ++rr.first) {
+                            const int n = *rr.first;
+                            const ggml_tensor * t = cgraph->nodes[n];
+                            ++nread;
+                            if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) {
+                                if (!readers_ok(t, n)) return false;
+                                continue;
+                            }
+                            if ((t->op == GGML_OP_REPEAT || t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) && in_combine(n)) continue;
+                            return false;
+                        }
+                        return true;
+                    };
+                    const bool ok = readers_ok(b, bi);
                     if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, b)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, b);
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // residual stream: the only readers are the fused norm and the next combine
-                std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> comb;
+                // the combine reads a BF16 residual and writes a BF16 out_res only at view offset 0 (graph_compute): a
+                // combine on an offset view takes no part, so the residual it touches keeps its F32 store
+                struct hc_comb { const ggml_tensor * res, * out; int i0, n; };
+                std::vector<hc_comb> comb;
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     ggml_cuda_hc_combine_norm_args ca;
-                    if (ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false) > 0) comb.emplace_back(ca.residual, ca.out_res);
+                    const int nc = ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false);
+                    if (nc > 0 && ca.residual->view_offs == 0 && ca.out_res->view_offs == 0) comb.push_back({ ca.residual, ca.out_res, i, nc });
                 }
                 auto is_next_combine = [&comb](const ggml_tensor * r, const ggml_tensor * t) {
                     for (const auto & d : comb) {
-                        const ggml_tensor * dr = d.first->view_src ? d.first->view_src : d.first;
-                        if (dr == r && d.second == t) return true;
+                        const ggml_tensor * dr = d.res->view_src ? d.res->view_src : d.res;
+                        if (dr == r && d.out == t) return true;
                     }
                     return false;
                 };
@@ -7853,7 +7875,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ++it;
                 }
                 for (const auto & c : comb) {
-                    const ggml_tensor * r = c.second;
+                    const ggml_tensor * r = c.out;
                     if (ggml_nrows(r) < 512) continue;
                     int ri = -1;
                     ri = pos_of(r);
@@ -7863,7 +7885,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         const int n = *rr.first; (void) n;
                         const ggml_tensor * t = cgraph->nodes[n];
                         ++nread;
-                        if (t->op == GGML_OP_RMS_NORM) continue;
+                        if (t->op == GGML_OP_RMS_NORM && n >= c.i0 && n < c.i0 + c.n) continue;   // the combine's own norm
                         if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                         if (is_next_combine(r, t)) continue;
                         ok = false;
