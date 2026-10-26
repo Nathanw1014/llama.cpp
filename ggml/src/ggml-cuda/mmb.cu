@@ -1989,7 +1989,13 @@ static void mmb_dq_forget(const void * base, const size_t size) {
     std::lock_guard<std::mutex> lock(g_dq_mutex);
     const char * lo = (const char *) base, * hi = lo + size;
     for (auto it = g_dq_packed.begin(); it != g_dq_packed.end();) {
-        if (it->first < hi && it->first + it->second > lo) it = g_dq_packed.erase(it); else ++it;
+        if (it->first < hi && it->first + it->second > lo) {
+            // the bytes outside the write would stay in the tile layout while the record says plain Q8_0
+            if (it->first < lo || it->first + it->second > hi) {
+                GGML_ABORT("a %zu-byte write covers part of a weight repacked in place (dense R2): partial writes to it are not supported", size);
+            }
+            it = g_dq_packed.erase(it);
+        } else ++it;
     }
     g_dq_count.store((int) g_dq_packed.size());
 }
@@ -3635,7 +3641,13 @@ void ggml_cuda_mmb_r2_forget(const void * base, const size_t size) {
     const char * lo = (const char *) base, * hi = lo + size;
     for (auto * packed : {&g_r2_packed, &g_g2_packed}) {
         for (auto it = packed->begin(); it != packed->end();) {
-            if (it->first < hi && it->first + it->second > lo) it = packed->erase(it); else ++it;
+            if (it->first < hi && it->first + it->second > lo) {
+                if (it->first < lo || it->first + it->second > hi) {
+                    GGML_ABORT("a %zu-byte write covers part of a weight repacked in place (%s): partial writes to it are not supported",
+                               size, packed == &g_r2_packed ? "down R2" : "GLU R2");
+                }
+                it = packed->erase(it);
+            } else ++it;
         }
     }
     for (auto * failed : {&g_r2_failed, &g_g2_failed}) {
@@ -3645,13 +3657,13 @@ void ggml_cuda_mmb_r2_forget(const void * base, const size_t size) {
     }
 }
 
-bool ggml_cuda_mmb_r2_overlaps(const void * base, const size_t size) {
-    if (mmb_dq_overlaps(base, size)) return true;
+const char * ggml_cuda_mmb_r2_layout(const void * base, const size_t size) {
+    if (mmb_dq_overlaps(base, size)) return "dense R2";
     std::lock_guard<std::mutex> lock(g_r2_mutex);
     const char * lo = (const char *) base, * hi = lo + size;
-    for (const auto & p : g_r2_packed) if (p.first < hi && p.first + p.second > lo) return true;
-    for (const auto & p : g_g2_packed) if (p.first < hi && p.first + p.second > lo) return true;
-    return false;
+    for (const auto & p : g_r2_packed) if (p.first < hi && p.first + p.second > lo) return "down R2";
+    for (const auto & p : g_g2_packed) if (p.first < hi && p.first + p.second > lo) return "GLU R2";
+    return nullptr;
 }
 
 // In-place repack of a routed Q5_1 down weight [K=640, M, E] to the R2 layout (same size). Read-only scale check over
