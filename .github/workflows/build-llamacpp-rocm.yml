@@ -915,8 +915,9 @@ jobs:
   build-windows-vulkan:
     # Windows Vulkan build of the same commit. Same portable layout as the Linux zip (runtime-loaded
     # CPU variants and backends); uses the Vulkan loader and AMD driver installed on the user's system.
-    # The clang toolchain matches upstream's Windows CPU release build.
-    runs-on: windows-2022
+    # The clang toolchain matches upstream's Windows CPU release build. Not pinned to windows-2022 like the
+    # HIP job: that image has Clang 19, and the fetched LLVM OpenMP needs Clang 20.
+    runs-on: windows-2025-vs2026
     needs: prepare-matrix
     if: |
       github.event.inputs.vulkan != 'false' &&
