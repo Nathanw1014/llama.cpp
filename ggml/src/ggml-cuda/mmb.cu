@@ -2250,6 +2250,10 @@ bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
     if (ggml_cuda_mmb_dq_packed(w)) return false;   // the kernel decodes the row-major Q8_0 layout, not the dense R2 tiles
     if (hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    // the fused kernel is instantiated for IQ4_NL and the BF16 shadow of a Q8_0 gate only: the direct Q8_0 and trellis
+    // decodes spill on gfx1151 (CI VGPR check), so those gates take the unfused GEMM + mix. A shadow is never dropped,
+    // so a graph planned with the fused route also runs it.
+    if (w->type != GGML_TYPE_IQ4_NL && !(mmb_is_hc_q8(w) && mmb_shadow_lookup(ctx, w))) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     return !(K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t(ctx));
@@ -2274,11 +2278,10 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const uint16_t * hc_shadow = mmb_is_hc_q8(w) ? mmb_shadow_lookup(ctx, w) : nullptr;
     if (hc_shadow) {
         hc_gate_mix_kernel<4, 2, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
-    } else
-    mmb_dispatch_quant(w->type, [&](auto tag) {
-        constexpr int WT = decltype(tag)::value;
-        hc_gate_mix_kernel<4, WT, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
-    });
+    } else {
+        GGML_ASSERT(w->type == GGML_TYPE_IQ4_NL);   // see ggml_cuda_hc_gate_mix_supported
+        hc_gate_mix_kernel<4, 0, 32><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, outf, store_f32, E, K, T, scale, bias);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -4043,10 +4046,10 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
-            if (BM_BIG == 128 && BN_sel != 256) {
+            // 128 x 64 spills on gfx1151 (CI VGPR check): a 64-token selection takes the 64-row tiles below
+            if (BM_BIG == 128 && BN_sel != 256 && BN_sel != 64) {
                 const dim3 gbig((M + 127) / 128, nbig_max);
-                if (BN_sel == 64) mmb_routed_glu_kernel<128, 64, 64, 16, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                else              mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+                mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
             } else {
                 auto launch_big = [&](auto bn_tag) {
                     constexpr int BN = decltype(bn_tag)::value;
