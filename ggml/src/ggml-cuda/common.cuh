@@ -739,6 +739,18 @@ static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_bf16_rne(const float
     return (uint16_t) (u >> 16);
 }
 
+// F32 -> F16 (RNE), saturated to +-65504 (NaN stays NaN): the MMB_DENSE_F16 activation copy (mmb_f2h_sat)
+static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_f16_sat(const float f) {
+    const float c = f != f ? f : fminf(fmaxf(f, -65504.0f), 65504.0f);
+    const half h = __float2half_rn(c);
+    return *(const uint16_t *) &h;
+}
+
+// the 16-bit activation copy an MMB GEMM reads: BF16 (RNE), or F16 (saturating RNE) for an MMB_DENSE_F16 reader
+static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_act16(const float f, const bool f16) {
+    return f16 ? ggml_cuda_f32_to_f16_sat(f) : ggml_cuda_f32_to_bf16_rne(f);
+}
+
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
@@ -1548,6 +1560,19 @@ struct ggml_cuda_stream_context {
 
 struct ggml_cuda_mmb_context;
 
+// Intra-graph concurrency (RDNA3.5): graph_optimize reorders a region of the graph into [S nodes][M nodes] (no data
+// dependency between the two sets) and records it; graph_compute runs S on a side stream while M runs on the main
+// stream and joins before `end` (the first node that may read S). Every tensor touched in the region is kept allocated
+// through `end` (add_alloc_dep), so no buffer is reused while both streams run.
+#define GGML_CUDA_SIDE_STREAM 1
+struct ggml_cuda_ovl_region {
+    const ggml_tensor * s_first = nullptr;   // first S node (side stream)
+    const ggml_tensor * m_first = nullptr;   // first M node (main stream); S occupies [s_first, m_first)
+    const ggml_tensor * end     = nullptr;   // join before this node
+    int  kind     = 0;                       // 1 = GDN z-proj, 2 = FFN shared expert, 4 = attention K/V
+    bool deferred = false;                   // the end node's op joins itself (ggml_cuda_ovl_join) before reading S
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1559,6 +1584,13 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    // intra-graph concurrency state (see ggml_cuda_ovl_region)
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ovl_region> ovl_regions;   // keyed by s_first
+    bool     ovl_open      = false;   // side stream forked and not yet joined
+    int      ovl_side      = 1;       // stream index of the open side stream
+    uint32_t ovl_slot_mask = 0;       // MMB slots of the main workspace read by side-stream ops of the open region
+    cudaEvent_t ovl_ev[2]  = { nullptr, nullptr };
 
     ggml_cuda_mmb_context * mmb = nullptr;
     bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
@@ -1677,6 +1709,31 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// join the open intra-graph concurrency side stream into the main stream (no-op when none is open)
+static inline void ggml_cuda_ovl_join(ggml_backend_cuda_context & ctx) {
+    if (!ctx.ovl_open) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(ctx.ovl_ev[1], ctx.stream(ctx.device, ctx.ovl_side)));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, 0), ctx.ovl_ev[1], 0));
+    ctx.ovl_open      = false;
+    ctx.ovl_slot_mask = 0;
+}
+
+// a side-stream op of the open region read MMB slot `slot` of the main stream's workspace
+static inline void ggml_cuda_ovl_note_slot_read(ggml_backend_cuda_context & ctx, int owner_stream, int slot) {
+    if (ctx.ovl_open && ctx.curr_stream_no == ctx.ovl_side && owner_stream == 0) {
+        ctx.ovl_slot_mask |= 1u << slot;
+    }
+}
+
+// the main stream is about to overwrite MMB slot `slot`: join first if the open region reads it
+static inline void ggml_cuda_ovl_slot_write(ggml_backend_cuda_context & ctx, int slot) {
+    if (ctx.ovl_open && ctx.curr_stream_no == 0 && (ctx.ovl_slot_mask >> slot) & 1u) {
+        ggml_cuda_ovl_join(ctx);
+    }
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1709,6 +1766,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * y_gate = nullptr;
     const void * y_norm_w = nullptr;
     float y_eps = 0.0f;
+    // MMB_DENSE_R2: the Q8_0 weight (x) is in the in-place 128-row x 64-K tile layout (RDNA3.5 fused-quantize matvecs only)
+    int x_pk = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

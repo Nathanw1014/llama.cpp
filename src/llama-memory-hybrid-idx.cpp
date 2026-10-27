@@ -112,15 +112,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (mem_idx) {
-        // the QSA layers must all run where a kernel reads the selection list: HIP (RDNA3.5), or a backend that takes the probe op
-        // CUDA is not asked: its supports_op does not look at the list
+        // the QSA layers must all run where a kernel reads the selection list: a backend that takes the probe op
+        // (ggml-cuda: the HIP QSA kernels on RDNA3.5)
         bool all = true, any = false;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
-            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
             any = true;
-            all = all && (std::strcmp(reg, "ROCm") == 0 ||
-                          (std::strcmp(reg, "CUDA") != 0 && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il)));
+            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
         }
         selected_key_attn = any && all && offload;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
@@ -834,10 +832,16 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         // member cells per group, for the tails (a group's slot k holds the cell at position k within the block)
         std::vector<int32_t> group_members;
         if (dst_tail) {
+            llama_kv_cells::seq_set_t tail_seqs;
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                tail_seqs.set(ubatch->seq_id[s*n_tps + ii][0]);
+            }
             group_members.assign(grp_first.size()*r, -1);
             for (int64_t j=0;j<n_kv;++j) {
                 const int32_t g=cell_grp[j];
                 if (g<0) { continue; }
+                // Other sequences' image cells can share a slot; their tails are not read by this ubatch.
+                if ((cells.seq_get_all((uint32_t) j) & tail_seqs).none()) { continue; }
                 const int64_t idx=ranked ? rank[j] : cells.pos_get(j);
                 const int64_t slot=g*r+idx%r;
                 GGML_ASSERT(group_members[slot]<0 || group_members[slot]==j);
@@ -1680,8 +1684,22 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
     if (qsa_prefix_matches(ubatch)) { return true; }
-    if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
+    if (!get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
             ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
+    if (get_n_stream()!=1) {
+        // split streams: stream s of the ubatch holds tokens [s*n_tps, (s+1)*n_tps) and reads the cells of their sequence
+        const uint32_t ns = get_n_stream();
+        if (ubatch.n_tokens % ns != 0) { return false; }
+        const uint32_t n_tps = ubatch.n_tokens / ns;
+        for (uint32_t s = 0; s < ns; ++s) {
+            const uint32_t i0 = s*n_tps;
+            if (ubatch.n_seq_id[i0]<1 || !ubatch.seq_id[i0]) { return false; }
+            if (!qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[i0][0]), get_idx()->get_n_kv(), ratio, ubatch)) {
+                return false;
+            }
+        }
+        return true;
+    }
     // one stream: every seq id of the ubatch reads the same cells
     return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), get_idx()->get_n_kv(), ratio, ubatch);
 }

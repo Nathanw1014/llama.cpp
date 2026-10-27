@@ -6114,10 +6114,10 @@ struct test_gated_delta_net : public test_case {
     }
 
     // the chunked prefill paths run their matrix products on fp16 WMMA operands (NMSE ~2e-7 vs the fp32
-    // reference) instead of the exact fp32 recurrence: HIP on RDNA3.5 (S_v = 128, >= 256 tokens, one sequence,
-    // final state only) and Vulkan on RDNA3 (S_v = 128, >= 64 tokens, final state only)
+    // reference) instead of the exact fp32 recurrence: HIP on RDNA3.5 (S_v = 128, >= 256 tokens per sequence, final
+    // state only; several sequences run it once per sequence) and Vulkan on RDNA3 (S_v = 128, >= 64 tokens, final state only)
     double max_nmse_err() override {
-        return (head_size == 128 && n_seq_tokens >= 256 && n_seqs == 1 && !kda && K == 1) ? 1e-6 : 1e-7;
+        return (head_size == 128 && n_seq_tokens >= 256 && !kda && K == 1) ? 1e-6 : 1e-7;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
