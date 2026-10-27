@@ -14777,6 +14777,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
     test_cases.emplace_back(new test_moe_prefill(false, 2048, GGML_TYPE_Q5_1, true));
+    // MUL_MAT_ID_PAIR_SWIGLU: both graph orders, f32 / f16 activations, token counts around the 64-row tile
+    for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (bool up_first : { false, true }) {
+            for (int64_t nt : { 9, 63, 64, 65, 200 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first));
+            }
+        }
+    }
+    // q5_K: both chains, both orders, f32 / f16 activations, tile edges
+    for (bool chain32 : { false, true }) {
+        for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+            for (int64_t nt : { 9, 65, 513 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, tx, 512, 256, 32, 8, nt, nt == 65, false, chain32));
+            }
+        }
+    }
+    // the f32 chain (no casts, f32 SWIGLU): both graph orders, f32 / f16 activations, tile edges, then model shapes
+    // (LFM2.5-8B-A1B, DeepSeek-V4-Flash) and an unmatched type
+    for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t nt : { 9, 64, 65, 200, 513 }) {
+            for (bool up_first : { false, true }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first, false, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 1792, 32, 4, 300, true, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 2048, 256, 6, 130, false, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 256, 32, 8, 65, false, false, true));
+    // every weight type: only q4_K may take the fused launch, the rest must fall back and still match
+    for (ggml_type tw : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+                         GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+                         GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t nt : { 65, 200 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 512, 256, 32, 8, nt));
+        }
+    }
+    // ragged M (65, 129 rows) and M % 128 != 0 at 192: q4_K must fall back
+    for (int64_t m : { 65, 129, 192 }) {
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, m, 32, 8, 200));
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 512, m, 32, 8, 513, true));
+    }
+    // the Flash-Next expert rows (2560 x 640, 10 used) around the 128-token MMB gate for the FN gate/up quant types, on 32
+    // experts so each weight stays small
+    for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int64_t nt : { 127, 128 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 32, 10, nt));
+        }
+    }
+    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K; the other full-shape runs are in
+    // the GGML_PERF_MOE perf set
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
