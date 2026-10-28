@@ -7,12 +7,13 @@
 # it was dispatched on. workflow_dispatch only works once this file is on the default branch.
 #
 # One run does:
-#   1. builds llama-bench and test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
+#   1. builds llama-bench, llama-perplexity and test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
 #   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg, on ROCm0
-#   3. runs llama-perplexity with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
+#   3. runs llama-perplexity on ROCm0 with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
 #   4. runs a test-backend-ops perf subset on ROCm0 (scripts/bench-history/ops-perf.sh)
-#   5. runs the same llama-bench matrix and then the perf subset on Vulkan0, after all HIP work
-#   6. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
+#   5. runs the same llama-bench matrix and a separate llama-perplexity measurement on Vulkan0, after all HIP work
+#   6. runs the Vulkan ops-perf subset last, where the device reset happens, after Vulkan perplexity
+#   7. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
 #      bench-results branch and rebuilds the Pages site from all runs on that branch
 #
 # Recipe. Models, quants and flags come from bench-gfx1151.yml and its PR172 comparison variant,
@@ -34,7 +35,8 @@
 #
 # Perplexity: wiki.test.raw of the ggml-org/ci dataset (the file scripts/get-wikitext-2.sh and ci/run.sh
 # use), pinned by revision and sha256; the first 32 chunks at -c 4096, with -b and -ub both 2048 and
-# both 4096. At c4096 the two runs score the same tokens: b2048 cuts every chunk into two batches,
+# both 4096. The Vulkan number is a separate measurement, not a replacement for ROCm.
+# At c4096 the two runs score the same tokens: b2048 cuts every chunk into two batches,
 # b4096 runs it as one, so a PPL difference comes from the batch cut alone.
 #
 # Perf subset: MUL_MAT and MUL_MAT_ID for every type at n = 1, 8 and 512, plus the cases listed in
@@ -90,6 +92,11 @@ on:
         required: false
         default: true
         type: boolean
+      vulkan_ppl:
+        description: 'Run llama-perplexity on Vulkan0 too, separately from the ROCm0 run (needs vulkan_bench)'
+        required: false
+        default: true
+        type: boolean
       vulkan_bench:
         description: 'Run the llama-bench matrix on Vulkan0 too'
         required: false
@@ -119,7 +126,7 @@ jobs:
     if: ${{ !inputs.site_only }}
     runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     # expected about 6.5 h; the step timeouts bound a slow step so the later steps still get their time
-    timeout-minutes: 900
+    timeout-minutes: 1200
     # one benchmark at a time; GitHub keeps one pending run per group and cancels an older pending one
     concurrency:
       group: ${{ github.workflow }}-devlab
@@ -229,6 +236,7 @@ jobs:
         env:
           INPUT_OPS_PERF: ${{ inputs.ops_perf }}
           INPUT_PPL: ${{ inputs.ppl }}
+          INPUT_VULKAN_PPL: ${{ inputs.vulkan_ppl }}
           INPUT_VULKAN_BENCH: ${{ inputs.vulkan_bench }}
         run: |
           set -euo pipefail
@@ -256,6 +264,7 @@ jobs:
             echo "n_batch=$BENCH_N_BATCH"
             echo "ops_perf=$INPUT_OPS_PERF"
             echo "ppl=$INPUT_PPL"
+            echo "vulkan_ppl=$INPUT_VULKAN_PPL"
             echo "vulkan_bench=$INPUT_VULKAN_BENCH"
             echo "ppl_ctx=$PPL_CTX"
             echo "ppl_chunks=$PPL_CHUNKS"
@@ -409,7 +418,7 @@ jobs:
             "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
             -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
-          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench test-backend-ops)
+          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench llama-perplexity test-backend-ops)
 
           printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
           printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
@@ -530,12 +539,14 @@ jobs:
           bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-hip/bin/test-backend-ops ROCm0 \
             "$RUNNER_TEMP/logs/ops-perf-ROCm0.log" .bench-lane/scripts/bench-history/perf-cases.txt
 
-      - name: llama-bench (Vulkan)
+      - name: llama-bench and llama-perplexity (Vulkan)
         id: bench_vulkan
         if: ${{ !cancelled() && inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
-        timeout-minutes: 330
+        timeout-minutes: 480
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+          RUN_VULKAN_PPL: ${{ inputs.vulkan_ppl }}
+          RUN_PPL: ${{ inputs.ppl }}
         run: |
           # after all HIP work, so a Vulkan failure or device reset cannot touch the HIP numbers
           set +e
@@ -543,6 +554,7 @@ jobs:
           export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           logs="$RUNNER_TEMP/logs"
           model=.bench-lane/scripts/bench-history/model.sh
+          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
           failed=0
           IFS=',' read -ra want <<< "$BENCH_MODELS"
           # files the HIP step kept first, so their space is free before a dropped file is downloaded again
@@ -572,6 +584,36 @@ jobs:
               continue
             fi
             bash "$model" bench llama-bench-vulkan ./build-vulkan/bin/llama-bench "$name" "$path" || failed=1
+
+            if [ "$RUN_PPL" = "true" ] && [ "$RUN_VULKAN_PPL" = "true" ]; then
+              for b in ${PPL_BATCHES//,/ }; do
+                if [ ! -s "${WIKITEXT_FILE:-}" ]; then
+                  echo "::error::SKIP llama-perplexity $name b$b: no Wikitext-2 sample"
+                  printf 'perplexity-vulkan\t%s\t%s\tno-wikitext\t\n' "$name" "$b" >> "$logs/results.tsv"
+                  failed=1
+                  continue
+                fi
+                extra=$(bash "$model" flags "$name")
+                cmd=(timeout 3600 ./build-vulkan/bin/llama-perplexity -m "$path" -f "$WIKITEXT_FILE" -c "$PPL_CTX" --chunks "$PPL_CHUNKS" -b "$b" -ub "$b" -lzm on-direct -ngl 99 -fa on -ctk f16 -ctv f16)
+                # shellcheck disable=SC2206
+                [ -z "$extra" ] || cmd+=($extra)
+                printf 'perplexity-vulkan-%s-b%s\t%s\n' "$name" "$b" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
+                echo "=== llama-perplexity $name b$b ==="
+                t0=$(date +%s.%N)
+                "${cmd[@]}" > "$logs/perplexity-vulkan-$name-b$b.log" 2>&1
+                rc=$?
+                wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+                final=$(grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+' "$logs/perplexity-vulkan-$name-b$b.log" | tail -1)
+                printf 'perplexity-vulkan\t%s\t%s\t%s\t%s\n' "$name" "$b" "$rc" "$wall" >> "$logs/results.tsv"
+                echo "$name b$b: exit $rc, $wall s, ${final:-no final estimate}"
+                # perplexity exits 0 without a result when the text is too short, so require the final line
+                if [ "$rc" -ne 0 ] || [ -z "$final" ]; then
+                  tail -20 "$logs/perplexity-vulkan-$name-b$b.log"
+                  echo "::error::llama-perplexity failed for $name b$b (exit $rc)"
+                  failed=1
+                fi
+              done
+            fi
             rm -rf "$RUNNER_TEMP/models/$name"
           done
           exit "$failed"
