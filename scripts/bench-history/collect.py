@@ -230,24 +230,28 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
     ppl_requested = meta.get('ppl', 'false') == 'true'
     ppl = []
     if ppl_requested:
-        ppl_rows = {(row[1], row[2]): row for row in results if row[0] == 'perplexity' and len(row) >= 4}
-        for name in meta.get('models', '').split(','):
-            if not name:
-                continue
-            for batch in int_list(meta.get('ppl_batches', '')):
-                row = ppl_rows.get((name, str(batch)))
-                parsed = parse_perplexity(raw / f'perplexity-{name}-b{batch}.log')
-                rc = to_int(row[3]) if row else None
-                if row and row[3] == 'no-wikitext':
-                    status = 'skipped (no wikitext)'
-                elif row is None and model_status.get(name, 'verified') not in ('verified', ''):
-                    status = f'skipped ({model_status[name]})'
-                else:
-                    status = exit_status(rc)
-                    if status == 'ok' and parsed['ppl'] is None:
-                        status = 'no result'
-                ppl.append({'model': name, 'n_batch': batch, 'n_ubatch': batch, 'exit_code': rc, 'status': status,
-                            'wall_seconds': float(row[4]) if row and len(row) > 4 and row[4] else None, **parsed})
+        lanes = [('ROCm', 'perplexity', 'perplexity')] + ([('Vulkan', 'perplexity-vulkan', 'perplexity-vulkan')] if meta.get('vulkan_ppl') == 'true' else [])
+        for backend, kind, prefix in lanes:
+            ppl_rows = {(row[1], row[2]): row for row in results if row[0] == kind and len(row) >= 4}
+            for name in meta.get('models', '').split(','):
+                if not name:
+                    continue
+                for batch in int_list(meta.get('ppl_batches', '')):
+                    row = ppl_rows.get((name, str(batch)))
+                    parsed = parse_perplexity(raw / f'{prefix}-{name}-b{batch}.log')
+                    rc = to_int(row[3]) if row else None
+                    if row and row[3] == 'no-wikitext':
+                        status = 'skipped (no wikitext)'
+                    elif row is None and model_status.get(name, 'verified') not in ('verified', ''):
+                        status = f'skipped ({model_status[name]})'
+                    elif backend == 'Vulkan' and row is None and steps.get('device-vulkan') not in ('success', None):
+                        status = 'skipped (no Vulkan device)'
+                    else:
+                        status = exit_status(rc)
+                        if status == 'ok' and parsed['ppl'] is None:
+                            status = 'no result'
+                    ppl.append({'model': name, 'backend': backend, 'n_batch': batch, 'n_ubatch': batch, 'exit_code': rc, 'status': status,
+                                'wall_seconds': float(row[4]) if row and len(row) > 4 and row[4] else None, **parsed})
 
     ops = []
     if ops_requested:
@@ -346,6 +350,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             'ops_perf': ops_requested,
             'vulkan_bench': vulkan_requested,
             'ppl': ppl_requested,
+            'vulkan_ppl': meta.get('vulkan_ppl') == 'true',
             'ppl_ctx': to_int(meta.get('ppl_ctx')),
             'ppl_chunks': to_int(meta.get('ppl_chunks')),
             'ppl_batches': int_list(meta.get('ppl_batches', '')),
@@ -380,7 +385,7 @@ def write_summary(run: dict[str, Any]) -> None:
         lines.append(f"- llama-bench {entry['model']} ({entry['backend']}): {entry['status']}, {len(entry['rows'])} rows")
     for entry in run['perplexity']:
         value = f"PPL {entry['ppl']:.4f} +/- {entry['ppl_err']:.5f}" if entry['ppl'] is not None else 'no PPL'
-        lines.append(f"- llama-perplexity {entry['model']} b{entry['n_batch']}: {entry['status']}, {value}")
+        lines.append(f"- llama-perplexity {entry['model']} ({entry.get('backend', 'ROCm')}) b{entry['n_batch']}: {entry['status']}, {value}")
     for entry in run['ops_perf']:
         missing = f", {len(entry['missing_listed'])} listed cases without a result" if entry['missing_listed'] else ''
         if entry.get('n_failed'):
