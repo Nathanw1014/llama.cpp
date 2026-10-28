@@ -4,6 +4,8 @@
 #
 # usage: model.sh fetch <name>       download and verify into $RUNNER_TEMP/models, print the path
 #        model.sh fits <name>...     exit 0 if the named models still fit on the disk
+#        model.sh have <name>        print the first shard of an already fetched model, exit 1 if absent
+#        model.sh flags <name>       print the model's extra llama flags
 #        model.sh bench <kind> <llama-bench> <name> <path>
 #                                    kind is llama-bench (ROCm0) or llama-bench-vulkan (Vulkan0)
 # fetch exits 2 for too little memory, 3 for too little disk, 4 for a failed download and 5 for a
@@ -15,16 +17,17 @@ model_root="$RUNNER_TEMP/models"
 # held back for KV cache and compute buffers when checking that a model fits in memory
 margin_bytes=$(( 16 * 1024 * 1024 * 1024 ))
 
-# repo|revision|file|bytes|sha256, read from the Hugging Face API on 2026-10-20
+# repo|revision|total bytes|manifest|extra llama flags, read from the Hugging Face API
+# A manifest entry is file:bytes:sha256. A split model lists one entry per shard and the total
+# covers all of them; llama.cpp takes the first shard and finds the rest beside it.
 spec() {
     case "$1" in
-        qwen36-35b-a3b)
-            echo 'bartowski/Qwen_Qwen3.6-35B-A3B-GGUF|5c2410d71524f4f72b023ce8daf7a80528226d5f|Qwen_Qwen3.6-35B-A3B-Q8_0.gguf|37812647552|bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9'
-            ;;
-        qwen38-27b)
-            echo 'unsloth/Qwen3.8-27B-GGUF|4ca720788d1e01f1bff70c033e0d0028fd02e502|Qwen3.8-27B-Q8_0.gguf|29047086048|a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348'
-            ;;
-        *) return 1 ;;
+    qwen36-35b-a3b) echo 'bartowski/Qwen_Qwen3.6-35B-A3B-GGUF|5c2410d71524f4f72b023ce8daf7a80528226d5f|37812647552|Qwen_Qwen3.6-35B-A3B-Q8_0.gguf:37812647552:bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9|' ;;
+    qwen38-27b) echo 'unsloth/Qwen3.8-27B-GGUF|4ca720788d1e01f1bff70c033e0d0028fd02e502|29047086048|Qwen3.8-27B-Q8_0.gguf:29047086048:a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348|' ;;
+    # the second shard is the PLE table alone and -lzm on-direct never allocates it, so 36.5 GiB of
+    # this 63.3 GiB file is resident; -lm dio keeps a 68 GB mmap out of the load path
+    flash-next-iq2xs) echo 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF|ed59f92082b1e93c0e96d60a8b11aab089b52f09|68026093024|IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf:39225954592:92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7 IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf:28800138432:316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113|-lm dio' ;;
+    *) return 1 ;;
     esac
 }
 
@@ -50,12 +53,13 @@ mem_fits() {
 }
 
 fetch() {
-    local name=$1 repo rev file bytes sha dest out free got_bytes got_sha
-    IFS='|' read -r repo rev file bytes sha <<< "$(spec "$name")"
+    local name=$1 repo rev bytes manifest extra dest free first entry file want out url got_bytes got_sha
+    IFS='|' read -r repo rev bytes manifest extra <<< "$(spec "$name")"
     dest="$model_root/$name"
-    out="$dest/$file"
-    note() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$repo" "$rev" "$file" "$bytes" "$sha" "$1" "$2" >> "$logs/models.tsv"; }
-
+    first=${manifest%% *}
+    note() {
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$repo" "$rev" "${first%%:*}" "$bytes" "${first##*:}" "$1" "$2" >> "$logs/models.tsv"
+    }
     mem_fits "$bytes" "$name" || { note "" skipped-memory; return 2; }
     mkdir -p "$dest"
     free=$(df -B1 --output=avail "$dest" | tail -1)
@@ -64,31 +68,38 @@ fetch() {
         note "" skipped-disk
         return 3
     fi
-    local url="https://huggingface.co/$repo/resolve/$rev/$file" auth=()
-    echo "fetching $url" >&2
+    local auth=()
     [ -z "${HF_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $HF_TOKEN")
-    if ! curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -C - "${auth[@]}" -o "$out" "$url"; then
-        echo "::error::download failed: $url" >&2
-        note "" download-failed
-        rm -rf "$dest"
-        return 4
-    fi
-    got_bytes=$(stat -c %s "$out")
-    got_sha=$(sha256sum "$out" | cut -d' ' -f1)
-    if [ "$got_bytes" != "$bytes" ] || [ "$got_sha" != "$sha" ]; then
-        echo "::error::$name: got $got_bytes bytes sha256 $got_sha, pinned $bytes bytes sha256 $sha" >&2
-        note "$got_sha" hash-mismatch
-        rm -rf "$dest"
-        return 5
-    fi
+    for entry in $manifest; do
+        file=${entry%%:*}
+        want=${entry#*:}
+        out="$dest/$file"
+        url="https://huggingface.co/$repo/resolve/$rev/$file"
+        mkdir -p "$(dirname "$out")"
+        echo "fetching $url" >&2
+        if ! curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -C - "${auth[@]}" -o "$out" "$url"; then
+            echo "::error::download failed: $url" >&2
+            note "" download-failed
+            rm -rf "$dest"
+            return 4
+        fi
+        got_bytes=$(stat -c %s "$out")
+        got_sha=$(sha256sum "$out" | cut -d' ' -f1)
+        if [ "$got_bytes" != "${want%%:*}" ] || [ "$got_sha" != "${want##*:}" ]; then
+            echo "::error::$name $file: got $got_bytes bytes sha256 $got_sha, pinned ${want%%:*} bytes sha256 ${want##*:}" >&2
+            note "$got_sha" hash-mismatch
+            rm -rf "$dest"
+            return 5
+        fi
+    done
     note "$got_sha" verified
-    printf '%s\n' "$out"
+    printf '%s\n' "$dest/${first%%:*}"
 }
 
 fits() {
-    local need=0 name bytes free
+    local need=0 name bytes
     for name in "$@"; do
-        IFS='|' read -r _ _ _ bytes _ <<< "$(spec "$name")"
+        IFS='|' read -r _ _ bytes _ <<< "$(spec "$name")"
         need=$(( need + bytes + bytes / 5 ))
     done
     mkdir -p "$model_root"
@@ -96,9 +107,24 @@ fits() {
     [ "$free" -ge "$need" ]
 }
 
+have() {
+    local name=$1 repo rev bytes manifest first dest
+    IFS='|' read -r repo rev bytes manifest _ <<< "$(spec "$name")"
+    first=${manifest%% *}
+    dest="$model_root/$name/${first%%:*}"
+    [ -s "$dest" ] || return 1
+    printf '%s\n' "$dest"
+}
+
+flags() {
+    local extra
+    IFS='|' read -r _ _ _ _ extra <<< "$(spec "$1")"
+    printf '%s\n' "$extra"
+}
+
 bench() {
-    local kind=$1 bin=$2 name=$3 path=$4 bytes rc rows
-    IFS='|' read -r _ _ _ bytes _ <<< "$(spec "$name")"
+    local kind=$1 bin=$2 name=$3 path=$4 bytes rc rows extra
+    IFS='|' read -r _ _ bytes _ extra <<< "$(spec "$name")"
     if ! mem_fits "$bytes" "$kind $name"; then
         printf '%s\t%s\tskipped-memory\t0\n' "$kind" "$name" >> "$logs/results.tsv"
         return 1
@@ -106,14 +132,9 @@ bench() {
     # -fa and the KV types are spelled out so the numbers do not move with the auto defaults.
     # HIP_LAUNCH_BLOCKING is not set: it serialises every kernel launch.
     # 3 h per model: the 27B HIP run took 1 h 53 min in run 39469034755.
-    local cmd=(timeout 10800 "$bin"
-        -m "$path"
-        -p "$BENCH_N_PROMPT" -n "$BENCH_N_GEN"
-        -b "$BENCH_N_BATCH" -ub "$BENCH_UBATCH"
-        -d "$BENCH_DEPTHS"
-        -lzm on-direct
-        -ngl 99 -fa on -ctk f16 -ctv f16
-        -r "$BENCH_REPS" -o jsonl --progress)
+    local cmd=(timeout 10800 "$bin" -m "$path" -p "$BENCH_N_PROMPT" -n "$BENCH_N_GEN" -b "$BENCH_N_BATCH" -ub "$BENCH_UBATCH" -d "$BENCH_DEPTHS" -lzm on-direct -ngl 99 -fa on -ctk f16 -ctv f16 -r "$BENCH_REPS" -o jsonl --progress)
+    # shellcheck disable=SC2206
+    [ -z "$extra" ] || cmd+=($extra)
     printf '%s-%s\t%s\n' "$kind" "$name" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
     echo "=== $kind $name ==="
     "${cmd[@]}" > "$logs/$kind-$name.jsonl" 2> "$logs/$kind-$name.log"
@@ -131,6 +152,6 @@ bench() {
 action=$1
 shift
 case "$action" in
-    fetch | fits | bench) "$action" "$@" ;;
-    *) echo "usage: model.sh fetch|fits|bench ..." >&2; exit 2 ;;
+    fetch | fits | have | flags | bench) "$action" "$@" ;;
+    *) echo "usage: model.sh fetch|fits|have|flags|bench ..." >&2; exit 2 ;;
 esac

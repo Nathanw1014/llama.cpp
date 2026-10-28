@@ -28,6 +28,9 @@
 #   key             repo                                 revision                                  file                            bytes        sha256
 #   qwen36-35b-a3b  bartowski/Qwen_Qwen3.6-35B-A3B-GGUF  5c2410d71524f4f72b023ce8daf7a80528226d5f  Qwen_Qwen3.6-35B-A3B-Q8_0.gguf  37812647552  bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9
 #   qwen38-27b      unsloth/Qwen3.8-27B-GGUF             4ca720788d1e01f1bff70c033e0d0028fd02e502  Qwen3.8-27B-Q8_0.gguf           29047086048  a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348
+#   flash-next-iq2xs  ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF  ed59f92082b1e93c0e96d60a8b11aab089b52f09  IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf  39225954592  92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7
+#   flash-next-iq2xs  ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF  ed59f92082b1e93c0e96d60a8b11aab089b52f09  IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf  28800138432  316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
+# -lm dio is set for flash-next-iq2xs only, to keep a 68 GB mmap out of the load path.
 #
 # Perplexity: wiki.test.raw of the ggml-org/ci dataset (the file scripts/get-wikitext-2.sh and ci/run.sh
 # use), pinned by revision and sha256; the first 32 chunks at -c 4096, with -b and -ub both 2048 and
@@ -62,9 +65,9 @@ on:
         required: false
         default: ''
       models:
-        description: 'Comma-separated subset of qwen36-35b-a3b,qwen38-27b'
+        description: 'Comma-separated subset of qwen36-35b-a3b,qwen38-27b,flash-next-iq2xs'
         required: false
-        default: 'qwen36-35b-a3b,qwen38-27b'
+        default: 'qwen36-35b-a3b,qwen38-27b,flash-next-iq2xs'
       ubatch:
         description: 'Comma-separated ubatch sizes (-ub), each 1..4096'
         required: false
@@ -179,7 +182,7 @@ jobs:
           case "$ref" in *[!A-Za-z0-9._/+@-]*) err "ref '$ref' has characters outside [A-Za-z0-9._/+@-]" ;; esac
           [ "${#ref}" -le 200 ] || err "ref is longer than 200 characters"
 
-          known="qwen36-35b-a3b qwen38-27b"
+          known="qwen36-35b-a3b qwen38-27b flash-next-iq2xs"
           models=""
           IFS=',' read -ra items <<< "$INPUT_MODELS"
           for m in "${items[@]}"; do
@@ -483,12 +486,10 @@ jobs:
                   failed=1
                   continue
                 fi
-                cmd=(timeout 3600 ./build-hip/bin/llama-perplexity
-                  -m "$path" -f "$WIKITEXT_FILE"
-                  -c "$PPL_CTX" --chunks "$PPL_CHUNKS"
-                  -b "$b" -ub "$b"
-                  -lzm on-direct
-                  -ngl 99 -fa on -ctk f16 -ctv f16)
+                extra=$(bash "$model" flags "$name")
+                cmd=(timeout 3600 ./build-hip/bin/llama-perplexity -m "$path" -f "$WIKITEXT_FILE" -c "$PPL_CTX" --chunks "$PPL_CHUNKS" -b "$b" -ub "$b" -lzm on-direct -ngl 99 -fa on -ctk f16 -ctv f16)
+                # shellcheck disable=SC2206
+                [ -z "$extra" ] || cmd+=($extra)
                 printf 'perplexity-%s-b%s\t%s\n' "$name" "$b" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
                 echo "=== llama-perplexity $name b$b ==="
                 t0=$(date +%s.%N)
@@ -556,14 +557,15 @@ jobs:
               echo "::error::SKIP Vulkan llama-bench $name: the HIP step could not use the model (${status:-not fetched})"
               printf 'llama-bench-vulkan\t%s\tskipped-%s\t0\n' "$name" "${status:-not-fetched}" >> "$logs/results.tsv"
               failed=1
-            elif [ -s "$RUNNER_TEMP/models/$name/$file" ]; then
+            elif bash "$model" have "$name" > /dev/null; then
               kept+=("$name")
             else
               dropped+=("$name")
             fi
           done
           for name in "${kept[@]}" "${dropped[@]}"; do
-            path=$(find "$RUNNER_TEMP/models/$name" -name '*.gguf' -print -quit 2> /dev/null)
+            path=$(bash "$model" have "$name" 2> /dev/null)
+            [ -n "$path" ] || path=$(find "$RUNNER_TEMP/models/$name" -name '*.gguf' -print -quit 2> /dev/null)
             if [ -z "$path" ] && ! path=$(bash "$model" fetch "$name"); then
               printf 'llama-bench-vulkan\t%s\tskipped-download\t0\n' "$name" >> "$logs/results.tsv"
               failed=1
