@@ -6,7 +6,8 @@
 #        model.sh fits <name>...     exit 0 if the named models still fit on the disk
 #        model.sh have <name>        print the first shard of an already fetched model, exit 1 if absent
 #        model.sh flags <name>       print the model's extra llama flags
-#        model.sh speed <name>       print the SPEED-Bench configs of a model that carries MTP heads, exit 1 if none
+#        model.sh speed <name>       print the SPEED-Bench configs of a model that gets a SPEED-Bench run, exit 1 if none
+#        model.sh draft <name>       download and verify the model's MTP draft head, print its path, exit 1 if none
 #        model.sh bench <kind> <llama-bench> <name> <path>
 #                                    kind is llama-bench (ROCm0) or llama-bench-vulkan (Vulkan0)
 # fetch exits 2 for too little memory, 3 for too little disk, 4 for a failed download and 5 for a
@@ -123,13 +124,68 @@ flags() {
     printf '%s\n' "$extra"
 }
 
-# The models whose GGUF carries MTP heads, so llama-server can draft with --spec-type draft-mtp and no
-# separate draft file. Prints the SPEED-Bench configs to run, comma-separated.
+# The models that get a SPEED-Bench run. Prints the SPEED-Bench configs, comma-separated. These are not
+# the models that carry an MTP head: see draft_spec() below for the head they need.
 speed() {
     case "$1" in
     flash-next-iq2xs) echo 'throughput_1k,throughput_32k' ;;
     *) return 1 ;;
     esac
+}
+
+# The MTP draft head a model needs, repo|revision|total bytes|file:bytes:sha256. The lane's GGUFs carry
+# no MTP tensor (IQ2_XS checked 2026-10-30), so llama-server takes a sidecar with -md. A self-contained
+# head carries its own embeddings and LM head; a -shared- one borrows them from the target, which this
+# tree supports (src/llama-context.cpp). unsloth calls shared-Q8_0 the fastest of the set: swapping is
+# this one line, plus its bytes and sha256.
+draft_spec() {
+    case "$1" in
+    flash-next-iq2xs) echo 'unsloth/Qwen3.8-Flash-Next-GGUF|766911a6b7369840a91dbcd95f9f997acaab6cd6|2786204800|MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf:2786204800:8087dbb39fc73f79ac069b1debe4069a44b73ada900c8bd761569d43a5a90231' ;;
+    *) return 1 ;;
+    esac
+}
+
+# download and verify the draft head into $RUNNER_TEMP/models/<name>-mtp, print its path
+# exits 3 for too little disk, 4 for a failed download and 5 for a size or sha256 mismatch
+draft() {
+    local name=$1 repo rev bytes manifest file want dest out free got_bytes got_sha
+    local auth=()
+    IFS='|' read -r repo rev bytes manifest <<< "$(draft_spec "$name")" || return 1
+    file=${manifest%%:*}
+    want=${manifest#*:}
+    dest="$model_root/$name-mtp"
+    out="$dest/$(basename "$file")"
+    # key, repo, revision, file, bytes, pinned sha256, actual sha256, status
+    note() {
+        printf 'draft\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "$repo" "$rev" "$file" "$bytes" "${want##*:}" "$1" "$2" >> "$logs/drafts.tsv"
+    }
+    mkdir -p "$dest"
+    free=$(df -B1 --output=avail "$dest" | tail -1)
+    if [ "$free" -lt "$bytes" ]; then
+        echo "::error::SKIP draft $name: needs $(( bytes >> 20 )) MiB of disk, $(( free >> 20 )) MiB free" >&2
+        note "" skipped-disk
+        return 3
+    fi
+    [ -z "${HF_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $HF_TOKEN")
+    echo "fetching draft https://huggingface.co/$repo/resolve/$rev/$file" >&2
+    if ! curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -C - "${auth[@]}" -o "$out" \
+        "https://huggingface.co/$repo/resolve/$rev/$file"; then
+        echo "::error::download failed: draft $name" >&2
+        note "" download-failed
+        rm -rf "$dest"
+        return 4
+    fi
+    got_bytes=$(stat -c %s "$out")
+    got_sha=$(sha256sum "$out" | cut -d' ' -f1)
+    if [ "$got_bytes" != "${want%%:*}" ] || [ "$got_sha" != "${want##*:}" ]; then
+        echo "::error::draft $name: got $got_bytes bytes sha256 $got_sha, pinned ${want%%:*} bytes sha256 ${want##*:}" >&2
+        note "$got_sha" hash-mismatch
+        rm -rf "$dest"
+        return 5
+    fi
+    note "$got_sha" verified
+    printf '%s\n' "$out"
 }
 
 bench() {
@@ -162,6 +218,6 @@ bench() {
 action=$1
 shift
 case "$action" in
-    fetch | fits | have | flags | speed | bench) "$action" "$@" ;;
-    *) echo "usage: model.sh fetch|fits|have|flags|speed|bench ..." >&2; exit 2 ;;
+    fetch | fits | have | flags | speed | draft | bench) "$action" "$@" ;;
+    *) echo "usage: model.sh fetch|fits|have|flags|speed|draft|bench ..." >&2; exit 2 ;;
 esac

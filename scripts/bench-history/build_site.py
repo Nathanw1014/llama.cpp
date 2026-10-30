@@ -348,7 +348,14 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
                 if name and name not in cats:
                     cats.append(name)
         cats.sort(key=lambda c: (c == 'overall', c))
-        parts.append(f'<h3>{esc(model)} - {esc(bench)}</h3><div class="scroll"><table><thead><tr><th>Date (UTC)</th>'
+        used = next((s.get('draft') for _, s in entries if (s.get('draft') or {}).get('file')), None)
+        if used:
+            head_note = (f'Draft head <code>{esc(used.get("file"))}</code> @ <code>{esc(used.get("revision"))}</code>'
+                         f' of {esc(used.get("repo"))}')
+        else:
+            head_note = 'No MTP draft head recorded'
+        parts.append(f'<h3>{esc(model)} - {esc(bench)}</h3><p class="note">{head_note}</p>'
+                     f'<div class="scroll"><table><thead><tr><th>Date (UTC)</th>'
                      '<th>Ref</th><th>Commit</th><th>Speculative</th>'
                      + ''.join(f'<th class="num">{esc(c)}</th>' for c in cats)
                      + '</tr></thead><tbody>')
@@ -603,12 +610,23 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                      f'{esc(e.get("failed_samples"))} failed') if samples is not None else '-'
             bench_row = (f'{esc(cfg.get("bench"))} / {esc(cfg.get("category"))}' if cfg else '-')
             out_row = (f'{esc(cfg.get("osl"))} tokens (max_tokens), temperature 0' if cfg else '-')
+            draft = e.get('draft') or {}
+            if draft.get('file'):
+                sha_ok = draft.get('sha256_actual') == draft.get('sha256')
+                hf_url = f'https://huggingface.co/{draft.get("repo")}/tree/{draft.get("revision")}'
+                head_row = (f'<code>{esc(draft.get("file"))}</code> from {link(hf_url, str(draft.get("repo")))}'
+                            f' @ <code>{esc(draft.get("revision"))}</code>, {esc(draft.get("bytes"))} bytes, '
+                            f'sha256 <code>{esc(draft.get("sha256"))}</code> '
+                            + (badge('ok') if sha_ok else badge(draft.get('status'))))
+            else:
+                head_row = '-'
             parts.append(kv_table([
                 ('Client', 'tools/server/bench/speed-bench/speed_bench.py'),
                 ('Bench / category', bench_row),
                 ('Samples', count),
                 ('Server', f'--spec-type {esc(e.get("spec_type"))}, -b {esc(e.get("n_batch"))}, '
                            f'-ub {esc(e.get("n_ubatch"))}, -c {esc(e.get("n_ctx"))}, one slot'),
+                ('Draft head', head_row),
                 ('Output length', out_row),
             ]))
             summary_rows = e.get('summary') or []
@@ -704,6 +722,7 @@ def summary(run: dict[str, Any]) -> dict[str, Any]:
     out['speed_bench'] = []
     for s in run.get('speed_bench') or []:
         entry = {k: s.get(k) for k in ('model', 'bench', 'spec_type', 'status', 'n_ctx', 'n_ubatch', 'limit')}
+        entry['draft'] = (s.get('draft') or {}).get('file')
         entry['summary'] = [{k: r.get(k) for k in ('category', 'requests', 'avg_prompt_t_s', 'avg_pred_t_s', 'accept_rate')}
                             for r in s.get('summary') or []]
         out['speed_bench'].append(entry)
