@@ -7,14 +7,18 @@
 # it was dispatched on. workflow_dispatch only works once this file is on the default branch.
 #
 # One run does:
-#   1. builds llama-bench, llama-perplexity and test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
+#   1. builds llama-bench, llama-perplexity and llama-server for HIP (gfx1151), and llama-bench and
+#      llama-perplexity for Vulkan, with the bench-gfx1151.yml recipe
 #   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg, on ROCm0
 #   3. runs llama-perplexity on ROCm0 with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
-#   4. runs a test-backend-ops perf subset on ROCm0 (scripts/bench-history/ops-perf.sh)
+#   4. runs SPEED-Bench against llama-server with MTP for flash-next-iq2xs, on ROCm0
 #   5. runs the same llama-bench matrix and a separate llama-perplexity measurement on Vulkan0, after all HIP work
-#   6. runs the Vulkan ops-perf subset last, where the device reset happens, after Vulkan perplexity
-#   7. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
+#   6. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
 #      bench-results branch and rebuilds the Pages site from all runs on that branch
+#
+# The test-backend-ops perf subset is a lane of its own: .github/workflows/bench-gfx1151-ops-perf.yml.
+# It builds only test-backend-ops, runs the same subset, and keeps its own artifact, because a Vulkan
+# device reset there must not cost this lane a 6 h run.
 #
 # Recipe. Models, quants and flags come from bench-gfx1151.yml and its PR172 comparison variant,
 # which ran this model pair on the pool on 2026-10-16. Differences, on purpose:
@@ -39,13 +43,13 @@
 # At c4096 the two runs score the same tokens: b2048 cuts every chunk into two batches,
 # b4096 runs it as one, so a PPL difference comes from the batch cut alone.
 #
-# Perf subset: MUL_MAT and MUL_MAT_ID for every type at n = 1, 8 and 512, plus the cases listed in
-# scripts/bench-history/perf-cases.txt (an even sample of every other op). The full suite took more
-# than 150 min per device in run 39469034755, mostly CPU-side weight setup of trellis MUL_MAT_ID cases.
-#
-# The full Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
-# SUM [8192,8192] case), so the Vulkan perf subset runs last: a device reset cannot touch the other
-# numbers. Such a run is kept and shown as partial.
+# SPEED-Bench: tools/server/bench/speed-bench (its client, taken from this workflow's own commit) against
+# the llama-server this lane builds, for each model that carries MTP heads. The server runs -b/-ub 4096,
+# -c 40960 (a 32k prompt plus a 4096 token output), f16 KV, -fa on, one slot and --spec-type draft-mtp, so
+# the decode number is MTP decode; without that flag it is plain decode and not comparable. The client runs
+# throughput_1k and throughput_32k with --category all and 2 samples per category, both against that one
+# server so the model is loaded once. Draft acceptance comes from the server's own timings, so draft_n = 0
+# means MTP did not engage and the row is not an MTP number.
 #
 # Runner labels: `devlab-dispatch` reaches the AMD Ryzen AI Dev Lab pool, `strix-halo` selects Strix
 # Halo hosts in it. Keep both. A wrong label does not fail, the job queues silently.
@@ -82,8 +86,8 @@ on:
         description: 'llama-bench repetitions per test (-r)'
         required: false
         default: '5'
-      ops_perf:
-        description: 'Run the test-backend-ops perf subset on ROCm0 and Vulkan0'
+      speed_bench:
+        description: 'Run SPEED-Bench against llama-server with MTP for flash-next-iq2xs'
         required: false
         default: true
         type: boolean
@@ -127,9 +131,10 @@ jobs:
     runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     # expected about 6.5 h; the step timeouts bound a slow step so the later steps still get their time
     timeout-minutes: 1200
-    # one benchmark at a time; GitHub keeps one pending run per group and cancels an older pending one
+    # one benchmark at a time on the pool, shared with bench-gfx1151-ops-perf.yml through this literal
+    # group name; GitHub keeps one pending run per group and cancels an older pending one
     concurrency:
-      group: ${{ github.workflow }}-devlab
+      group: bench-gfx1151-devlab
       cancel-in-progress: false
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -141,6 +146,15 @@ jobs:
       PPL_CTX: 4096
       PPL_CHUNKS: 32
       PPL_BATCHES: 2048,4096
+      # SPEED-Bench client settings, recorded in meta.env and read by scripts/bench-history/speed-bench.sh
+      SPEED_BENCH_LIMIT: 2
+      SPEED_BENCH_OSL: 4096
+      # 32k prompt plus a 4096 token output, so the throughput_32k split fits in one slot
+      SPEED_BENCH_CTX: 40960
+      SPEED_BENCH_BATCH: 4096
+      SPEED_BENCH_UBATCH: 4096
+      SPEED_BENCH_SPEC: draft-mtp
+      SPEED_BENCH_PORT: 8199
       WIKITEXT_ZIP_URL: https://huggingface.co/datasets/ggml-org/ci/resolve/927b3642933080f1b0e811e2f916e14c292992f9/wikitext-2-raw-v1.zip
       WIKITEXT_ZIP_SHA256: ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11
       WIKITEXT_TEST_SHA256: 173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08
@@ -223,18 +237,20 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      # the lane's own scripts and case list, which the measured ref may not have
+      # the lane's own scripts, case list and SPEED-Bench client, which the measured ref may not have
       - name: Checkout the lane scripts
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           path: .bench-lane
-          sparse-checkout: scripts/bench-history
+          sparse-checkout: |
+            scripts/bench-history
+            tools/server/bench/speed-bench
           persist-credentials: false
 
       - name: Record run metadata
         env:
-          INPUT_OPS_PERF: ${{ inputs.ops_perf }}
+          INPUT_SPEED_BENCH: ${{ inputs.speed_bench }}
           INPUT_PPL: ${{ inputs.ppl }}
           INPUT_VULKAN_PPL: ${{ inputs.vulkan_ppl }}
           INPUT_VULKAN_BENCH: ${{ inputs.vulkan_bench }}
@@ -245,7 +261,6 @@ jobs:
           : > "$logs/commands.tsv"
           : > "$logs/results.tsv"
           : > "$logs/models.tsv"
-          cp .bench-lane/scripts/bench-history/perf-cases.txt "$logs/perf-cases.txt"
           git log -1 --format='%H%n%cI%n%s' > "$logs/commit.txt"
           {
             echo "schema=1"
@@ -262,7 +277,13 @@ jobs:
             echo "n_prompt=$BENCH_N_PROMPT"
             echo "n_gen=$BENCH_N_GEN"
             echo "n_batch=$BENCH_N_BATCH"
-            echo "ops_perf=$INPUT_OPS_PERF"
+            echo "speed_bench=$INPUT_SPEED_BENCH"
+            echo "speed_bench_limit=$SPEED_BENCH_LIMIT"
+            echo "speed_bench_osl=$SPEED_BENCH_OSL"
+            echo "speed_bench_ctx=$SPEED_BENCH_CTX"
+            echo "speed_bench_batch=$SPEED_BENCH_BATCH"
+            echo "speed_bench_ubatch=$SPEED_BENCH_UBATCH"
+            echo "spec_type=$SPEED_BENCH_SPEC"
             echo "ppl=$INPUT_PPL"
             echo "vulkan_ppl=$INPUT_VULKAN_PPL"
             echo "vulkan_bench=$INPUT_VULKAN_BENCH"
@@ -277,6 +298,11 @@ jobs:
             echo "hip_version=$(hipconfig --version 2> /dev/null | head -1 || true)"
             echo "cmake_version=$(cmake --version | head -1)"
           } > "$logs/meta.env"
+          # the SPEED-Bench configs each model will be measured with, so collect.py knows what to look for
+          for m in ${BENCH_MODELS//,/ }; do
+            b=$(bash .bench-lane/scripts/bench-history/model.sh speed "$m" 2> /dev/null) || b=""
+            [ -z "$b" ] || echo "speed_bench_benches_$m=$b" >> "$logs/meta.env"
+          done
           cat "$logs/meta.env"
 
           # diagnostics only, so a missing probe does not fail the job
@@ -310,7 +336,7 @@ jobs:
           logs="$RUNNER_TEMP/logs"
           quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
 
-          # same flags as the hip branch of bench-gfx1151.yml
+          # same flags as the hip branch of bench-gfx1151.yml, plus the server the SPEED-Bench step drives
           configure=(cmake -B build-hip -S .
             -DCMAKE_BUILD_TYPE=Release
             -DGGML_HIP=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF
@@ -318,8 +344,8 @@ jobs:
             -DGPU_TARGETS=gfx1151
             -DGGML_HIP_EXPORT_METRICS=Off
             -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
-            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
-          build=(cmake --build build-hip --config Release -j "$(nproc)" --target llama-bench llama-perplexity test-backend-ops)
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON)
+          build=(cmake --build build-hip --config Release -j "$(nproc)" --target llama-bench llama-perplexity llama-server)
 
           printf 'build-hip-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
           printf 'build-hip\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
@@ -346,7 +372,7 @@ jobs:
 
       - name: Provide the Vulkan toolchain
         id: vulkan_sdk
-        if: ${{ !cancelled() && (inputs.ops_perf || inputs.vulkan_bench) && steps.checkout.outcome == 'success' }}
+        if: ${{ !cancelled() && inputs.vulkan_bench && steps.checkout.outcome == 'success' }}
         timeout-minutes: 20
         run: |
           # the pool has Mesa and the loader but no glslc, headers, SPIRV-Headers config or
@@ -418,7 +444,7 @@ jobs:
             "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
             -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
-          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench llama-perplexity test-backend-ops)
+          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench llama-perplexity)
 
           printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
           printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
@@ -461,6 +487,33 @@ jobs:
           echo "$WIKITEXT_TEST_SHA256  $dir/wikitext-2-raw/wiki.test.raw" | sha256sum -c -
           echo "WIKITEXT_FILE=$dir/wikitext-2-raw/wiki.test.raw" >> "$GITHUB_ENV"
 
+      # the client needs datasets, requests and tqdm; a venv keeps them off the runner's own python
+      - name: Set up the SPEED-Bench client
+        id: speed_setup
+        if: ${{ !cancelled() && inputs.speed_bench && steps.device_hip.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/logs/speed-bench-setup.log"
+          client=.bench-lane/tools/server/bench/speed-bench
+          pip_args=(--disable-pip-version-check -q -r "$client/requirements.txt")
+          if python3 -m venv "$RUNNER_TEMP/sbvenv" >> "$log" 2>&1; then
+            python="$RUNNER_TEMP/sbvenv/bin/python"
+            "$python" -m pip install "${pip_args[@]}" >> "$log" 2>&1
+          else
+            # no venv module on this image: fall back to the user site of the system python
+            echo "python3 -m venv failed, installing into the user site" >> "$log"
+            python=python3
+            python3 -m pip install --user "${pip_args[@]}" >> "$log" 2>&1
+          fi
+          if ! "$python" -c 'import datasets, requests, tqdm' >> "$log" 2>&1; then
+            tail -20 "$log"
+            echo "::error::SPEED-Bench client dependencies are not importable with $python"
+            exit 1
+          fi
+          echo "SPEED_PYTHON=$python" >> "$GITHUB_ENV"
+          echo "SPEED-Bench client ready: $python"
+
       - name: Download models, run llama-bench and llama-perplexity (HIP)
         id: bench
         if: ${{ !cancelled() && steps.device_hip.outcome == 'success' }}
@@ -468,6 +521,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
           RUN_PPL: ${{ inputs.ppl }}
+          RUN_SPEED_BENCH: ${{ inputs.speed_bench && steps.speed_setup.outcome == 'success' }}
           KEEP_MODELS: ${{ inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
         run: |
           # the runner starts bash with -e; drop it so one failed model does not stop the next
@@ -516,6 +570,13 @@ jobs:
                 fi
               done
             fi
+            # MTP decode on the same file, before this model is dropped for the Vulkan pass
+            if [ "$RUN_SPEED_BENCH" = "true" ] && sb=$(bash "$model" speed "$name"); then
+              # shellcheck disable=SC2046
+              SPEED_BENCH_BENCHES="$sb" bash .bench-lane/scripts/bench-history/speed-bench.sh \
+                ./build-hip/bin/llama-server .bench-lane/tools/server/bench/speed-bench "${SPEED_PYTHON:-python3}" \
+                "$name" "$path" "$logs/speed-bench-$name" $(bash "$model" flags "$name") || failed=1
+            fi
             # keep the file for the Vulkan llama-bench only while the next models still fit on the disk;
             # the Vulkan step downloads a dropped file again
             if [ "$KEEP_MODELS" = "true" ] && bash "$model" fits "${want[@]:i+1}"; then
@@ -525,19 +586,6 @@ jobs:
             fi
           done
           exit "$failed"
-
-      - name: test-backend-ops perf (ROCm0)
-        id: ops_rocm
-        if: ${{ !cancelled() && inputs.ops_perf && steps.device_hip.outcome == 'success' }}
-        timeout-minutes: 90
-        env:
-          # SOLVE_TRI aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR in
-          # solve_tri_f32_cublas), seen on ROCm 7.2.1 on this pool, see bench-gfx1151.yml. These
-          # perf numbers are graphs-off; remove this once the capture issue is fixed.
-          GGML_CUDA_DISABLE_GRAPHS: "1"
-        run: |
-          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-hip/bin/test-backend-ops ROCm0 \
-            "$RUNNER_TEMP/logs/ops-perf-ROCm0.log" .bench-lane/scripts/bench-history/perf-cases.txt
 
       - name: llama-bench and llama-perplexity (Vulkan)
         id: bench_vulkan
@@ -618,15 +666,6 @@ jobs:
           done
           exit "$failed"
 
-      - name: test-backend-ops perf (Vulkan0)
-        id: ops_vulkan
-        if: ${{ !cancelled() && inputs.ops_perf && steps.device_vulkan.outcome == 'success' }}
-        timeout-minutes: 90
-        run: |
-          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-vulkan/bin/test-backend-ops Vulkan0 \
-            "$RUNNER_TEMP/logs/ops-perf-Vulkan0.log" .bench-lane/scripts/bench-history/perf-cases.txt
-
       - name: Write run manifest
         if: ${{ always() }}
         env:
@@ -637,10 +676,9 @@ jobs:
           S_BUILD_VULKAN: ${{ steps.build_vulkan.outcome }}
           S_DEVICE_VULKAN: ${{ steps.device_vulkan.outcome }}
           S_WIKITEXT: ${{ steps.wikitext.outcome }}
+          S_SPEED_SETUP: ${{ steps.speed_setup.outcome }}
           S_BENCH: ${{ steps.bench.outcome }}
           S_BENCH_VULKAN: ${{ steps.bench_vulkan.outcome }}
-          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
-          S_OPS_VULKAN: ${{ steps.ops_vulkan.outcome }}
         run: |
           logs="$RUNNER_TEMP/logs"
           mkdir -p "$logs"
@@ -652,10 +690,9 @@ jobs:
             printf 'build-vulkan\t%s\n' "$S_BUILD_VULKAN"
             printf 'device-vulkan\t%s\n' "$S_DEVICE_VULKAN"
             printf 'wikitext\t%s\n' "$S_WIKITEXT"
+            printf 'speed-bench-setup\t%s\n' "$S_SPEED_SETUP"
             printf 'models-hip\t%s\n' "$S_BENCH"
             printf 'llama-bench-vulkan\t%s\n' "$S_BENCH_VULKAN"
-            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
-            printf 'ops-perf-Vulkan0\t%s\n' "$S_OPS_VULKAN"
           } > "$logs/steps.tsv"
           echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$logs/meta.env"
           cat "$logs/steps.tsv"

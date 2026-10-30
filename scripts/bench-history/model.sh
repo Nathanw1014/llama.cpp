@@ -6,6 +6,7 @@
 #        model.sh fits <name>...     exit 0 if the named models still fit on the disk
 #        model.sh have <name>        print the first shard of an already fetched model, exit 1 if absent
 #        model.sh flags <name>       print the model's extra llama flags
+#        model.sh speed <name>       print the SPEED-Bench configs of a model that carries MTP heads, exit 1 if none
 #        model.sh bench <kind> <llama-bench> <name> <path>
 #                                    kind is llama-bench (ROCm0) or llama-bench-vulkan (Vulkan0)
 # fetch exits 2 for too little memory, 3 for too little disk, 4 for a failed download and 5 for a
@@ -122,6 +123,15 @@ flags() {
     printf '%s\n' "$extra"
 }
 
+# The models whose GGUF carries MTP heads, so llama-server can draft with --spec-type draft-mtp and no
+# separate draft file. Prints the SPEED-Bench configs to run, comma-separated.
+speed() {
+    case "$1" in
+    flash-next-iq2xs) echo 'throughput_1k,throughput_32k' ;;
+    *) return 1 ;;
+    esac
+}
+
 bench() {
     local kind=$1 bin=$2 name=$3 path=$4 bytes rc rows extra
     IFS='|' read -r _ _ bytes _ extra <<< "$(spec "$name")"
@@ -152,6 +162,6 @@ bench() {
 action=$1
 shift
 case "$action" in
-    fetch | fits | have | flags | bench) "$action" "$@" ;;
-    *) echo "usage: model.sh fetch|fits|have|flags|bench ..." >&2; exit 2 ;;
+    fetch | fits | have | flags | speed | bench) "$action" "$@" ;;
+    *) echo "usage: model.sh fetch|fits|have|flags|speed|bench ..." >&2; exit 2 ;;
 esac
