@@ -15924,10 +15924,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000));
     test_cases.emplace_back(new test_qsa_prefill_maskless(200,65536,2051,12,true,15000));
     test_cases.emplace_back(new test_qsa_prefill_maskless(70,65536,2051,12,false,16000));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(130,270336,2051,12,true,66000));   // block ids past 65535 (uint16 bound)
     for (int q : {1,2,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,true,100));
     for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,32768,2051,12,true,8000));
     for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,65536,2051,12,true,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(3,65536,2051,8,false,16000));
+    test_cases.emplace_back(new test_qsa_decode_maskless(9,270336,2051,12,true,66000));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));

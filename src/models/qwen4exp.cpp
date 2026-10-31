@@ -24,6 +24,7 @@
 // defined below, used by the graph constructor
 static bool    qwen4exp_last_attn_trim();
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
+static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h);
 
 // the PLE row gather of a batch, defined below set_input
 static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst);
@@ -1077,23 +1078,49 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
+// The indexer raw score F32 [n_blocks, n_idx_h, strip] and its ReLU grow with the context (2 x 2 GiB at 1M keys): halve the strip while the raw score exceeds 2^27 elements, down to 64 queries.
+// 2^27 is the raw score at 262144 keys for Qwen3.8 Flash Next (ratio 4, 4 indexer heads, strip 512), so shorter contexts keep 512.
+// Halves of 512 divide the q_first of the last-layer trim; a shorter ubatch has q_first = 0.
+static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h) {
+    int64_t strip = qwen4exp_query_strip(n_tokens, n_stream);
+    if (n_stream != 1) {
+        return strip;
+    }
+    while (strip >= 128 && n_blocks * n_idx_h * strip > ((int64_t) 1 << 27)) {
+        strip = (strip + 1) / 2;
+    }
+    return strip;
+}
+
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
 // qsa_prefill larger ubatches). The HIP backend (RDNA3.5) and Vulkan (flash_attn_sel) have them, so the selection needs
 // selected_key_attn (all QSA layers run there). Dense kernels do not read the list: ggml-cuda aborts, Vulkan declines.
-static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
+// The depth bound mirrors GGML_QSA_MAX_KEYS of the HIP kernels for every backend (Vulkan flash_attn_sel goes to ~8M keys but takes the masked route above 1M too).
+static constexpr int64_t QSA_MASKLESS_MAX_KV = 1048576;  // == GGML_QSA_MAX_KEYS: llama/ must not depend on ggml-cuda headers
+static_assert(QSA_MASKLESS_MAX_KV % 4 == 0, "qsa_prefill requires a multiple-of-4 key count at its depth bound");
+
+// split streams select per stream (one sequence's cells each); depth_warn is null where the decision is only re-checked
+static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
-        ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
-    // split streams select per stream (one sequence's cells each). Depth bound of the QSA kernels: prefill 262140 (uint16
-    // cell groups, 0xFFFF pad), decode (one stream, <= 512 queries) 262144
-    const bool depth_ok = n_kv<=262140 || (n_stream==1 && ubatch.n_tokens<=512 && n_kv<=262144);
-    return selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && depth_ok && ubatch.token &&
+        ggml_type type_k, ggml_type type_v, bool selected_key_attn, std::once_flag * depth_warn) {
+    const bool eligible = selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
+        n_kv>hparams.indexer_top_k+ratio-1 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
         type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
+    if (eligible && n_kv > QSA_MASKLESS_MAX_KV && depth_warn) {
+        // the masked route keeps full [n_kv, n_tokens] masks: the reserve can fail with no other hint
+        const int64_t n_tokens = ubatch.n_tokens;
+        std::call_once(*depth_warn, [n_kv, n_tokens, fn = __func__] {
+            LLAMA_LOG_WARN("%s: n_kv = %" PRId64 " > %" PRId64 ": maskless QSA block selection is off, the masked route is used and the compute buffer grows with n_kv x n_ubatch "
+                    "(%.1f GiB per F32 [%" PRId64 ", %" PRId64 "] mask; lower -c or -ub)\n",
+                    fn, n_kv, QSA_MASKLESS_MAX_KV, (double) n_kv * n_tokens * sizeof(float) / (1024.0*1024.0*1024.0), n_kv, n_tokens);
+        });
+    }
+    return eligible && n_kv <= QSA_MASKLESS_MAX_KV;
 }
 
 // Visible-prefix scoring bound. For one sequence with unique non-negative positions the indexer enumerates
@@ -1238,15 +1265,16 @@ public:
 
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
         const auto * attn = mctx->get_attn();
-        const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
-                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn());
+        const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, ratio, n_kv,
+                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn(), nullptr);
         const bool scalar = blocks && params.hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
                 mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == (scalar && n_stream == 1);
         res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
-        const int64_t next_strip = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
+        const int64_t next_strip = qwen4exp_score_strip(params.ubatch.n_tokens/n_stream, n_stream, n_blocks,
+                params.hparams.indexer_n_head);
         const auto next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, n_blocks, next_strip, ratio,
                 params.hparams.indexer_top_k/ratio, compact);
         res &= score_strip == next_strip;
@@ -1405,14 +1433,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         const auto * attn_ctx = mctx_hyb->get_attn();
-        const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
-                attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn());
+        const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, r, n_kv, ubatch, cparams, hparams,
+                attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn(),
+                &static_cast<const llama_model_qwen4exp &>(model).qsa_depth_warn_once);
         // split streams: only the prefill kernel takes several streams (>= 128 queries each); decode keeps the mask
         const bool scalar = blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
                 mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar && n_stream == 1;   // split streams: F32 per-block bias per stream, same tails
         qsa->maskless = scalar;
-        qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
+        qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact);
         qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
@@ -1523,8 +1552,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
+    const int64_t strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, n_idx_h);
     GGML_ASSERT(q_first % strip == 0);
+    GGML_ASSERT(inp->score_strip == strip);
 
     // the strips slice the block cells and the tails; copy these host inputs to the compute backend once, so no strip
     // needs an input copy and the scheduler cannot cut a split inside a (fused) block selection
