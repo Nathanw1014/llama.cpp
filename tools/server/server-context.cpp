@@ -1618,7 +1618,7 @@ private:
                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
 
             if (n_ctx_capped > n_ctx_max) {
-                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d: the training context, or what --rope-scale extends it to) - capping\n",
+                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d: the training context, or what a linear --rope-scale / --rope-freq-scale extends it to) - capping\n",
                         n_ctx_capped, n_ctx_max);
             }
         }
@@ -4886,7 +4886,8 @@ private:
             t = type;
         }
         return t == "none" ? LLAMA_ROPE_SCALING_TYPE_NONE : t == "yarn" ? LLAMA_ROPE_SCALING_TYPE_YARN :
-               t == "linear" ? LLAMA_ROPE_SCALING_TYPE_LINEAR : LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+               t == "linear" ? LLAMA_ROPE_SCALING_TYPE_LINEAR : t == "longrope" ? LLAMA_ROPE_SCALING_TYPE_LONGROPE :
+               LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the context the model can serve
