@@ -4862,7 +4862,8 @@ private:
     }
 
     // the context the model can serve: its training context, extended by a linear RoPE scale below the trained one.
-    // YaRN needs nothing here: llama_init_from_model already set n_ctx_train to n_ctx_orig_yarn / rope_freq_scale.
+    // YaRN needs nothing here: llama_init_from_model (src/llama-context.cpp, "custom YaRN scaling detected") already set
+    // n_ctx_train to n_ctx_orig_yarn / rope_freq_scale when the YaRN scale differs from the trained one.
     int n_ctx_model() const {
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
         const float scale = params_base.rope_freq_scale;

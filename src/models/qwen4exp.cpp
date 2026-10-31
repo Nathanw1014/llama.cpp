@@ -1112,10 +1112,12 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
         type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
     if (eligible && n_kv > QSA_MASKLESS_MAX_KV && depth_warn) {
-        // the masked route keeps a full F32 [n_kv, n_tokens] mask: the reserve can fail with no other hint
-        std::call_once(*depth_warn, [n_kv, fn = __func__] {
-            LLAMA_LOG_WARN("%s: n_kv = %" PRId64 " > %" PRId64 ": maskless QSA block selection is off, the masked route is used and the compute buffer grows with n_kv x n_ubatch (lower -c or -ub)\n",
-                    fn, n_kv, QSA_MASKLESS_MAX_KV);
+        // the masked route keeps full [n_kv, n_tokens] masks: the reserve can fail with no other hint
+        const int64_t n_tokens = ubatch.n_tokens;
+        std::call_once(*depth_warn, [n_kv, n_tokens, fn = __func__] {
+            LLAMA_LOG_WARN("%s: n_kv = %" PRId64 " > %" PRId64 ": maskless QSA block selection is off, the masked route is used and the compute buffer grows with n_kv x n_ubatch "
+                    "(%.1f GiB per F32 [%" PRId64 ", %" PRId64 "] mask; lower -c or -ub)\n",
+                    fn, n_kv, QSA_MASKLESS_MAX_KV, (double) n_kv * n_tokens * sizeof(float) / (1024.0*1024.0*1024.0), n_kv, n_tokens);
         });
     }
     return eligible && n_kv <= QSA_MASKLESS_MAX_KV;
