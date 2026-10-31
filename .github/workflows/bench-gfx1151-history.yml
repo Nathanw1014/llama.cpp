@@ -11,7 +11,7 @@
 #      llama-perplexity for Vulkan, with the bench-gfx1151.yml recipe
 #   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg, on ROCm0
 #   3. runs llama-perplexity on ROCm0 with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
-#   4. runs SPEED-Bench against llama-server with MTP for flash-next-iq2xs, on ROCm0
+#   4. runs SPEED-Bench against llama-server with the MTP sidecar head for flash-next-iq2xs, on ROCm0
 #   5. runs the same llama-bench matrix and a separate llama-perplexity measurement on Vulkan0, after all HIP work
 #   6. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
 #      bench-results branch and rebuilds the Pages site from all runs on that branch
@@ -44,12 +44,16 @@
 # b4096 runs it as one, so a PPL difference comes from the batch cut alone.
 #
 # SPEED-Bench: tools/server/bench/speed-bench (its client, taken from this workflow's own commit) against
-# the llama-server this lane builds, for each model that carries MTP heads. The server runs -b/-ub 4096,
-# -c 40960 (a 32k prompt plus a 4096 token output), f16 KV, -fa on, one slot and --spec-type draft-mtp, so
-# the decode number is MTP decode; without that flag it is plain decode and not comparable. The client runs
-# throughput_1k and throughput_32k with --category all and 2 samples per category, both against that one
-# server so the model is loaded once. Draft acceptance comes from the server's own timings, so draft_n = 0
-# means MTP did not engage and the row is not an MTP number.
+# the llama-server this lane builds, for each model that has a SPEED-Bench config. The server runs -b/-ub
+# 4096, -c 40960 (a 32k prompt plus a 4096 token output), f16 KV, -fa on, one slot, -md with the model's
+# MTP draft head and --spec-type draft-mtp, so the decode number is MTP decode; without those the number is
+# plain decode and not comparable. The GGUF of this lane carries no MTP tensor, so the head comes from a
+# pinned sidecar in draft_spec() of model.sh (unsloth/Qwen3.8-Flash-Next-GGUF, self-contained Q4_K_M,
+# 2.79 GB, verified by sha256). A model whose head cannot be downloaded is skipped with a `no-draft` row
+# rather than measured without MTP. The client runs throughput_1k and throughput_32k with --category all
+# and 2 samples per category, both against that one server so the model is loaded once. Draft acceptance
+# comes from the server's own timings, so draft_n = 0 means MTP did not engage and the row is not an MTP
+# number.
 #
 # Runner labels: `devlab-dispatch` reaches the AMD Ryzen AI Dev Lab pool, `strix-halo` selects Strix
 # Halo hosts in it. Keep both. A wrong label does not fail, the job queues silently.
@@ -261,6 +265,7 @@ jobs:
           : > "$logs/commands.tsv"
           : > "$logs/results.tsv"
           : > "$logs/models.tsv"
+          : > "$logs/drafts.tsv"
           git log -1 --format='%H%n%cI%n%s' > "$logs/commit.txt"
           {
             echo "schema=1"
@@ -570,12 +575,24 @@ jobs:
                 fi
               done
             fi
-            # MTP decode on the same file, before this model is dropped for the Vulkan pass
+            # MTP decode on the same file, before this model is dropped for the Vulkan pass. The GGUFs of
+            # this lane carry no MTP head, so the server takes a sidecar head with -md; without one the
+            # decode number would not be MTP and is not recorded.
             if [ "$RUN_SPEED_BENCH" = "true" ] && sb=$(bash "$model" speed "$name"); then
-              # shellcheck disable=SC2046
-              SPEED_BENCH_BENCHES="$sb" bash .bench-lane/scripts/bench-history/speed-bench.sh \
-                ./build-hip/bin/llama-server .bench-lane/tools/server/bench/speed-bench "${SPEED_PYTHON:-python3}" \
-                "$name" "$path" "$logs/speed-bench-$name" $(bash "$model" flags "$name") || failed=1
+              if draft=$(bash "$model" draft "$name"); then
+                # shellcheck disable=SC2046
+                SPEED_BENCH_BENCHES="$sb" SPEED_MTP_DRAFT="$draft" \
+                  bash .bench-lane/scripts/bench-history/speed-bench.sh \
+                  ./build-hip/bin/llama-server .bench-lane/tools/server/bench/speed-bench "${SPEED_PYTHON:-python3}" \
+                  "$name" "$path" "$logs/speed-bench-$name" $(bash "$model" flags "$name") || failed=1
+              else
+                echo "::error::SKIP SPEED-Bench $name: no MTP draft head, the decode number would not be MTP"
+                for b in ${sb//,/ }; do
+                  printf 'speed-bench\t%s\t%s\tno-draft\t0\n' "$name" "$b" >> "$logs/results.tsv"
+                done
+                failed=1
+              fi
+              rm -rf "$RUNNER_TEMP/models/$name-mtp"
             fi
             # keep the file for the Vulkan llama-bench only while the next models still fit on the disk;
             # the Vulkan step downloads a dropped file again

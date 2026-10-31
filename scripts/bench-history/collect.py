@@ -310,8 +310,14 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
 
     speed = []
     if meta.get('speed_bench', 'false') == 'true':
-        # one results.tsv row per bench: speed-bench <model> <bench> <rc> <wall>
-        speed_rc = {(row[1], row[2]): to_int(row[3]) for row in results
+        # the pinned MTP draft head each model was measured with, from drafts.tsv
+        drafts: dict[str, dict[str, Any]] = {}
+        for row in read_tsv(raw / 'drafts.tsv'):
+            if row[0] == 'draft' and len(row) >= 9 and row[1] not in drafts:
+                drafts[row[1]] = {'repo': row[2], 'revision': row[3], 'file': row[4], 'bytes': to_int(row[5]),
+                                  'sha256': row[6], 'sha256_actual': row[7] or None, 'status': row[8]}
+        # one results.tsv row per bench: speed-bench <model> <bench> <rc|no-draft> <wall>
+        speed_rc = {(row[1], row[2]): row[3] for row in results
                     if row[0] == 'speed-bench' and len(row) >= 4}
         for name in meta.get('models', '').split(','):
             if not name:
@@ -319,9 +325,12 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             benches = [b for b in (meta.get(f'speed_bench_benches_{name}') or '').split(',') if b]
             for bench_name in benches:
                 parsed = parse_speed_bench(raw / f'speed-bench-{name}-{bench_name}.json')
-                rc = speed_rc.get((name, bench_name))
+                row_rc = speed_rc.get((name, bench_name))
+                rc = to_int(row_rc)
                 status = exit_status(rc)
-                if model_status.get(name, 'verified') not in ('verified', ''):
+                if row_rc == 'no-draft':
+                    status = 'skipped (no MTP draft)'
+                elif model_status.get(name, 'verified') not in ('verified', ''):
                     status = f'skipped ({model_status[name]})'
                 elif status == 'ok' and not parsed['summary']:
                     status = 'no result'
@@ -334,6 +343,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
                     'n_batch': to_int(meta.get('speed_bench_batch')),
                     'n_ubatch': to_int(meta.get('speed_bench_ubatch')),
                     'limit': to_int(meta.get('speed_bench_limit')),
+                    'draft': drafts.get(name),
                     **parsed,
                 })
 
@@ -454,10 +464,12 @@ def write_summary(run: dict[str, Any]) -> None:
     for entry in run.get('speed_bench') or []:
         overall = next((row for row in entry['summary'] if row.get('category') == 'overall'), None)
         label = f"{entry['model']} {entry.get('bench')}"
+        draft = entry.get('draft') or {}
+        head = f" with {draft['file']}" if draft.get('file') else ''
         if overall and overall.get('avg_pred_t_s') is not None:
             accept = overall.get('accept_rate')
             share = f", {100 * accept:.1f}% draft acceptance" if accept is not None else ', nothing drafted'
-            lines.append(f"- SPEED-Bench {label} (--spec-type {entry.get('spec_type')}): {entry['status']}, "
+            lines.append(f"- SPEED-Bench {label} (--spec-type {entry.get('spec_type')}{head}): {entry['status']}, "
                          f"{overall['avg_pred_t_s']:.2f} t/s decode over {overall.get('requests')} samples{share}")
         else:
             lines.append(f"- SPEED-Bench {label}: {entry['status']}, no result")

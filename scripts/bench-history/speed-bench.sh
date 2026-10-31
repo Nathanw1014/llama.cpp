@@ -15,6 +15,7 @@
 #   SPEED_BENCH_BATCH   server -b, default 4096
 #   SPEED_BENCH_UBATCH  server -ub, default 4096
 #   SPEED_BENCH_SPEC    server --spec-type, default draft-mtp
+#   SPEED_MTP_DRAFT     path of the MTP draft head passed with -md; unset means no draft
 #   SPEED_BENCH_PORT    server port, default 8199
 #
 # Writes command lines to commands.tsv and one result row per bench to results.tsv next to the output.
@@ -37,6 +38,7 @@ ctx=${SPEED_BENCH_CTX:-40960}
 batch=${SPEED_BENCH_BATCH:-4096}
 ubatch=${SPEED_BENCH_UBATCH:-4096}
 spec=${SPEED_BENCH_SPEC:-draft-mtp}
+draft=${SPEED_MTP_DRAFT:-}
 port=${SPEED_BENCH_PORT:-8199}
 
 # shell-quote for the record
@@ -56,9 +58,17 @@ cmd=("$server" -m "$path" -c "$ctx" -b "$batch" -ub "$ubatch" -ngl 99 -fa on -ct
      -np 1 -lzm on-direct --spec-type "$spec" --host 127.0.0.1 --port "$port" --no-webui)
 # shellcheck disable=SC2206
 [ ${#extra[@]} -eq 0 ] || cmd+=("${extra[@]}")
+# the target GGUF carries no MTP head, so the head arrives as a sidecar
+if [ -n "$draft" ]; then
+    if [ ! -s "$draft" ]; then
+        echo "::error::MTP draft head is missing: $draft" >&2
+        exit 1
+    fi
+    cmd+=(-md "$draft")
+fi
 printf 'speed-bench-server-%s\t%s\n' "$name" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
 
-echo "=== llama-server $name (--spec-type $spec, -c $ctx, -ub $ubatch) ==="
+echo "=== llama-server $name (--spec-type $spec, -c $ctx, -ub $ubatch, draft ${draft:-none}) ==="
 "${cmd[@]}" > "$srv_log" 2>&1 &
 srv_pid=$!
 trap 'kill -9 "$srv_pid" 2> /dev/null' EXIT
