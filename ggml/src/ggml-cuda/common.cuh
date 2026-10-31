@@ -104,11 +104,8 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
 #define GGML_CUDA_CC_IS_CDNA4(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
-// max selected-key depth the QSA prefill/decode kernels serve. The selected list addresses whole blocks of 4 keys and
-// the union stores block ids as uint32 with 0xFFFFFFFF reserved as the padding sentinel, so the id space is not the
-// limit: the bound is the largest context the Qwen3.8 Flash Next card supports with RoPE/YaRN scaling. The model-side
-// gate (qwen4exp.cpp) and both kernel support checks must agree, so that a deeper n_kv takes the masked route instead
-// of reaching a kernel that refuses the op.
+// max keys of the QSA selected-key kernels: the 1M context of Qwen3.8 Flash Next with YaRN x4, not an id-space limit
+// QSA_MASKLESS_MAX_KV in qwen4exp.cpp must match, so a deeper n_kv takes the masked route instead of a refused op
 #define GGML_QSA_MAX_KEYS 1048576
 
 // Moore Threads

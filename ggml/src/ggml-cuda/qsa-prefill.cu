@@ -19,8 +19,7 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 // union builder, kernel A: per query row, check that the (validity-transformed) row is non-decreasing; if not, rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 #define QSA3_SENT 0x7FFFFFFF
 
-// padding sentinel in the union's block-id list. The list is uint32 so the id space does not limit the selected depth
-// (uint16 did: 65535 real blocks * 4 = 262140 keys, the next block id colliding with the 0xFFFF sentinel).
+// padding sentinel of the union's block-id list (uint32, so the id space does not limit the depth)
 #define QSA3_BLK_SENT 0xFFFFFFFFu
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
