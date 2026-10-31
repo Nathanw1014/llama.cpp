@@ -590,6 +590,19 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_stream; // QSA only
 };
 
+// QSA_EXPAND (qsa_expand.comp): element offsets and row strides of each binding
+struct vk_op_qsa_expand_push_constants {
+    uint32_t n_query;
+    uint32_t n_blocks;
+    uint32_t budget;
+    uint32_t r;
+    uint32_t b_off, b_stride;
+    uint32_t s_off, s_stride;
+    uint32_t c_off, c_stride;
+    uint32_t t_off, t_stride;
+    uint32_t d_off, d_stride;
+};
+
 struct vk_op_im2col_push_constants {
     uint64_t dst_addr;
     uint32_t batch_offset; uint32_t offset_delta;
