@@ -1110,11 +1110,20 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
     GGML_UNUSED(n_stream);   // split streams select per stream (one sequence's cells each)
-    return selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=QSA_MASKLESS_MAX_KV && ubatch.token &&
+    const bool eligible = selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
+        n_kv>hparams.indexer_top_k+ratio-1 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
         type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
+    if (eligible && n_kv > QSA_MASKLESS_MAX_KV) {
+        // the masked route keeps a full F32 [n_kv, n_tokens] mask: the reserve can fail with no other hint
+        static std::once_flag warned;
+        std::call_once(warned, [n_kv] {
+            LLAMA_LOG_WARN("%s: n_kv = %" PRId64 " > %" PRId64 ": maskless QSA block selection is off, the masked route is used and the compute buffer grows with n_kv x n_ubatch (lower the context size)\n",
+                    __func__, n_kv, QSA_MASKLESS_MAX_KV);
+        });
+    }
+    return eligible && n_kv <= QSA_MASKLESS_MAX_KV;
 }
 
 // Visible-prefix scoring bound. For one sequence with unique non-negative positions the indexer enumerates
