@@ -4690,6 +4690,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->gdn_chunk_scan_nsplit = 8;
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
                     "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+                // streaming MUL_MAT_ID down (used only after the fragment layout probe passed): 256 features per workgroup in x
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51[0], "mul_mm_id_down_q5_1_f16", mul_mm_id_down_q5_1_f16_len,
+                    mul_mm_id_down_q5_1_f16_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51[1], "mul_mm_id_down_q5_1_f32", mul_mm_id_down_q5_1_f32_len,
+                    mul_mm_id_down_q5_1_f32_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
             }
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
@@ -9960,6 +9965,111 @@ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx)
     return ggml_vk_use_mul_mat_vec_id(cgraph->nodes[node_idx]);
 }
 
+// MUL_MAT_ID(+MUL)+CPY(f16) of q5_1 experts as one mul_mm_id_down.comp launch over the count_experts tile list (64-row tiles),
+// the weights streamed into registers. GGML_VK_MMID_DOWN_STREAM=0 disables.
+static bool ggml_vk_mmid_down_stream_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMID_DOWN_STREAM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr uint32_t mmid_down_stream_bn = 64;   // the shader's token tile (BN)
+
+static bool ggml_vk_mmid_down_stream_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mmid, const ggml_tensor * scale, const ggml_tensor * out) {
+    const ggml_tensor * w   = mmid->src[0];
+    const ggml_tensor * x   = mmid->src[1];
+    const ggml_tensor * ids = mmid->src[2];
+    if (!ggml_vk_mmid_down_stream_enabled() || !ctx->device->coopmat_rdna3_layout || !ctx->device->pipeline_mmid_down_q51[0] ||
+        w->type != GGML_TYPE_Q5_1) {
+        return false;
+    }
+    const int64_t K = w->ne[0], M = w->ne[1], n_used = ids->ne[0], T = ids->ne[1];
+    if (K % 64 != 0 || M % 256 != 0 || !ggml_vk_dim01_contiguous(w) || w->nb[2] != (size_t) M * w->nb[1] ||
+        ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if ((x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || x->ne[0] != K || x->ne[2] != T ||
+        (x->ne[1] != 1 && x->ne[1] != n_used) || x->ne[3] != 1 || x->nb[0] != ggml_type_size(x->type) ||
+        x->nb[1] % 16 != 0 || x->nb[2] % 16 != 0) {
+        return false;
+    }
+    if (ids->type != GGML_TYPE_I32 || T <= 8 || T > 65535 || n_used > 65535) {
+        return false;
+    }
+    if (out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || out->ne[0] != M || out->ne[1] != n_used || out->ne[2] != T) {
+        return false;
+    }
+    if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != 1 || scale->ne[1] != n_used ||
+                  scale->ne[2] != T || get_misalign_bytes(ctx, scale) % 4 != 0)) {
+        return false;
+    }
+    return get_misalign_bytes(ctx, w) % 16 == 0 && get_misalign_bytes(ctx, x) % 16 == 0 && get_misalign_bytes(ctx, out) % 8 == 0;
+}
+
+static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mmid, const ggml_tensor * scale, const ggml_tensor * out) {
+    const ggml_tensor * w   = mmid->src[0];
+    const ggml_tensor * x   = mmid->src[1];
+    const ggml_tensor * ids = mmid->src[2];
+
+    const uint32_t K = (uint32_t) w->ne[0], M = (uint32_t) w->ne[1], n_as = (uint32_t) w->ne[2];
+    const uint32_t n_used = (uint32_t) ids->ne[0], T = (uint32_t) ids->ne[1];
+    const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, (uint64_t) n_used * T, mmid_down_stream_bn);
+    const uint64_t row_ids_offset = 1 + 2 * max_tiles;
+    const size_t expert_data_size = sizeof(uint32_t) * (row_ids_offset + max_tiles * mmid_down_stream_bn);
+
+    vk_pipeline pipeline = ctx->device->pipeline_mmid_down_q51[x->type == GGML_TYPE_F32 ? 1 : 0];
+    vk_pipeline count_experts = ctx->device->pipeline_count_experts;
+    if (ctx->prealloc_size_split_k < expert_data_size) {
+        ctx->prealloc_size_split_k = expert_data_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID down streaming engaged (q5_1, M=%u K=%u experts=%u used=%u, %s B%s)\n", M, K, n_as, n_used,
+                      ggml_type_name(x->type), scale ? ", router weights" : "");
+    }
+    ggml_vk_path_census_add("MUL_MAT_ID_DOWN_STREAM");
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer expert_buf = { ctx->prealloc_split_k, 0, expert_data_size };
+    {
+        vk_op_count_experts_push_constants pc = { n_used, T,
+                                                  (uint32_t) (ids->nb[0] / ggml_type_size(ids->type)),
+                                                  (uint32_t) (ids->nb[1] / ggml_type_size(ids->type)),
+                                                  (uint32_t) (get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                                  n_as, 0, 0, mmid_down_stream_bn, (uint32_t) row_ids_offset };
+        init_pushconst_fastdiv(pc);
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf }, pc, { 1, 1, 1 });
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const uint32_t xs = x->type == GGML_TYPE_F32 ? 4 : 8;   // B elements per uvec4
+    const vk_op_mmid_down_push_constants pc = {
+        M, K,
+        get_misalign_bytes(ctx, w) / 16, (uint32_t) (w->nb[2] / 16),
+        get_misalign_bytes(ctx, x) / 16, (uint32_t) (x->nb[1] / ggml_type_size(x->type) / xs), (uint32_t) (x->nb[2] / ggml_type_size(x->type) / xs),
+        (uint32_t) x->ne[1],
+        get_misalign_bytes(ctx, out) / 8,
+        n_used, (uint32_t) row_ids_offset,
+        scale ? (uint32_t) (get_misalign_bytes(ctx, scale) / 4) : 0u, scale ? 1u : 0u,
+    };
+    const uint32_t tiles_y = (uint32_t) std::min<uint64_t>(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    // without router weights the scale binding is not read: bind the output there
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, out, true), expert_buf,
+          ggml_vk_tensor_subbuffer(ctx, scale ? scale : out, true) },
+        pc, { M, tiles_y, (uint32_t) CEIL_DIV(max_tiles, tiles_y) });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -9979,10 +10089,19 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
         } else if (ctx->num_additional_fused_ops == 2) {
             ggml_tensor * mul = cgraph->nodes[node_idx + 1];
             GGML_ASSERT(mul->op == GGML_OP_MUL && (mul->src[0] == dst || mul->src[1] == dst));
-            ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, mul->src[0] == dst ? mul->src[1] : mul->src[0], mul, cpy);
+            const ggml_tensor * scale = mul->src[0] == dst ? mul->src[1] : mul->src[0];
+            if (ggml_vk_mmid_down_stream_ok(ctx, dst, scale, cpy)) {
+                ggml_vk_mmid_down_stream(ctx, subctx, dst, scale, cpy);
+            } else {
+                ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, scale, mul, cpy);
+            }
         } else {
             GGML_ASSERT(ctx->num_additional_fused_ops == 1);
-            ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, nullptr, nullptr, cpy);
+            if (ggml_vk_mmid_down_stream_ok(ctx, dst, nullptr, cpy)) {
+                ggml_vk_mmid_down_stream(ctx, subctx, dst, nullptr, cpy);
+            } else {
+                ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, nullptr, nullptr, cpy);
+            }
         }
     } else if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
